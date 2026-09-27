@@ -22,6 +22,7 @@ resource "cloudflare_zero_trust_access_application" "dash_app" {
   auto_redirect_to_identity = false
 
   policies = [
-    cloudflare_zero_trust_access_policy.admin_ui.id
+    cloudflare_zero_trust_access_policy.admin_ui.id,
+    cloudflare_zero_trust_access_policy.service_auth.id
   ]
 }
