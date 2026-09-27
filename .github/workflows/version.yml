@@ -1,0 +1,20 @@
+name: version-check
+
+on:
+  push:
+    branches: [init-free-vpc]
+  pull_request:
+    branches: [init-free-vpc]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate Version
+        uses: Greewil/version-update-helper@gha/validate-version/v1
+        with:
+          check-git-diff: false

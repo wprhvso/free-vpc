@@ -1,0 +1,36 @@
+name: free-vpc-node
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_id:
+        description: 'Node identifier'
+        required: false
+        default: '1'
+      lifetime_seconds:
+        description: 'Node lifetime in seconds'
+        required: false
+        default: '18000'
+  repository_dispatch:
+    types: [spawn-node]
+
+jobs:
+  run-node:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Free VPC Node
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_TEAM_NAME: ${{ secrets.CF_TEAM_NAME }}
+          SSH_HOST_ED25519_KEY: ${{ secrets.SSH_HOST_ED25519_KEY }}
+          SSH_HOST_RSA_KEY: ${{ secrets.SSH_HOST_RSA_KEY }}
+          SSH_AUTHORIZED_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
+          NODE_ID: ${{ github.event.inputs.node_id || github.event.client_payload.node_id || '1' }}
+          LIFETIME_SECONDS: ${{ github.event.inputs.lifetime_seconds || github.event.client_payload.lifetime_seconds || '18000' }}
+        run: |
+          chmod +x scripts/entrypoint.sh
+          ./scripts/entrypoint.sh
