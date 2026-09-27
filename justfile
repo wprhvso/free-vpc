@@ -1,5 +1,9 @@
 set shell := ["bash", "-uc"]
 
+API_URL := "https://api.unsafie.com"
+CF_ACCESS_CLIENT_ID := "5a06f20e534be12f4e259e932af57b57.access"
+CF_ACCESS_CLIENT_SECRET := "cfast_clJJ6Rx6HA0bdn2eXV31EO7UNnApjsLaOOdkWCMe71e2052a"
+
 default:
     @just --list
 
@@ -21,7 +25,12 @@ tf-apply:
       -target=cloudflare_teams_rule.allow_mesh_traffic \
       -target=cloudflare_d1_database.free_vpc_db \
       -target=cloudflare_worker_script.orchestrator \
-      -target=cloudflare_worker_cron_trigger.orchestrator_cron
+      -target=cloudflare_worker_cron_trigger.orchestrator_cron \
+      -target=cloudflare_workers_domain.api_domain \
+      -target=cloudflare_zero_trust_access_service_token.orchestrator_token \
+      -target=cloudflare_zero_trust_access_policy.service_auth \
+      -target=cloudflare_zero_trust_access_policy.admin_ui \
+      -target=cloudflare_zero_trust_access_application.api_app
 
 secrets-sync:
     @if [ -z "${CF_API_TOKEN:-}" ]; then echo "CF_API_TOKEN is required" && exit 1; fi
@@ -29,6 +38,8 @@ secrets-sync:
     @echo -n "${CF_ACCOUNT_ID}" | gh secret set CF_ACCOUNT_ID --repo wprhvso/free-vpc
     @echo -n "${CF_API_TOKEN}" | gh secret set CF_API_TOKEN --repo wprhvso/free-vpc
     @echo -n "${CF_TEAM_NAME:-shy-resonance-71c0}" | gh secret set CF_TEAM_NAME --repo wprhvso/free-vpc
+    @echo -n "${CF_ACCESS_CLIENT_ID}" | gh secret set CF_ACCESS_CLIENT_ID --repo wprhvso/free-vpc
+    @echo -n "${CF_ACCESS_CLIENT_SECRET}" | gh secret set CF_ACCESS_CLIENT_SECRET --repo wprhvso/free-vpc
 
 d1-migrate:
     @curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID:-39f6858f9b5865652ac69c506ec4736c}/d1/database/c4887003-15c4-4e85-8e83-bd33e7aa278b/query" \
@@ -43,26 +54,38 @@ d1-tables:
       -d '{"sql": "SELECT name FROM sqlite_master WHERE type=\"table\" ORDER BY name;"}' | jq '.result[0].results'
 
 vm-create name slot="1" vcpus="1" ram="1024" image="debian-12-minimal":
-    @curl -sS -X POST "https://free-vpc-orchestrator.wprhvso.workers.dev/v1/vms" \
+    @curl -sS -X POST "{{API_URL}}/v1/vms" \
+      -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
+      -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" \
       -H "Content-Type: application/json" \
       -d '{"name":"{{name}}","slot_id":{{slot}},"vcpus":{{vcpus}},"memory_mb":{{ram}},"image":"{{image}}"}' | jq .
 
 vm-list:
-    @curl -sS "https://free-vpc-orchestrator.wprhvso.workers.dev/v1/vms" | jq .
+    @curl -sS "{{API_URL}}/v1/vms" \
+      -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
+      -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" | jq .
 
 vm-delete name_or_id:
-    @curl -sS -X DELETE "https://free-vpc-orchestrator.wprhvso.workers.dev/v1/vms/{{name_or_id}}" | jq .
+    @curl -sS -X DELETE "{{API_URL}}/v1/vms/{{name_or_id}}" \
+      -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
+      -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" | jq .
 
 image-add name repo path:
-    @curl -sS -X POST "https://free-vpc-orchestrator.wprhvso.workers.dev/v1/images" \
+    @curl -sS -X POST "{{API_URL}}/v1/images" \
+      -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
+      -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" \
       -H "Content-Type: application/json" \
       -d '{"name":"{{name}}","hf_repo":"{{repo}}","hf_path":"{{path}}"}' | jq .
 
 image-list:
-    @curl -sS "https://free-vpc-orchestrator.wprhvso.workers.dev/v1/images" | jq .
+    @curl -sS "{{API_URL}}/v1/images" \
+      -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
+      -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" | jq .
 
 secret-set key value:
-    @curl -sS -X POST "https://free-vpc-orchestrator.wprhvso.workers.dev/v1/admin/secrets" \
+    @curl -sS -X POST "{{API_URL}}/v1/admin/secrets" \
+      -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
+      -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" \
       -H "Content-Type: application/json" \
       -d '{"key_name":"{{key}}","value":"{{value}}"}' | jq .
 
@@ -70,10 +93,14 @@ spawn node_id="1":
     gh workflow run node.yml --repo wprhvso/free-vpc --ref init-free-vpc -f node_id={{node_id}}
 
 spawn-all:
-    curl -sS -X POST "https://free-vpc-orchestrator.wprhvso.workers.dev/spawn" | jq .
+    @curl -sS -X POST "{{API_URL}}/spawn" \
+      -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
+      -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" | jq .
 
 worker-status:
-    curl -sS "https://free-vpc-orchestrator.wprhvso.workers.dev/status" | jq .
+    @curl -sS "{{API_URL}}/status" \
+      -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
+      -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" | jq .
 
 nodes:
     gh run list --repo wprhvso/free-vpc --workflow node.yml --limit 20
