@@ -80,6 +80,15 @@ for i in $(seq 1 45); do
 done
 
 echo "NODE_IP=$ASSIGNED_IP"
+
+if [ -n "${GH_PAT:-}" ] && [ -n "${ASSIGNED_IP}" ]; then
+  curl -sS -X PATCH "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/NODE_IP" \
+    -H "Authorization: Bearer ${GH_PAT}" \
+    -H "Accept: application/vnd.github.v3+json" \
+    -H "Content-Type: application/json" \
+    -d "{\"name\":\"NODE_IP\",\"value\":\"${ASSIGNED_IP}\"}" || true
+fi
+
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   printf "## Free VPC Node Online\n- Node: %s\n- Mesh IP: \`%s\`\n- User: \`runner\`\n- SSH Command: \`ssh runner@%s\`\n" "$NODE_NAME" "$ASSIGNED_IP" "$ASSIGNED_IP" >> "$GITHUB_STEP_SUMMARY"
 fi
