@@ -18,8 +18,8 @@ resource "cloudflare_split_tunnel" "mesh_include" {
     description = "Mesh IP Range"
   }
   tunnels {
-    address     = "10.0.1.0/24"
-    description = "Free VPC Private CIDR"
+    address     = "10.0.0.0/8"
+    description = "Free VPC Network"
   }
 }
 
@@ -56,8 +56,8 @@ resource "cloudflare_split_tunnel" "default_include" {
     description = "Mesh IPs"
   }
   tunnels {
-    address     = "10.0.1.0/24"
-    description = "Free VPC Private CIDR"
+    address     = "10.0.0.0/8"
+    description = "Free VPC Network"
   }
 }
 
@@ -69,5 +69,5 @@ resource "cloudflare_teams_rule" "allow_mesh_traffic" {
   enabled     = true
   precedence  = 100
   filters     = ["l4"]
-  traffic     = "net.dst.ip in {100.96.0.0/12 10.0.1.0/24}"
+  traffic     = "net.dst.ip in {100.96.0.0/12 10.0.0.0/8}"
 }

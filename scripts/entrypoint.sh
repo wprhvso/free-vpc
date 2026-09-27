@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd sudo iptables
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/firecracker_manager.sh"
+
+WORKER_URL="${WORKER_URL:-https://free-vpc-orchestrator.wprhvso.workers.dev}"
+
+sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd sudo iptables e2fsprogs
 
 sudo mkdir -p /etc/ssh /etc/ssh/sshd_config.d
 if [ -n "${SSH_HOST_ED25519_KEY:-}" ]; then
@@ -28,24 +33,33 @@ SSHEOF
 sudo mkdir -p /home/runner/.ssh /root/.ssh
 sudo chmod 700 /home/runner/.ssh /root/.ssh
 AUTH_FILE="/home/runner/.ssh/authorized_keys"
+sudo touch "$AUTH_FILE"
 if [ -f "authorized_keys" ]; then
   cat authorized_keys | sudo tee -a "$AUTH_FILE" > /dev/null
 fi
-sudo touch "$AUTH_FILE"
 if [ -n "${SSH_AUTHORIZED_KEYS:-}" ]; then
   echo "${SSH_AUTHORIZED_KEYS}" | sudo tee -a "$AUTH_FILE" > /dev/null
 fi
 curl -sSL "https://github.com/wprhvso.keys" | sudo tee -a "$AUTH_FILE" > /dev/null
 sudo cp "$AUTH_FILE" /root/.ssh/authorized_keys
-sudo chmod 600 "$AUTH_FILE" /root/.ssh/authorized_keys
+sudo cp "$AUTH_FILE" /tmp/free-vpc-auth-keys
+sudo chmod 600 "$AUTH_FILE" /root/.ssh/authorized_keys /tmp/free-vpc-auth-keys
 sudo chown -R runner:runner /home/runner/.ssh
 echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner-nopasswd
 sudo chmod 440 /etc/sudoers.d/runner-nopasswd
 sudo systemctl restart ssh || sudo service ssh restart || true
 
+setup_kvm
+setup_zswap
+setup_ksm
+
 NODE_NUM="${NODE_ID:-1}"
-NODE_IP="10.0.1.${NODE_NUM}"
-sudo ip addr add "${NODE_IP}/32" dev lo || true
+X1=$(( 2 + (NODE_NUM - 1) / 256 ))
+X2=$(( (NODE_NUM - 1) % 256 ))
+SUBNET="10.${X1}.${X2}.0/24"
+GATEWAY_IP="10.${X1}.${X2}.1"
+
+setup_bridge "$GATEWAY_IP" "$SUBNET"
 
 NODE_NAME="free-vpc-${GITHUB_RUN_ID:-manual}-${NODE_NUM}"
 CREATE_RESP=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector" \
@@ -67,9 +81,9 @@ ROUTE_RESP=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${C
   -H "Authorization: Bearer ${CF_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d "{
-    \"network\": \"${NODE_IP}/32\",
+    \"network\": \"${SUBNET}\",
     \"tunnel_id\": \"${NODE_ID_CF}\",
-    \"comment\": \"Node ${NODE_NUM}\"
+    \"comment\": \"Runner ${NODE_NUM}\"
   }")
 ROUTE_ID=$(echo "$ROUTE_RESP" | jq -r '.result.id // empty')
 
@@ -95,28 +109,63 @@ sudo warp-cli --accept-tos connect
 
 sleep 3
 
-sudo ip route replace 10.0.1.0/24 dev CloudflareWARP 2>/dev/null || sudo ip route add 10.0.1.0/24 dev CloudflareWARP 2>/dev/null || true
+sudo ip route replace 10.0.0.0/8 dev CloudflareWARP 2>/dev/null || sudo ip route add 10.0.0.0/8 dev CloudflareWARP 2>/dev/null || true
 sudo ip route replace 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || sudo ip route add 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || true
 
-echo "NODE_IP=${NODE_IP}"
+BOOT_DATA=$(curl -sS -X POST "${WORKER_URL}/api/runner/boot" \
+  -H "Content-Type: application/json" \
+  -d "{\"run_id\": ${GITHUB_RUN_ID:-0}, \"slot_id\": ${NODE_NUM}}")
+
+install_firecracker
+download_assets
+
+VMS_COUNT=$(echo "$BOOT_DATA" | jq '.vms | length')
+if [ "$VMS_COUNT" -gt 0 ]; then
+  for row in $(echo "$BOOT_DATA" | jq -r '.vms[] | @base64'); do
+    _jq() {
+      echo "${row}" | base64 --decode | jq -r "${1}"
+    }
+    VM_ID=$(_jq '.id')
+    VM_IP=$(_jq '.ip')
+    VM_VCPUS=$(_jq '.vcpus')
+    VM_RAM=$(_jq '.memory_mb')
+    spawn_microvm "$VM_ID" "$VM_IP" "$GATEWAY_IP" "$VM_VCPUS" "$VM_RAM"
+  done
+else
+  DEFAULT_VM_IP="10.${X1}.${X2}.2"
+  spawn_microvm "vm-${NODE_NUM}-default" "$DEFAULT_VM_IP" "$GATEWAY_IP" 2 2048 || true
+fi
 
 if [ -n "${GH_PAT:-}" ]; then
   curl -sS -X PATCH "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/NODE_IP" \
     -H "Authorization: Bearer ${GH_PAT}" \
     -H "Accept: application/vnd.github.v3+json" \
     -H "Content-Type: application/json" \
-    -d "{\"name\":\"NODE_IP\",\"value\":\"${NODE_IP}\"}" || true
+    -d "{\"name\":\"NODE_IP\",\"value\":\"${GATEWAY_IP}\"}" || true
 fi
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  printf "## Free VPC Node Online\n- Node: %s\n- Fixed IP: \`%s\`\n- User: \`runner\`\n- SSH Command: \`ssh runner@%s\`\n" "$NODE_NAME" "$NODE_IP" "$NODE_IP" >> "$GITHUB_STEP_SUMMARY"
+  printf "## Free VPC Node Online\n- Node: %s\n- Host Gateway IP: \`%s\`\n- MicroVM Subnet: \`%s\`\n- Default VM IP: \`10.%s.%s.2\`\n" "$NODE_NAME" "$GATEWAY_IP" "$SUBNET" "$X1" "$X2" >> "$GITHUB_STEP_SUMMARY"
 fi
 
 START_TIME=$SECONDS
-LIFETIME=${LIFETIME_SECONDS:-18000}
-while [ $((SECONDS - START_TIME)) -lt "$LIFETIME" ]; do
+HANDOVER_TRIGGERED=0
+
+while [ $((SECONDS - START_TIME)) -lt 21120 ]; do
   if [ -f "/tmp/stop-node" ]; then
     break
   fi
-  sleep 15
+
+  curl -sS -X POST "${WORKER_URL}/api/runner/heartbeat" \
+    -H "Content-Type: application/json" \
+    -d "{\"slot_id\": ${NODE_NUM}, \"runner_id\": \"${NODE_NAME}\"}" >/dev/null 2>&1 || true
+
+  if [ $((SECONDS - START_TIME)) -ge 20700 ] && [ "$HANDOVER_TRIGGERED" -eq 0 ]; then
+    HANDOVER_TRIGGERED=1
+    curl -sS -X POST "${WORKER_URL}/api/runner/handover" \
+      -H "Content-Type: application/json" \
+      -d "{\"slot_id\": ${NODE_NUM}, \"runner_id\": \"${NODE_NAME}\"}" >/dev/null 2>&1 || true
+  fi
+
+  sleep 30
 done

@@ -4,19 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       node_id:
-        description: 'Node identifier'
+        description: 'Node slot identifier'
         required: false
         default: '1'
-      lifetime_seconds:
-        description: 'Node lifetime in seconds'
-        required: false
-        default: '18000'
   repository_dispatch:
     types: [spawn-node]
 
 jobs:
   run-node:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,7 +28,7 @@ jobs:
           SSH_AUTHORIZED_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
           GH_PAT: ${{ secrets.GH_PAT }}
           NODE_ID: ${{ github.event.inputs.node_id || github.event.client_payload.node_id || '1' }}
-          LIFETIME_SECONDS: ${{ github.event.inputs.lifetime_seconds || github.event.client_payload.lifetime_seconds || '18000' }}
+          WORKER_URL: https://free-vpc-orchestrator.wprhvso.workers.dev
         run: |
-          chmod +x scripts/entrypoint.sh
+          chmod +x scripts/entrypoint.sh scripts/firecracker_manager.sh
           ./scripts/entrypoint.sh
