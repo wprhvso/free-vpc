@@ -14,8 +14,8 @@ output "warp_app_id" {
   value = cloudflare_zero_trust_access_application.warp_enrollment.id
 }
 
-output "worker_url" {
-  value = "https://free-vpc-orchestrator.wprhvso.workers.dev"
+output "portal_url" {
+  value = "https://vm.unsafie.com"
 }
 
 output "d1_database_id" {
@@ -25,6 +25,7 @@ output "d1_database_id" {
 output "d1_database_name" {
   value = cloudflare_d1_database.free_vpc_db.name
 }
+
 output "cf_access_client_id" {
   value = cloudflare_zero_trust_access_service_token.orchestrator_token.client_id
 }
@@ -32,11 +33,4 @@ output "cf_access_client_id" {
 output "cf_access_client_secret" {
   value     = cloudflare_zero_trust_access_service_token.orchestrator_token.client_secret
   sensitive = true
-}
-
-output "api_endpoint" {
-  value = "https://api.unsafie.com"
-}
-output "dashboard_url" {
-  value = "https://dash.unsafie.com"
 }
