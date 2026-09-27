@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd sudo
+sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd sudo iptables
 
 sudo mkdir -p /etc/ssh /etc/ssh/sshd_config.d
 if [ -n "${SSH_HOST_ED25519_KEY:-}" ]; then
@@ -69,6 +69,10 @@ sudo apt-get update -qq && sudo apt-get install -y -qq cloudflare-warp
 
 sudo warp-cli --accept-tos connector new "$CONNECTOR_TOKEN"
 sudo warp-cli --accept-tos connect
+
+sleep 3
+
+sudo ip route replace 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || sudo ip route add 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || true
 
 ASSIGNED_IP=""
 for i in $(seq 1 45); do
