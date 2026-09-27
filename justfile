@@ -18,7 +18,9 @@ tf-apply:
       -target=cloudflare_zero_trust_access_policy.device_enrollment \
       -target=cloudflare_zero_trust_access_application.warp_enrollment \
       -target=cloudflare_split_tunnel.default_include \
-      -target=cloudflare_teams_rule.allow_mesh_traffic
+      -target=cloudflare_teams_rule.allow_mesh_traffic \
+      -target=cloudflare_worker_script.orchestrator \
+      -target=cloudflare_worker_cron_trigger.orchestrator_cron
 
 secrets-sync:
     @if [ -z "${CF_API_TOKEN:-}" ]; then echo "CF_API_TOKEN is required" && exit 1; fi
@@ -30,12 +32,11 @@ secrets-sync:
 spawn node_id="1":
     gh workflow run node.yml --repo wprhvso/free-vpc --ref init-free-vpc -f node_id={{node_id}}
 
-spawn-all count="20":
-    @for i in $(seq 1 {{count}}); do \
-      echo "Spawning node $i..."; \
-      gh workflow run node.yml --repo wprhvso/free-vpc --ref init-free-vpc -f node_id=$i; \
-      sleep 1; \
-    done
+spawn-all:
+    curl -sS -X POST "https://free-vpc-orchestrator.wprhvso.workers.dev/spawn" | jq .
+
+worker-status:
+    curl -sS "https://free-vpc-orchestrator.wprhvso.workers.dev/status" | jq .
 
 nodes:
     gh run list --repo wprhvso/free-vpc --workflow node.yml --limit 20
