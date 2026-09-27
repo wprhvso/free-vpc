@@ -52,3 +52,14 @@ resource "cloudflare_split_tunnel" "default_include" {
     description = "Free VPC Mesh IPs"
   }
 }
+
+resource "cloudflare_teams_rule" "allow_mesh_traffic" {
+  account_id  = var.cloudflare_account_id
+  name        = "Allow Free VPC Mesh Traffic"
+  description = "Allow all L4 traffic to Mesh IPs"
+  action      = "allow"
+  enabled     = true
+  precedence  = 100
+  filters     = ["l4"]
+  traffic     = "net.dst.ip in {100.96.0.0/12}"
+}
