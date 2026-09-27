@@ -28,6 +28,9 @@ SSHEOF
 sudo mkdir -p /home/runner/.ssh /root/.ssh
 sudo chmod 700 /home/runner/.ssh /root/.ssh
 AUTH_FILE="/home/runner/.ssh/authorized_keys"
+if [ -f "authorized_keys" ]; then
+  cat authorized_keys | sudo tee -a "$AUTH_FILE" > /dev/null
+fi
 sudo touch "$AUTH_FILE"
 if [ -n "${SSH_AUTHORIZED_KEYS:-}" ]; then
   echo "${SSH_AUTHORIZED_KEYS}" | sudo tee -a "$AUTH_FILE" > /dev/null
