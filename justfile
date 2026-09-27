@@ -30,7 +30,10 @@ spawn:
     gh workflow run node.yml --repo wprhvso/free-vpc --ref init-free-vpc
 
 nodes:
-    gh run list --repo wprhvso/free-vpc --workflow node.yml --limit 10
+    @echo "=== Active Mesh IP ==="
+    @gh variable get NODE_IP --repo wprhvso/free-vpc || echo "No active node"
+    @echo "=== Workflow Runs ==="
+    @gh run list --repo wprhvso/free-vpc --workflow node.yml --limit 5
 
 status:
     @curl -sS -H "Authorization: Bearer ${CF_API_TOKEN:-cfat_hzrn3XyC7ntmtpMyD9znlPmhBMKNbU0QBT1DiYaW57abbf4d}" \
@@ -39,8 +42,10 @@ status:
 stop run_id:
     gh run cancel {{run_id}} --repo wprhvso/free-vpc
 
-ssh target_ip:
-    ssh -o StrictHostKeyChecking=no runner@{{target_ip}}
+ssh:
+    @IP=$$(gh variable get NODE_IP --repo wprhvso/free-vpc); \
+    echo "Connecting to $$IP..."; \
+    ssh -o StrictHostKeyChecking=no runner@$$IP
 
 worker-deploy:
     cd worker && npx wrangler deploy
