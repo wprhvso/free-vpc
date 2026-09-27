@@ -19,6 +19,7 @@ tf-apply:
       -target=cloudflare_zero_trust_access_application.warp_enrollment \
       -target=cloudflare_split_tunnel.default_include \
       -target=cloudflare_teams_rule.allow_mesh_traffic \
+      -target=cloudflare_d1_database.free_vpc_db \
       -target=cloudflare_worker_script.orchestrator \
       -target=cloudflare_worker_cron_trigger.orchestrator_cron
 
@@ -28,6 +29,18 @@ secrets-sync:
     @echo -n "${CF_ACCOUNT_ID}" | gh secret set CF_ACCOUNT_ID --repo wprhvso/free-vpc
     @echo -n "${CF_API_TOKEN}" | gh secret set CF_API_TOKEN --repo wprhvso/free-vpc
     @echo -n "${CF_TEAM_NAME:-shy-resonance-71c0}" | gh secret set CF_TEAM_NAME --repo wprhvso/free-vpc
+
+d1-migrate:
+    @curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID:-39f6858f9b5865652ac69c506ec4736c}/d1/database/c4887003-15c4-4e85-8e83-bd33e7aa278b/query" \
+      -H "Authorization: Bearer ${CF_API_TOKEN:-cfat_hzrn3XyC7ntmtpMyD9znlPmhBMKNbU0QBT1DiYaW57abbf4d}" \
+      -H "Content-Type: application/json" \
+      -d "$$(jq -n --arg sql "$$(cat terraform/schema.sql)" '{"sql": $$sql}')" | jq .
+
+d1-tables:
+    @curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID:-39f6858f9b5865652ac69c506ec4736c}/d1/database/c4887003-15c4-4e85-8e83-bd33e7aa278b/query" \
+      -H "Authorization: Bearer ${CF_API_TOKEN:-cfat_hzrn3XyC7ntmtpMyD9znlPmhBMKNbU0QBT1DiYaW57abbf4d}" \
+      -H "Content-Type: application/json" \
+      -d '{"sql": "SELECT name FROM sqlite_master WHERE type=\"table\" ORDER BY name;"}' | jq '.result[0].results'
 
 spawn node_id="1":
     gh workflow run node.yml --repo wprhvso/free-vpc --ref init-free-vpc -f node_id={{node_id}}

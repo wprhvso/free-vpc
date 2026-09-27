@@ -17,3 +17,11 @@ output "warp_app_id" {
 output "worker_url" {
   value = "https://free-vpc-orchestrator.wprhvso.workers.dev"
 }
+
+output "d1_database_id" {
+  value = cloudflare_d1_database.free_vpc_db.id
+}
+
+output "d1_database_name" {
+  value = cloudflare_d1_database.free_vpc_db.name
+}
