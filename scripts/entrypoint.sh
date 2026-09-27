@@ -72,7 +72,7 @@ sudo warp-cli --accept-tos connect
 
 ASSIGNED_IP=""
 for i in $(seq 1 45); do
-  ASSIGNED_IP=$(ip -4 addr show dev cloudflare-warp 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1 || true)
+  ASSIGNED_IP=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)100\.96\.\d+\.\d+' | head -n 1 || true)
   if [ -n "$ASSIGNED_IP" ]; then
     break
   fi
