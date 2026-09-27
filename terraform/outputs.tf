@@ -6,10 +6,14 @@ output "split_tunnel_id" {
   value = cloudflare_split_tunnel.mesh_include.id
 }
 
-output "access_app_id" {
+output "enrollment_policy_id" {
+  value = cloudflare_zero_trust_access_policy.device_enrollment.id
+}
+
+output "warp_app_id" {
   value = cloudflare_zero_trust_access_application.warp_enrollment.id
 }
 
-output "access_policy_id" {
-  value = cloudflare_zero_trust_access_policy.device_enrollment.id
+output "worker_url" {
+  value = "https://free-vpc-orchestrator.wprhvso.workers.dev"
 }
