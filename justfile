@@ -12,12 +12,7 @@ tf-plan:
     cd terraform && terraform plan
 
 tf-apply:
-    cd terraform && terraform apply -auto-approve \
-      -target=cloudflare_device_settings_policy.free_vpc_mesh \
-      -target=cloudflare_split_tunnel.mesh_include \
-      -target=cloudflare_zero_trust_access_policy.device_enrollment \
-      -target=cloudflare_zero_trust_access_application.warp_enrollment \
-      -target=cloudflare_split_tunnel.default_exclude
+    cd terraform && terraform apply -auto-approve -target=cloudflare_device_settings_policy.free_vpc_mesh -target=cloudflare_split_tunnel.mesh_include -target=cloudflare_zero_trust_access_policy.device_enrollment -target=cloudflare_zero_trust_access_application.warp_enrollment -target=cloudflare_split_tunnel.default_exclude
 
 secrets-sync:
     @if [ -z "${CF_API_TOKEN:-}" ]; then echo "CF_API_TOKEN is required" && exit 1; fi
