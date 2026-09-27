@@ -37,3 +37,6 @@ output "cf_access_client_secret" {
 output "api_endpoint" {
   value = "https://api.unsafie.com"
 }
+output "dashboard_url" {
+  value = "https://dash.unsafie.com"
+}
