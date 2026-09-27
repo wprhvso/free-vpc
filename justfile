@@ -38,8 +38,8 @@ secrets-sync:
     @echo -n "${CF_ACCOUNT_ID}" | gh secret set CF_ACCOUNT_ID --repo wprhvso/free-vpc
     @echo -n "${CF_API_TOKEN}" | gh secret set CF_API_TOKEN --repo wprhvso/free-vpc
     @echo -n "${CF_TEAM_NAME:-shy-resonance-71c0}" | gh secret set CF_TEAM_NAME --repo wprhvso/free-vpc
-    @echo -n "${CF_ACCESS_CLIENT_ID}" | gh secret set CF_ACCESS_CLIENT_ID --repo wprhvso/free-vpc
-    @echo -n "${CF_ACCESS_CLIENT_SECRET}" | gh secret set CF_ACCESS_CLIENT_SECRET --repo wprhvso/free-vpc
+    @echo -n "{{CF_ACCESS_CLIENT_ID}}" | gh secret set CF_ACCESS_CLIENT_ID --repo wprhvso/free-vpc
+    @echo -n "{{CF_ACCESS_CLIENT_SECRET}}" | gh secret set CF_ACCESS_CLIENT_SECRET --repo wprhvso/free-vpc
 
 d1-migrate:
     @curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID:-39f6858f9b5865652ac69c506ec4736c}/d1/database/c4887003-15c4-4e85-8e83-bd33e7aa278b/query" \
