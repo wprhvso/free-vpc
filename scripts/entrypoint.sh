@@ -40,7 +40,11 @@ echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner-nopasswd
 sudo chmod 440 /etc/sudoers.d/runner-nopasswd
 sudo systemctl restart ssh || sudo service ssh restart || true
 
-NODE_NAME="free-vpc-${GITHUB_RUN_ID:-manual}-${NODE_ID:-1}"
+NODE_NUM="${NODE_ID:-1}"
+NODE_IP="10.0.1.${NODE_NUM}"
+sudo ip addr add "${NODE_IP}/32" dev lo || true
+
+NODE_NAME="free-vpc-${GITHUB_RUN_ID:-manual}-${NODE_NUM}"
 CREATE_RESP=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector" \
   -H "Authorization: Bearer ${CF_API_TOKEN}" \
   -H "Content-Type: application/json" \
@@ -56,10 +60,26 @@ TOKEN_RESP=$(curl -sS "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUN
   -H "Authorization: Bearer ${CF_API_TOKEN}")
 CONNECTOR_TOKEN=$(echo "$TOKEN_RESP" | jq -r '.result // empty')
 
+ROUTE_RESP=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/teamnet/routes" \
+  -H "Authorization: Bearer ${CF_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"network\": \"${NODE_IP}/32\",
+    \"tunnel_id\": \"${NODE_ID_CF}\",
+    \"comment\": \"Node ${NODE_NUM}\"
+  }")
+ROUTE_ID=$(echo "$ROUTE_RESP" | jq -r '.result.id // empty')
+
 cleanup() {
+  if [ -n "${ROUTE_ID:-}" ]; then
+    curl -sS -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/teamnet/routes/${ROUTE_ID}" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" || true
+  fi
   sudo warp-cli --accept-tos disconnect || true
-  curl -sS -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector/${NODE_ID_CF}" \
-    -H "Authorization: Bearer ${CF_API_TOKEN}" || true
+  if [ -n "${NODE_ID_CF:-}" ]; then
+    curl -sS -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector/${NODE_ID_CF}" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" || true
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -72,29 +92,21 @@ sudo warp-cli --accept-tos connect
 
 sleep 3
 
+sudo ip route replace 10.0.1.0/24 dev CloudflareWARP 2>/dev/null || sudo ip route add 10.0.1.0/24 dev CloudflareWARP 2>/dev/null || true
 sudo ip route replace 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || sudo ip route add 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || true
 
-ASSIGNED_IP=""
-for i in $(seq 1 45); do
-  ASSIGNED_IP=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)100\.96\.\d+\.\d+' | head -n 1 || true)
-  if [ -n "$ASSIGNED_IP" ]; then
-    break
-  fi
-  sleep 1
-done
+echo "NODE_IP=${NODE_IP}"
 
-echo "NODE_IP=$ASSIGNED_IP"
-
-if [ -n "${GH_PAT:-}" ] && [ -n "${ASSIGNED_IP}" ]; then
+if [ -n "${GH_PAT:-}" ]; then
   curl -sS -X PATCH "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/NODE_IP" \
     -H "Authorization: Bearer ${GH_PAT}" \
     -H "Accept: application/vnd.github.v3+json" \
     -H "Content-Type: application/json" \
-    -d "{\"name\":\"NODE_IP\",\"value\":\"${ASSIGNED_IP}\"}" || true
+    -d "{\"name\":\"NODE_IP\",\"value\":\"${NODE_IP}\"}" || true
 fi
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  printf "## Free VPC Node Online\n- Node: %s\n- Mesh IP: \`%s\`\n- User: \`runner\`\n- SSH Command: \`ssh runner@%s\`\n" "$NODE_NAME" "$ASSIGNED_IP" "$ASSIGNED_IP" >> "$GITHUB_STEP_SUMMARY"
+  printf "## Free VPC Node Online\n- Node: %s\n- Fixed IP: \`%s\`\n- User: \`runner\`\n- SSH Command: \`ssh runner@%s\`\n" "$NODE_NAME" "$NODE_IP" "$NODE_IP" >> "$GITHUB_STEP_SUMMARY"
 fi
 
 START_TIME=$SECONDS

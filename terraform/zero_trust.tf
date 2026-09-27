@@ -17,6 +17,10 @@ resource "cloudflare_split_tunnel" "mesh_include" {
     address     = "100.96.0.0/12"
     description = "Mesh IP Range"
   }
+  tunnels {
+    address     = "10.0.1.0/24"
+    description = "Free VPC Private CIDR"
+  }
 }
 
 resource "cloudflare_zero_trust_access_policy" "device_enrollment" {
@@ -49,17 +53,21 @@ resource "cloudflare_split_tunnel" "default_include" {
 
   tunnels {
     address     = "100.96.0.0/12"
-    description = "Free VPC Mesh IPs"
+    description = "Mesh IPs"
+  }
+  tunnels {
+    address     = "10.0.1.0/24"
+    description = "Free VPC Private CIDR"
   }
 }
 
 resource "cloudflare_teams_rule" "allow_mesh_traffic" {
   account_id  = var.cloudflare_account_id
-  name        = "Allow Free VPC Mesh Traffic"
-  description = "Allow all L4 traffic to Mesh IPs"
+  name        = "Allow Free VPC Private Traffic"
+  description = "Allow all L4 traffic to Mesh IPs and Private CIDR"
   action      = "allow"
   enabled     = true
   precedence  = 100
   filters     = ["l4"]
-  traffic     = "net.dst.ip in {100.96.0.0/12}"
+  traffic     = "net.dst.ip in {100.96.0.0/12 10.0.1.0/24}"
 }

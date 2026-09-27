@@ -17,7 +17,8 @@ tf-apply:
       -target=cloudflare_split_tunnel.mesh_include \
       -target=cloudflare_zero_trust_access_policy.device_enrollment \
       -target=cloudflare_zero_trust_access_application.warp_enrollment \
-      -target=cloudflare_split_tunnel.default_include
+      -target=cloudflare_split_tunnel.default_include \
+      -target=cloudflare_teams_rule.allow_mesh_traffic
 
 secrets-sync:
     @if [ -z "${CF_API_TOKEN:-}" ]; then echo "CF_API_TOKEN is required" && exit 1; fi
@@ -26,26 +27,33 @@ secrets-sync:
     @echo -n "${CF_API_TOKEN}" | gh secret set CF_API_TOKEN --repo wprhvso/free-vpc
     @echo -n "${CF_TEAM_NAME:-shy-resonance-71c0}" | gh secret set CF_TEAM_NAME --repo wprhvso/free-vpc
 
-spawn:
-    gh workflow run node.yml --repo wprhvso/free-vpc --ref init-free-vpc
+spawn node_id="1":
+    gh workflow run node.yml --repo wprhvso/free-vpc --ref init-free-vpc -f node_id={{node_id}}
+
+spawn-all count="20":
+    @for i in $(seq 1 {{count}}); do \
+      echo "Spawning node $i..."; \
+      gh workflow run node.yml --repo wprhvso/free-vpc --ref init-free-vpc -f node_id=$i; \
+      sleep 1; \
+    done
 
 nodes:
-    @echo "=== Active Mesh IP ==="
-    @gh variable get NODE_IP --repo wprhvso/free-vpc || echo "No active node"
-    @echo "=== Workflow Runs ==="
-    @gh run list --repo wprhvso/free-vpc --workflow node.yml --limit 5
+    gh run list --repo wprhvso/free-vpc --workflow node.yml --limit 20
 
 status:
+    @echo "=== Active WARP Connectors ==="
     @curl -sS -H "Authorization: Bearer ${CF_API_TOKEN:-cfat_hzrn3XyC7ntmtpMyD9znlPmhBMKNbU0QBT1DiYaW57abbf4d}" \
-      "https://api.cloudflare.com/client/v4/accounts/39f6858f9b5865652ac69c506ec4736c/warp_connector" | jq '.result[] | {id, name, status, created_on}'
+      "https://api.cloudflare.com/client/v4/accounts/39f6858f9b5865652ac69c506ec4736c/warp_connector" | jq '.result[] | {id, name, status}'
+    @echo "=== Private CIDR Routes ==="
+    @curl -sS -H "Authorization: Bearer ${CF_API_TOKEN:-cfat_hzrn3XyC7ntmtpMyD9znlPmhBMKNbU0QBT1DiYaW57abbf4d}" \
+      "https://api.cloudflare.com/client/v4/accounts/39f6858f9b5865652ac69c506ec4736c/teamnet/routes" | jq '.result[] | {network, comment, tunnel_id}'
 
 stop run_id:
     gh run cancel {{run_id}} --repo wprhvso/free-vpc
 
-ssh:
-    @IP=$$(gh variable get NODE_IP --repo wprhvso/free-vpc); \
-    echo "Connecting to $$IP..."; \
-    ssh -o StrictHostKeyChecking=no runner@$$IP
-
-worker-deploy:
-    cd worker && npx wrangler deploy
+ssh target="1":
+    @if [[ "{{target}}" =~ ^[0-9]+$ ]]; then \
+      ssh -o StrictHostKeyChecking=no runner@10.0.1.{{target}}; \
+    else \
+      ssh -o StrictHostKeyChecking=no runner@{{target}}; \
+    fi
