@@ -53,6 +53,13 @@ setup_bridge() {
   fi
 }
 
+start_metadata_server() {
+  local gateway_ip="$1"
+  local port="${2:-18080}"
+  pkill -f "metadata_server.py" 2>/dev/null || true
+  python3 "${SCRIPT_DIR}/metadata_server.py" "$gateway_ip" "$port" >/tmp/meta_server.log 2>&1 &
+}
+
 install_firecracker() {
   if ! command -v firecracker >/dev/null 2>&1; then
     mkdir -p /tmp/fc-install
@@ -87,7 +94,7 @@ spawn_microvm() {
   sudo ip link set "$tap_name" master br0 2>/dev/null || true
   sudo ip link set "$tap_name" up
 
-  cp /tmp/fc-assets/base-rootfs.ext4 "$vm_rootfs"
+  cp --sparse=always /tmp/fc-assets/base-rootfs.ext4 "$vm_rootfs" 2>/dev/null || cp /tmp/fc-assets/base-rootfs.ext4 "$vm_rootfs"
 
   mkdir -p /tmp/mnt-"$vm_id"
   sudo mount -o loop "$vm_rootfs" /tmp/mnt-"$vm_id" 2>/dev/null || true
@@ -98,6 +105,30 @@ spawn_microvm() {
       sudo chmod 600 /tmp/mnt-"$vm_id"/root/.ssh/authorized_keys
     fi
   fi
+
+  if [ -d /tmp/mnt-"$vm_id"/etc ]; then
+    cat << AGENTEOF | sudo tee /tmp/mnt-"$vm_id"/etc/rc.local > /dev/null
+#!/bin/sh -e
+(
+  while true; do
+    GUEST_IP=\$(hostname -I 2>/dev/null | awk '{print \$1}')
+    if [ -n "\$GUEST_IP" ]; then
+      FETCHED_KEYS=\$(curl -sf "http://${gateway_ip}:18080/keys?ip=\${GUEST_IP}" 2>/dev/null || true)
+      if [ -n "\$FETCHED_KEYS" ]; then
+        mkdir -p /root/.ssh
+        echo "\$FETCHED_KEYS" >> /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+        break
+      fi
+    fi
+    sleep 1
+  done
+) &
+exit 0
+AGENTEOF
+    sudo chmod +x /tmp/mnt-"$vm_id"/etc/rc.local
+  fi
+
   sudo umount /tmp/mnt-"$vm_id" 2>/dev/null || true
   rm -rf /tmp/mnt-"$vm_id"
 
@@ -130,4 +161,18 @@ spawn_microvm() {
   curl -s -X PUT --unix-socket "$sock" http://localhost/actions \
     -H "Content-Type: application/json" \
     -d "{\"action_type\": \"InstanceStart\"}"
+}
+
+stop_microvm() {
+  local vm_id="$1"
+  local sock="/tmp/fc-${vm_id}.sock"
+  local tap_name="tap-${vm_id:0:8}"
+  local pid
+  pid=$(pgrep -f "firecracker.*${vm_id}" || true)
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$sock" "/tmp/rootfs-${vm_id}.ext4"
+  sudo ip link set "$tap_name" down 2>/dev/null || true
+  sudo ip link delete "$tap_name" 2>/dev/null || true
 }

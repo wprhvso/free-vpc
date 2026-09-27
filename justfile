@@ -95,3 +95,8 @@ ssh target="1":
     else \
       ssh -o StrictHostKeyChecking=no runner@{{target}}; \
     fi
+
+vm-acquire name="" slot="" key="":
+    @curl -sS -X POST "https://free-vpc-orchestrator.wprhvso.workers.dev/v1/vms/acquire" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"{{name}}\",\"slot_id\":\"{{slot}}\",\"ssh_key\":\"{{key}}\"}" | jq .

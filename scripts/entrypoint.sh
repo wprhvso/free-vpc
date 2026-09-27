@@ -60,6 +60,7 @@ SUBNET="10.${X1}.${X2}.0/24"
 GATEWAY_IP="10.${X1}.${X2}.1"
 
 setup_bridge "$GATEWAY_IP" "$SUBNET"
+start_metadata_server "$GATEWAY_IP" 18080
 
 NODE_NAME="free-vpc-${GITHUB_RUN_ID:-manual}-${NODE_NUM}"
 CREATE_RESP=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector" \
@@ -100,6 +101,7 @@ cleanup() {
   if command -v tailscale >/dev/null 2>&1; then
     sudo tailscale logout || true
   fi
+  pkill -f "metadata_server.py" || true
 }
 trap cleanup EXIT INT TERM
 
@@ -126,12 +128,12 @@ if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
   echo "Tailscale online: ${NODE_NAME} (${TS_IP})"
 fi
 
+install_firecracker
+download_assets
+
 BOOT_DATA=$(curl -sS -X POST "${WORKER_URL}/api/runner/boot" \
   -H "Content-Type: application/json" \
   -d "{\"run_id\": ${GITHUB_RUN_ID:-0}, \"slot_id\": ${NODE_NUM}}")
-
-install_firecracker
-download_assets
 
 VMS_COUNT=$(echo "$BOOT_DATA" | jq '.vms | length')
 if [ "$VMS_COUNT" -gt 0 ]; then
@@ -141,13 +143,18 @@ if [ "$VMS_COUNT" -gt 0 ]; then
     }
     VM_ID=$(_jq '.id')
     VM_IP=$(_jq '.ip')
-    VM_VCPUS=$(_jq '.vcpus')
-    VM_RAM=$(_jq '.memory_mb')
+    VM_VCPUS=$(_jq '.vcpus // 1')
+    VM_RAM=$(_jq '.memory_mb // 1024')
+    VM_KEYS=$(_jq '.ssh_keys // empty')
+    if [ -n "$VM_KEYS" ] && [ "$VM_KEYS" != "null" ]; then
+      echo "$VM_KEYS" | jq -r '.[]' 2>/dev/null > "/tmp/keys_${VM_IP}" || true
+    fi
     spawn_microvm "$VM_ID" "$VM_IP" "$GATEWAY_IP" "$VM_VCPUS" "$VM_RAM"
   done
 else
   DEFAULT_VM_IP="10.${X1}.${X2}.2"
-  spawn_microvm "vm-${NODE_NUM}-default" "$DEFAULT_VM_IP" "$GATEWAY_IP" 2 2048 || true
+  spawn_microvm "vm-${NODE_NUM}-standby-1" "$DEFAULT_VM_IP" "$GATEWAY_IP" 1 1024 || true
+  spawn_microvm "vm-${NODE_NUM}-standby-2" "10.${X1}.${X2}.3" "$GATEWAY_IP" 1 1024 || true
 fi
 
 if [ -n "${GH_PAT:-}" ]; then
@@ -159,7 +166,7 @@ if [ -n "${GH_PAT:-}" ]; then
 fi
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  printf "## Free VPC Node Online\n- Node: %s\n- Host Gateway IP: \`%s\`\n- MicroVM Subnet: \`%s\`\n- Default VM IP: \`10.%s.%s.2\`\n- Tailscale IP: \`%s\`\n" "$NODE_NAME" "$GATEWAY_IP" "$SUBNET" "$X1" "$X2" "${TS_IP:-none}" >> "$GITHUB_STEP_SUMMARY"
+  printf "## Free VPC Node Online\n- Node: %s\n- Host Gateway IP: \`%s\`\n- MicroVM Subnet: \`%s\`\n- Tailscale IP: \`%s\`\n" "$NODE_NAME" "$GATEWAY_IP" "$SUBNET" "${TS_IP:-none}" >> "$GITHUB_STEP_SUMMARY"
 fi
 
 START_TIME=$SECONDS
@@ -170,9 +177,44 @@ while [ $((SECONDS - START_TIME)) -lt 21120 ]; do
     break
   fi
 
-  curl -sS -X POST "${WORKER_URL}/api/runner/heartbeat" \
+  HB_RESP=$(curl -sS -X POST "${WORKER_URL}/api/runner/heartbeat" \
     -H "Content-Type: application/json" \
-    -d "{\"slot_id\": ${NODE_NUM}, \"runner_id\": \"${NODE_NAME}\"}" >/dev/null 2>&1 || true
+    -d "{\"slot_id\": ${NODE_NUM}, \"runner_id\": \"${NODE_NAME}\"}" 2>/dev/null || true)
+
+  TASKS_COUNT=$(echo "$HB_RESP" | jq -r '.tasks | length // 0' 2>/dev/null || echo 0)
+  if [ "$TASKS_COUNT" -gt 0 ]; then
+    for row in $(echo "$HB_RESP" | jq -r '.tasks[] | @base64'); do
+      _tjq() {
+        echo "${row}" | base64 --decode | jq -r "${1}"
+      }
+      TASK_ID=$(_tjq '.id')
+      TASK_TYPE=$(_tjq '.type')
+      TASK_PAYLOAD=$(_tjq '.payload')
+
+      if [ "$TASK_TYPE" = "claim" ] || [ "$TASK_TYPE" = "activate_vm" ]; then
+        TASK_IP=$(echo "$TASK_PAYLOAD" | jq -r '.ip // empty')
+        echo "$TASK_PAYLOAD" | jq -r '.ssh_keys[]?' 2>/dev/null > "/tmp/keys_${TASK_IP}" || true
+        curl -sS -X POST "${WORKER_URL}/api/runner/ack" \
+          -H "Content-Type: application/json" \
+          -d "{\"task_id\": \"${TASK_ID}\", \"slot_id\": ${NODE_NUM}}" >/dev/null 2>&1 || true
+      elif [ "$TASK_TYPE" = "spawn_standby" ]; then
+        SVM_ID=$(echo "$TASK_PAYLOAD" | jq -r '.vm_id')
+        SVM_IP=$(echo "$TASK_PAYLOAD" | jq -r '.ip')
+        SVM_VCPUS=$(echo "$TASK_PAYLOAD" | jq -r '.vcpus // 1')
+        SVM_RAM=$(echo "$TASK_PAYLOAD" | jq -r '.memory_mb // 1024')
+        spawn_microvm "$SVM_ID" "$SVM_IP" "$GATEWAY_IP" "$SVM_VCPUS" "$SVM_RAM" || true
+        curl -sS -X POST "${WORKER_URL}/api/runner/ack" \
+          -H "Content-Type: application/json" \
+          -d "{\"task_id\": \"${TASK_ID}\", \"slot_id\": ${NODE_NUM}}" >/dev/null 2>&1 || true
+      elif [ "$TASK_TYPE" = "stop_vm" ]; then
+        SVM_ID=$(echo "$TASK_PAYLOAD" | jq -r '.vm_id')
+        stop_microvm "$SVM_ID" || true
+        curl -sS -X POST "${WORKER_URL}/api/runner/ack" \
+          -H "Content-Type: application/json" \
+          -d "{\"task_id\": \"${TASK_ID}\", \"slot_id\": ${NODE_NUM}}" >/dev/null 2>&1 || true
+      fi
+    done
+  fi
 
   if [ $((SECONDS - START_TIME)) -ge 20700 ] && [ "$HANDOVER_TRIGGERED" -eq 0 ]; then
     HANDOVER_TRIGGERED=1
@@ -181,5 +223,5 @@ while [ $((SECONDS - START_TIME)) -lt 21120 ]; do
       -d "{\"slot_id\": ${NODE_NUM}, \"runner_id\": \"${NODE_NAME}\"}" >/dev/null 2>&1 || true
   fi
 
-  sleep 30
+  sleep 5
 done

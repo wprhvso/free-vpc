@@ -17,9 +17,13 @@ export default {
         return await handleStatus(request, env);
       }
 
+      if (path === "/v1/vms/acquire" && method === "POST") {
+        return await handleAcquireVm(request, env);
+      }
+
       if (path === "/v1/vms") {
         if (method === "GET") return await handleListVms(request, env);
-        if (method === "POST") return await handleCreateVm(request, env);
+        if (method === "POST") return await handleAcquireVm(request, env);
       }
 
       if (path.startsWith("/v1/vms/")) {
@@ -34,6 +38,10 @@ export default {
 
       if (path === "/api/runner/heartbeat" && method === "POST") {
         return await handleRunnerHeartbeat(request, env);
+      }
+
+      if (path === "/api/runner/ack" && method === "POST") {
+        return await handleRunnerAck(request, env);
       }
 
       if (path === "/api/runner/handover" && method === "POST") {
@@ -54,7 +62,7 @@ export default {
       }
 
       return new Response(
-        "Free VPC Orchestrator API v1\nEndpoints: /status, /v1/vms, /v1/images, /api/runner/boot, /api/runner/heartbeat, /api/runner/handover\n",
+        "Free VPC Orchestrator API v1\nEndpoints: /status, /v1/vms, /v1/vms/acquire, /v1/images, /api/runner/boot, /api/runner/heartbeat, /api/runner/ack, /api/runner/handover\n",
         {
           headers: {
             "Content-Type": "text/plain; charset=utf-8",
@@ -164,6 +172,8 @@ async function handleStatus(request, env) {
   const activeRunners = (runnersQuery.results || []).filter(
     r => r.status === "online" && now - r.last_heartbeat < 90000
   );
+  const standbyVms = (vmsQuery.results || []).filter(v => v.status === "standby");
+  const claimedVms = (vmsQuery.results || []).filter(v => v.status === "claimed");
 
   return Response.json(
     {
@@ -171,6 +181,8 @@ async function handleStatus(request, env) {
       target,
       active_runners: activeRunners.length,
       total_vms: (vmsQuery.results || []).length,
+      standby_vms: standbyVms.length,
+      claimed_vms: claimedVms.length,
       runners: runnersQuery.results || [],
       vms: vmsQuery.results || []
     },
@@ -229,23 +241,152 @@ async function handleGetVm(request, env, id) {
   });
 }
 
-async function handleCreateVm(request, env) {
+async function handleAcquireVm(request, env) {
   const payload = await request.json();
-  const name = payload.name;
-  if (!name) {
-    return Response.json({ ok: false, error: "name is required" }, { status: 400, headers: corsHeaders() });
+  const now = Date.now();
+  const specifiedSlot = payload.slot_id ? parseInt(payload.slot_id, 10) : null;
+  const rawKeys = payload.ssh_keys || (payload.ssh_key ? [payload.ssh_key] : []);
+  const sshKeys = Array.isArray(rawKeys) ? rawKeys : [rawKeys];
+
+  let standbyVm = null;
+
+  if (specifiedSlot !== null) {
+    standbyVm = await env.DB.prepare(
+      `SELECT v.* FROM vms v
+       JOIN runners r ON v.runner_id = r.id
+       WHERE v.slot_id = ?
+         AND v.status = 'standby'
+         AND r.status = 'online'
+         AND (? - r.last_heartbeat) < 90000
+       ORDER BY v.ip ASC
+       LIMIT 1`
+    ).bind(specifiedSlot, now).first();
+  } else {
+    standbyVm = await env.DB.prepare(
+      `SELECT v.* FROM vms v
+       JOIN runners r ON v.runner_id = r.id
+       WHERE v.status = 'standby'
+         AND r.status = 'online'
+         AND (? - r.last_heartbeat) < 90000
+         AND (r.expires_at - ?) > 7200000
+       ORDER BY r.expires_at DESC
+       LIMIT 1`
+    ).bind(now, now).first();
+
+    if (!standbyVm) {
+      standbyVm = await env.DB.prepare(
+        `SELECT v.* FROM vms v
+         JOIN runners r ON v.runner_id = r.id
+         WHERE v.status = 'standby'
+           AND r.status = 'online'
+           AND (? - r.last_heartbeat) < 90000
+         ORDER BY r.expires_at DESC
+         LIMIT 1`
+      ).bind(now).first();
+    }
+
+    if (!standbyVm) {
+      standbyVm = await env.DB.prepare(
+        "SELECT * FROM vms WHERE status = 'standby' ORDER BY created_at ASC LIMIT 1"
+      ).first();
+    }
   }
 
-  let slotId = payload.slot_id;
+  if (standbyVm) {
+    const assignedName = payload.name || `vm-${standbyVm.slot_id}-${Date.now().toString(36)}`;
+    await env.DB.prepare(
+      `UPDATE vms
+       SET status = 'claimed',
+           name = ?,
+           ssh_keys = ?,
+           claimed_at = ?,
+           key_synced = 0,
+           updated_at = ?
+       WHERE id = ?`
+    ).bind(assignedName, JSON.stringify(sshKeys), now, now, standbyVm.id).run();
+
+    const taskId = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO runner_tasks (id, slot_id, type, payload, status, created_at)
+       VALUES (?, ?, 'claim', ?, 'pending', ?)`
+    ).bind(
+      taskId,
+      standbyVm.slot_id,
+      JSON.stringify({ vm_id: standbyVm.id, ip: standbyVm.ip, ssh_keys: sshKeys }),
+      now
+    ).run();
+
+    const remainingStandby = await env.DB.prepare(
+      "SELECT COUNT(*) as count FROM vms WHERE slot_id = ? AND status = 'standby'"
+    ).bind(standbyVm.slot_id).first();
+
+    if ((remainingStandby?.count || 0) < 1) {
+      const netInfo = calculateSubnet(standbyVm.slot_id);
+      const existingIpsQuery = await env.DB.prepare(
+        "SELECT ip FROM vms WHERE slot_id = ?"
+      ).bind(standbyVm.slot_id).all();
+      const takenIps = new Set((existingIpsQuery.results || []).map(r => r.ip));
+      let nextIp = null;
+      for (let y = 2; y <= 254; y++) {
+        const candidate = `10.${netInfo.x1}.${netInfo.x2}.${y}`;
+        if (!takenIps.has(candidate)) {
+          nextIp = candidate;
+          break;
+        }
+      }
+      if (nextIp) {
+        const newVmId = crypto.randomUUID();
+        const newVmName = `vm-${standbyVm.slot_id}-standby-${Date.now().toString(36)}`;
+        await env.DB.prepare(
+          `INSERT INTO vms (id, name, runner_id, slot_id, ip, status, vcpus, memory_mb, disk_gb, image, ssh_keys, claimed_at, key_synced, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'standby', 1, 1024, 10, 'debian-12', '[]', NULL, 1, ?, ?)`
+        ).bind(newVmId, newVmName, standbyVm.runner_id, standbyVm.slot_id, nextIp, now, now).run();
+
+        const spawnTaskId = crypto.randomUUID();
+        await env.DB.prepare(
+          `INSERT INTO runner_tasks (id, slot_id, type, payload, status, created_at)
+           VALUES (?, ?, 'spawn_standby', ?, 'pending', ?)`
+        ).bind(
+          spawnTaskId,
+          standbyVm.slot_id,
+          JSON.stringify({ vm_id: newVmId, ip: nextIp, vcpus: 1, memory_mb: 1024 }),
+          now
+        ).run();
+      }
+    }
+
+    const netInfo = calculateSubnet(standbyVm.slot_id);
+    return Response.json(
+      {
+        ok: true,
+        instant: true,
+        vm: {
+          id: standbyVm.id,
+          name: assignedName,
+          runner_id: standbyVm.runner_id,
+          slot_id: standbyVm.slot_id,
+          ip: standbyVm.ip,
+          gateway: netInfo.gateway_ip,
+          status: "ready",
+          vcpus: standbyVm.vcpus,
+          memory_mb: standbyVm.memory_mb
+        }
+      },
+      { status: 200, headers: corsHeaders() }
+    );
+  }
+
+  let slotId = specifiedSlot;
   if (!slotId) {
     const runner = await env.DB.prepare(
-      "SELECT slot_id FROM runners WHERE status = 'online' ORDER BY slot_id ASC"
-    ).first();
+      `SELECT slot_id FROM runners
+       WHERE status = 'online' AND (? - last_heartbeat) < 90000
+       ORDER BY expires_at DESC`
+    ).bind(now).first();
     slotId = runner ? runner.slot_id : 1;
   }
 
   const netInfo = calculateSubnet(slotId);
-
   const existingIpsQuery = await env.DB.prepare(
     "SELECT ip FROM vms WHERE slot_id = ?"
   ).bind(slotId).all();
@@ -268,20 +409,19 @@ async function handleCreateVm(request, env) {
   }
 
   const vmId = crypto.randomUUID();
-  const now = Date.now();
   const vcpus = payload.vcpus || 1;
   const memoryMb = payload.memory_mb || 1024;
   const diskGb = payload.disk_gb || 10;
   const image = payload.image || "debian-12";
-  const sshKeys = JSON.stringify(payload.ssh_keys || []);
   const runnerId = `runner-${slotId}`;
+  const vmName = payload.name || `vm-${slotId}-${Date.now().toString(36)}`;
 
   await env.DB.prepare(
-    `INSERT INTO vms (id, name, runner_id, slot_id, ip, status, vcpus, memory_mb, disk_gb, image, ssh_keys, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO vms (id, name, runner_id, slot_id, ip, status, vcpus, memory_mb, disk_gb, image, ssh_keys, claimed_at, key_synced, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?, ?, 0, ?, ?)`
   ).bind(
     vmId,
-    name,
+    vmName,
     runnerId,
     slotId,
     assignedIp,
@@ -289,34 +429,67 @@ async function handleCreateVm(request, env) {
     memoryMb,
     diskGb,
     image,
-    sshKeys,
+    JSON.stringify(sshKeys),
+    now,
     now,
     now
   ).run();
 
-  const createdVm = {
-    id: vmId,
-    name,
-    runner_id: runnerId,
-    slot_id: slotId,
-    ip: assignedIp,
-    gateway: netInfo.gateway_ip,
-    status: "running",
-    vcpus,
-    memory_mb: memoryMb,
-    disk_gb: diskGb,
-    image,
-    created_at: now
-  };
+  const spawnTaskId = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO runner_tasks (id, slot_id, type, payload, status, created_at)
+     VALUES (?, ?, 'spawn_standby', ?, 'pending', ?)`
+  ).bind(
+    spawnTaskId,
+    slotId,
+    JSON.stringify({ vm_id: vmId, ip: assignedIp, vcpus, memory_mb: memoryMb }),
+    now
+  ).run();
 
-  return Response.json({ ok: true, vm: createdVm }, { status: 201, headers: corsHeaders() });
+  const claimTaskId = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO runner_tasks (id, slot_id, type, payload, status, created_at)
+     VALUES (?, ?, 'claim', ?, 'pending', ?)`
+  ).bind(
+    claimTaskId,
+    slotId,
+    JSON.stringify({ vm_id: vmId, ip: assignedIp, ssh_keys: sshKeys }),
+    now
+  ).run();
+
+  return Response.json(
+    {
+      ok: true,
+      instant: false,
+      vm: {
+        id: vmId,
+        name: vmName,
+        runner_id: runnerId,
+        slot_id: slotId,
+        ip: assignedIp,
+        gateway: netInfo.gateway_ip,
+        status: "pending",
+        vcpus,
+        memory_mb: memoryMb
+      }
+    },
+    { status: 201, headers: corsHeaders() }
+  );
 }
 
 async function handleDeleteVm(request, env, id) {
-  const result = await env.DB.prepare("DELETE FROM vms WHERE id = ? OR name = ?").bind(id, id).run();
-  if (result.meta.changes === 0) {
+  const vm = await env.DB.prepare("SELECT * FROM vms WHERE id = ? OR name = ?").bind(id, id).first();
+  if (!vm) {
     return Response.json({ ok: false, error: "VM not found" }, { status: 404, headers: corsHeaders() });
   }
+
+  const taskId = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO runner_tasks (id, slot_id, type, payload, status, created_at)
+     VALUES (?, ?, 'stop_vm', ?, 'pending', ?)`
+  ).bind(taskId, vm.slot_id, JSON.stringify({ vm_id: vm.id }), Date.now()).run();
+
+  await env.DB.prepare("DELETE FROM vms WHERE id = ?").bind(vm.id).run();
   return Response.json({ ok: true, deleted: id }, { headers: corsHeaders() });
 }
 
@@ -359,13 +532,36 @@ async function handleRunnerBoot(request, env) {
     "SELECT * FROM vms WHERE slot_id = ?"
   ).bind(slotId).all();
 
+  let slotVms = vmsQuery.results || [];
+  if (slotVms.length === 0) {
+    const ip1 = `10.${netInfo.x1}.${netInfo.x2}.2`;
+    const ip2 = `10.${netInfo.x1}.${netInfo.x2}.3`;
+    const vm1Id = crypto.randomUUID();
+    const vm2Id = crypto.randomUUID();
+
+    await env.DB.prepare(
+      `INSERT INTO vms (id, name, runner_id, slot_id, ip, status, vcpus, memory_mb, disk_gb, image, ssh_keys, key_synced, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'standby', 1, 1024, 10, 'debian-12', '[]', 1, ?, ?)`
+    ).bind(vm1Id, `vm-${slotId}-standby-1`, runnerId, slotId, ip1, now, now).run();
+
+    await env.DB.prepare(
+      `INSERT INTO vms (id, name, runner_id, slot_id, ip, status, vcpus, memory_mb, disk_gb, image, ssh_keys, key_synced, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'standby', 1, 1024, 10, 'debian-12', '[]', 1, ?, ?)`
+    ).bind(vm2Id, `vm-${slotId}-standby-2`, runnerId, slotId, ip2, now, now).run();
+
+    const refreshed = await env.DB.prepare(
+      "SELECT * FROM vms WHERE slot_id = ?"
+    ).bind(slotId).all();
+    slotVms = refreshed.results || [];
+  }
+
   return Response.json({
     ok: true,
     runner_id: runnerId,
     slot_id: slotId,
     gateway_ip: netInfo.gateway_ip,
     subnet: netInfo.subnet,
-    vms: vmsQuery.results || []
+    vms: slotVms
   }, { headers: corsHeaders() });
 }
 
@@ -378,7 +574,36 @@ async function handleRunnerHeartbeat(request, env) {
     "UPDATE runners SET last_heartbeat = ?, status = 'online' WHERE slot_id = ?"
   ).bind(now, slotId).run();
 
-  return Response.json({ ok: true, timestamp: now }, { headers: corsHeaders() });
+  const tasksQuery = await env.DB.prepare(
+    "SELECT * FROM runner_tasks WHERE slot_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 10"
+  ).bind(slotId).all();
+
+  const tasks = (tasksQuery.results || []).map(t => {
+    let parsedPayload = t.payload;
+    if (typeof t.payload === "string") {
+      try {
+        parsedPayload = JSON.parse(t.payload);
+      } catch (e) {
+        parsedPayload = t.payload;
+      }
+    }
+    return {
+      id: t.id,
+      type: t.type,
+      payload: parsedPayload
+    };
+  });
+
+  return Response.json({ ok: true, timestamp: now, tasks }, { headers: corsHeaders() });
+}
+
+async function handleRunnerAck(request, env) {
+  const payload = await request.json();
+  const taskId = payload.task_id;
+  if (taskId) {
+    await env.DB.prepare("UPDATE runner_tasks SET status = 'completed' WHERE id = ?").bind(taskId).run();
+  }
+  return Response.json({ ok: true }, { headers: corsHeaders() });
 }
 
 async function handleRunnerHandover(request, env) {
