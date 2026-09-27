@@ -24,8 +24,7 @@ CREATE TABLE IF NOT EXISTS vms (
   image TEXT DEFAULT 'debian-12',
   ssh_keys TEXT,
   created_at INTEGER,
-  updated_at INTEGER,
-  FOREIGN KEY (runner_id) REFERENCES runners(id)
+  updated_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS images (

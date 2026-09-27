@@ -42,6 +42,30 @@ d1-tables:
       -H "Content-Type: application/json" \
       -d '{"sql": "SELECT name FROM sqlite_master WHERE type=\"table\" ORDER BY name;"}' | jq '.result[0].results'
 
+vm-create name slot="1" vcpus="1" ram="1024" image="debian-12-minimal":
+    @curl -sS -X POST "https://free-vpc-orchestrator.wprhvso.workers.dev/v1/vms" \
+      -H "Content-Type: application/json" \
+      -d '{"name":"{{name}}","slot_id":{{slot}},"vcpus":{{vcpus}},"memory_mb":{{ram}},"image":"{{image}}"}' | jq .
+
+vm-list:
+    @curl -sS "https://free-vpc-orchestrator.wprhvso.workers.dev/v1/vms" | jq .
+
+vm-delete name_or_id:
+    @curl -sS -X DELETE "https://free-vpc-orchestrator.wprhvso.workers.dev/v1/vms/{{name_or_id}}" | jq .
+
+image-add name repo path:
+    @curl -sS -X POST "https://free-vpc-orchestrator.wprhvso.workers.dev/v1/images" \
+      -H "Content-Type: application/json" \
+      -d '{"name":"{{name}}","hf_repo":"{{repo}}","hf_path":"{{path}}"}' | jq .
+
+image-list:
+    @curl -sS "https://free-vpc-orchestrator.wprhvso.workers.dev/v1/images" | jq .
+
+secret-set key value:
+    @curl -sS -X POST "https://free-vpc-orchestrator.wprhvso.workers.dev/v1/admin/secrets" \
+      -H "Content-Type: application/json" \
+      -d '{"key_name":"{{key}}","value":"{{value}}"}' | jq .
+
 spawn node_id="1":
     gh workflow run node.yml --repo wprhvso/free-vpc --ref init-free-vpc -f node_id={{node_id}}
 
@@ -67,7 +91,7 @@ stop run_id:
 
 ssh target="1":
     @if [[ "{{target}}" =~ ^[0-9]+$ ]]; then \
-      ssh -o StrictHostKeyChecking=no runner@10.0.1.{{target}}; \
+      ssh -o StrictHostKeyChecking=no runner@10.200.0.{{target}}; \
     else \
       ssh -o StrictHostKeyChecking=no runner@{{target}}; \
     fi
