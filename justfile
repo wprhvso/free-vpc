@@ -17,12 +17,8 @@ tf-plan:
 
 tf-apply:
     cd terraform && terraform apply -auto-approve \
-      -target=cloudflare_device_settings_policy.free_vpc_mesh \
-      -target=cloudflare_split_tunnel.mesh_include \
       -target=cloudflare_zero_trust_access_policy.device_enrollment \
       -target=cloudflare_zero_trust_access_application.warp_enrollment \
-      -target=cloudflare_split_tunnel.default_include \
-      -target=cloudflare_teams_rule.allow_mesh_traffic \
       -target=cloudflare_d1_database.free_vpc_db \
       -target=cloudflare_worker_script.orchestrator \
       -target=cloudflare_worker_cron_trigger.orchestrator_cron \
@@ -53,72 +49,42 @@ d1-tables:
       -H "Content-Type: application/json" \
       -d '{"sql": "SELECT name FROM sqlite_master WHERE type=\"table\" ORDER BY name;"}' | jq '.result[0].results'
 
-vm-create name slot="1" vcpus="1" ram="1024" image="debian-12-minimal":
+vm-create:
     @curl -sS -X POST "{{API_URL}}/api/vm" \
       -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
       -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" \
-      -H "Content-Type: application/json" \
-      -d '{"name":"{{name}}","slot_id":{{slot}},"vcpus":{{vcpus}},"memory_mb":{{ram}},"image":"{{image}}"}' | jq .
+      -H "Content-Type: application/json" | jq .
 
 vm-list:
     @curl -sS "{{API_URL}}/api/vm" \
       -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
       -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" | jq .
 
-vm-delete name_or_id:
-    @curl -sS -X DELETE "{{API_URL}}/api/vm/{{name_or_id}}" \
+vm-delete id:
+    @curl -sS -X DELETE "{{API_URL}}/api/vm/{{id}}" \
       -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
       -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" | jq .
 
-image-add name repo path:
-    @curl -sS -X POST "{{API_URL}}/api/images" \
-      -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
-      -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" \
-      -H "Content-Type: application/json" \
-      -d '{"name":"{{name}}","hf_repo":"{{repo}}","hf_path":"{{path}}"}' | jq .
-
-image-list:
-    @curl -sS "{{API_URL}}/api/images" \
+keys-get:
+    @curl -sS "{{API_URL}}/api/ssh-keys" \
       -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
       -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" | jq .
 
-secret-set key value:
-    @curl -sS -X POST "{{API_URL}}/api/secrets" \
+keys-set keys_file:
+    @curl -sS -X POST "{{API_URL}}/api/ssh-keys" \
       -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
       -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" \
       -H "Content-Type: application/json" \
-      -d '{"key_name":"{{key}}","value":"{{value}}"}' | jq .
+      -d "$$(jq -n --arg keys "$$(cat {{keys_file}})" '{"keys": ($$keys | split("\n"))}')" | jq .
 
 spawn node_id="1":
     gh workflow run node.yml --repo wprhvso/free-vpc --ref init-free-vpc -f node_id={{node_id}}
 
-spawn-all:
-    @curl -sS -X POST "{{API_URL}}/api/spawn" \
-      -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
-      -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" | jq .
-
-worker-status:
-    @curl -sS "{{API_URL}}/api/status" \
-      -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
-      -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" | jq .
-
 nodes:
     gh run list --repo wprhvso/free-vpc --workflow node.yml --limit 20
-
-status:
-    @echo "=== Active WARP Connectors ==="
-    @curl -sS -H "Authorization: Bearer ${CF_API_TOKEN:-cfat_hzrn3XyC7ntmtpMyD9znlPmhBMKNbU0QBT1DiYaW57abbf4d}" \
-      "https://api.cloudflare.com/client/v4/accounts/39f6858f9b5865652ac69c506ec4736c/warp_connector" | jq '.result[] | {id, name, status}'
-    @echo "=== Private CIDR Routes ==="
-    @curl -sS -H "Authorization: Bearer ${CF_API_TOKEN:-cfat_hzrn3XyC7ntmtpMyD9znlPmhBMKNbU0QBT1DiYaW57abbf4d}" \
-      "https://api.cloudflare.com/client/v4/accounts/39f6858f9b5865652ac69c506ec4736c/teamnet/routes" | jq '.result[] | {network, comment, tunnel_id}'
 
 stop run_id:
     gh run cancel {{run_id}} --repo wprhvso/free-vpc
 
-ssh target="1":
-    @if [[ "{{target}}" =~ ^[0-9]+$ ]]; then \
-      ssh -o StrictHostKeyChecking=no runner@10.200.0.{{target}}; \
-    else \
-      ssh -o StrictHostKeyChecking=no runner@{{target}}; \
-    fi
+ssh ip:
+    ssh -o StrictHostKeyChecking=no runner@{{ip}}

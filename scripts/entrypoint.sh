@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/firecracker_manager.sh"
 
-WORKER_URL="${WORKER_URL:-https://free-vpc-orchestrator.wprhvso.workers.dev}"
+WORKER_URL="${WORKER_URL:-https://vm.unsafie.com}"
 
 sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd sudo iptables e2fsprogs
 
@@ -54,99 +54,68 @@ setup_zswap
 setup_ksm
 
 NODE_NUM="${NODE_ID:-1}"
-X1=$(( 2 + (NODE_NUM - 1) / 256 ))
-X2=$(( (NODE_NUM - 1) % 256 ))
-SUBNET="10.${X1}.${X2}.0/24"
-GATEWAY_IP="10.${X1}.${X2}.1"
 
-setup_bridge "$GATEWAY_IP" "$SUBNET"
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo systemctl start tailscaled || sudo tailscaled --state=/var/lib/tailscale/tailscaled.state &
+sleep 2
 
-NODE_NAME="free-vpc-${GITHUB_RUN_ID:-manual}-${NODE_NUM}"
-CREATE_RESP=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector" \
-  -H "Authorization: Bearer ${CF_API_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d "{\"name\": \"${NODE_NAME}\"}")
-NODE_ID_CF=$(echo "$CREATE_RESP" | jq -r '.result.id // empty')
+TS_AUTH="${TAILSCALE_AUTH_KEY:-${TAILSCALE_AUTHKEY:-}}"
+sudo tailscale up --authkey="${TS_AUTH}" --hostname="free-vpc-${NODE_NUM}" --accept-routes --ssh
 
-if [ -z "$NODE_ID_CF" ]; then
-  echo "Failed to create WARP connector: $CREATE_RESP" >&2
-  exit 1
-fi
-
-TOKEN_RESP=$(curl -sS "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector/${NODE_ID_CF}/token" \
-  -H "Authorization: Bearer ${CF_API_TOKEN}")
-CONNECTOR_TOKEN=$(echo "$TOKEN_RESP" | jq -r '.result // empty')
-
-ROUTE_RESP=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/teamnet/routes" \
-  -H "Authorization: Bearer ${CF_API_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"network\": \"${SUBNET}\",
-    \"tunnel_id\": \"${NODE_ID_CF}\",
-    \"comment\": \"Runner ${NODE_NUM}\"
-  }")
-ROUTE_ID=$(echo "$ROUTE_RESP" | jq -r '.result.id // empty')
-
-cleanup() {
-  if [ -n "${ROUTE_ID:-}" ]; then
-    curl -sS -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/teamnet/routes/${ROUTE_ID}" \
-      -H "Authorization: Bearer ${CF_API_TOKEN}" || true
+TAILSCALE_IP=""
+for i in $(seq 1 30); do
+  TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || true)
+  if [ -n "$TAILSCALE_IP" ]; then
+    break
   fi
-  sudo warp-cli --accept-tos disconnect || true
-  if [ -n "${NODE_ID_CF:-}" ]; then
-    curl -sS -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector/${NODE_ID_CF}" \
-      -H "Authorization: Bearer ${CF_API_TOKEN}" || true
-  fi
-}
-trap cleanup EXIT INT TERM
-
-curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-sudo apt-get update -qq && sudo apt-get install -y -qq cloudflare-warp
-
-sudo warp-cli --accept-tos connector new "$CONNECTOR_TOKEN"
-sudo warp-cli --accept-tos connect
-
-sleep 3
-
-sudo ip route replace 10.0.0.0/8 dev CloudflareWARP 2>/dev/null || sudo ip route add 10.0.0.0/8 dev CloudflareWARP 2>/dev/null || true
-sudo ip route replace 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || sudo ip route add 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || true
+  sleep 1
+done
 
 BOOT_DATA=$(curl -sS -X POST "${WORKER_URL}/api/runner/boot" \
   -H "Content-Type: application/json" \
-  -d "{\"run_id\": ${GITHUB_RUN_ID:-0}, \"slot_id\": ${NODE_NUM}}")
+  -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID:-5a06f20e534be12f4e259e932af57b57.access}" \
+  -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET:-cfast_clJJ6Rx6HA0bdn2eXV31EO7UNnApjsLaOOdkWCMe71e2052a}" \
+  -d "{\"run_id\": ${GITHUB_RUN_ID:-0}, \"slot_id\": ${NODE_NUM}, \"tailscale_ip\": \"${TAILSCALE_IP}\"}")
 
-install_firecracker
-download_assets
+CURRENT_KEYS_HASH=""
 
-VMS_COUNT=$(echo "$BOOT_DATA" | jq '.vms | length')
-if [ "$VMS_COUNT" -gt 0 ]; then
-  for row in $(echo "$BOOT_DATA" | jq -r '.vms[] | @base64'); do
-    _jq() {
-      echo "${row}" | base64 --decode | jq -r "${1}"
-    }
-    VM_ID=$(_jq '.id')
-    VM_IP=$(_jq '.ip')
-    VM_VCPUS=$(_jq '.vcpus')
-    VM_RAM=$(_jq '.memory_mb')
-    spawn_microvm "$VM_ID" "$VM_IP" "$GATEWAY_IP" "$VM_VCPUS" "$VM_RAM"
-  done
-else
-  DEFAULT_VM_IP="10.${X1}.${X2}.2"
-  spawn_microvm "vm-${NODE_NUM}-default" "$DEFAULT_VM_IP" "$GATEWAY_IP" 2 2048 || true
-fi
+sync_keys() {
+  local json_keys="$1"
+  local new_hash
+  new_hash=$(echo "$json_keys" | md5sum | awk '{print $1}')
+  if [ "$new_hash" != "$CURRENT_KEYS_HASH" ]; then
+    CURRENT_KEYS_HASH="$new_hash"
+    local tmp_k="/tmp/ts_keys.txt"
+    echo "$json_keys" | jq -r '.[]' 2>/dev/null > "$tmp_k" || true
+    if [ -s "$tmp_k" ]; then
+      sudo cp "$tmp_k" "$AUTH_FILE"
+      sudo cp "$tmp_k" /root/.ssh/authorized_keys
+      sudo cp "$tmp_k" /tmp/free-vpc-auth-keys
+      sudo chmod 600 "$AUTH_FILE" /root/.ssh/authorized_keys /tmp/free-vpc-auth-keys
+    fi
+    rm -f "$tmp_k"
+  fi
+}
 
-if [ -n "${GH_PAT:-}" ]; then
+INIT_KEYS=$(echo "$BOOT_DATA" | jq '.ssh_keys // []')
+sync_keys "$INIT_KEYS"
+
+if [ -n "${GH_PAT:-}" ] && [ -n "${TAILSCALE_IP}" ]; then
   curl -sS -X PATCH "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/NODE_IP" \
     -H "Authorization: Bearer ${GH_PAT}" \
     -H "Accept: application/vnd.github.v3+json" \
     -H "Content-Type: application/json" \
-    -d "{\"name\":\"NODE_IP\",\"value\":\"${GATEWAY_IP}\"}" || true
+    -d "{\"name\":\"NODE_IP\",\"value\":\"${TAILSCALE_IP}\"}" || true
 fi
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  printf "## Free VPC Node Online\n- Node: %s\n- Host Gateway IP: \`%s\`\n- MicroVM Subnet: \`%s\`\n- Default VM IP: \`10.%s.%s.2\`\n" "$NODE_NAME" "$GATEWAY_IP" "$SUBNET" "$X1" "$X2" >> "$GITHUB_STEP_SUMMARY"
+  printf "## Free VPC Online\n- Tailscale IP: \`%s\`\n- Slot: \`#%s\`\n- SSH Command: \`ssh runner@%s\`\n" "$TAILSCALE_IP" "$NODE_NUM" "$TAILSCALE_IP" >> "$GITHUB_STEP_SUMMARY"
 fi
+
+cleanup() {
+  sudo tailscale logout || true
+}
+trap cleanup EXIT INT TERM
 
 START_TIME=$SECONDS
 HANDOVER_TRIGGERED=0
@@ -156,16 +125,25 @@ while [ $((SECONDS - START_TIME)) -lt 21120 ]; do
     break
   fi
 
-  curl -sS -X POST "${WORKER_URL}/api/runner/heartbeat" \
+  HB_DATA=$(curl -sS -X POST "${WORKER_URL}/api/runner/heartbeat" \
     -H "Content-Type: application/json" \
-    -d "{\"slot_id\": ${NODE_NUM}, \"runner_id\": \"${NODE_NAME}\"}" >/dev/null 2>&1 || true
+    -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID:-5a06f20e534be12f4e259e932af57b57.access}" \
+    -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET:-cfast_clJJ6Rx6HA0bdn2eXV31EO7UNnApjsLaOOdkWCMe71e2052a}" \
+    -d "{\"slot_id\": ${NODE_NUM}, \"tailscale_ip\": \"${TAILSCALE_IP}\"}" 2>/dev/null || true)
+
+  LATEST_KEYS=$(echo "$HB_DATA" | jq '.ssh_keys // []' 2>/dev/null || true)
+  if [ -n "$LATEST_KEYS" ] && [ "$LATEST_KEYS" != "null" ]; then
+    sync_keys "$LATEST_KEYS"
+  fi
 
   if [ $((SECONDS - START_TIME)) -ge 20700 ] && [ "$HANDOVER_TRIGGERED" -eq 0 ]; then
     HANDOVER_TRIGGERED=1
     curl -sS -X POST "${WORKER_URL}/api/runner/handover" \
       -H "Content-Type: application/json" \
-      -d "{\"slot_id\": ${NODE_NUM}, \"runner_id\": \"${NODE_NAME}\"}" >/dev/null 2>&1 || true
+      -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID:-5a06f20e534be12f4e259e932af57b57.access}" \
+      -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET:-cfast_clJJ6Rx6HA0bdn2eXV31EO7UNnApjsLaOOdkWCMe71e2052a}" \
+      -d "{\"slot_id\": ${NODE_NUM}}" >/dev/null 2>&1 || true
   fi
 
-  sleep 30
+  sleep 15
 done
