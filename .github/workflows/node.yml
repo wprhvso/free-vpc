@@ -26,6 +26,7 @@ jobs:
           SSH_HOST_ED25519_KEY: ${{ secrets.SSH_HOST_ED25519_KEY }}
           SSH_HOST_RSA_KEY: ${{ secrets.SSH_HOST_RSA_KEY }}
           SSH_AUTHORIZED_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
           GH_PAT: ${{ secrets.GH_PAT }}
           NODE_ID: ${{ github.event.inputs.node_id || github.event.client_payload.node_id || '1' }}
           WORKER_URL: https://free-vpc-orchestrator.wprhvso.workers.dev

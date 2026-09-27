@@ -57,7 +57,7 @@ install_firecracker() {
   if ! command -v firecracker >/dev/null 2>&1; then
     mkdir -p /tmp/fc-install
     curl -fsSL "$FC_URL" | tar -zx -C /tmp/fc-install
-    sudo mv /tmp/fc-install/release-*/firecracker-* /usr/local/bin/firecracker
+    sudo cp /tmp/fc-install/release-*/firecracker-${FC_VERSION}-x86_64 /usr/local/bin/firecracker
     sudo chmod +x /usr/local/bin/firecracker
     rm -rf /tmp/fc-install
   fi

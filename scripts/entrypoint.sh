@@ -97,6 +97,9 @@ cleanup() {
     curl -sS -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector/${NODE_ID_CF}" \
       -H "Authorization: Bearer ${CF_API_TOKEN}" || true
   fi
+  if command -v tailscale >/dev/null 2>&1; then
+    sudo tailscale logout || true
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -111,6 +114,17 @@ sleep 3
 
 sudo ip route replace 10.0.0.0/8 dev CloudflareWARP 2>/dev/null || sudo ip route add 10.0.0.0/8 dev CloudflareWARP 2>/dev/null || true
 sudo ip route replace 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || sudo ip route add 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || true
+
+TS_IP=""
+if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
+  curl -fsSL https://tailscale.com/install.sh | sudo sh
+  sudo systemctl enable --now tailscaled || true
+  sleep 2
+  sudo tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${NODE_NAME}" --accept-routes --ssh || \
+  sudo tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${NODE_NAME}" --accept-routes || true
+  TS_IP=$(tailscale ip -4 2>/dev/null || true)
+  echo "Tailscale online: ${NODE_NAME} (${TS_IP})"
+fi
 
 BOOT_DATA=$(curl -sS -X POST "${WORKER_URL}/api/runner/boot" \
   -H "Content-Type: application/json" \
@@ -145,7 +159,7 @@ if [ -n "${GH_PAT:-}" ]; then
 fi
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  printf "## Free VPC Node Online\n- Node: %s\n- Host Gateway IP: \`%s\`\n- MicroVM Subnet: \`%s\`\n- Default VM IP: \`10.%s.%s.2\`\n" "$NODE_NAME" "$GATEWAY_IP" "$SUBNET" "$X1" "$X2" >> "$GITHUB_STEP_SUMMARY"
+  printf "## Free VPC Node Online\n- Node: %s\n- Host Gateway IP: \`%s\`\n- MicroVM Subnet: \`%s\`\n- Default VM IP: \`10.%s.%s.2\`\n- Tailscale IP: \`%s\`\n" "$NODE_NAME" "$GATEWAY_IP" "$SUBNET" "$X1" "$X2" "${TS_IP:-none}" >> "$GITHUB_STEP_SUMMARY"
 fi
 
 START_TIME=$SECONDS
