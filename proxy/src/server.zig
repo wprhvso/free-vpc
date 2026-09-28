@@ -38,6 +38,27 @@ const Mutex = struct {
     }
 };
 
+const Semaphore = struct {
+    count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    pub fn post(self: *Semaphore) void {
+        _ = self.count.fetchAdd(1, .release);
+        _ = std.os.linux.syscall3(.futex, @intFromPtr(&self.count.raw), 1, 1);
+    }
+
+    pub fn wait(self: *Semaphore) void {
+        while (true) {
+            var c = self.count.load(.acquire);
+            while (c > 0) {
+                if (self.count.cmpxchgWeak(c, c - 1, .acquire, .monotonic)) |actual| {
+                    c = actual;
+                } else return;
+            }
+            _ = std.os.linux.syscall4(.futex, @intFromPtr(&self.count.raw), 0, 0, 0);
+        }
+    }
+};
+
 fn sleepMs(ms: u64) void {
     const timespec = extern struct {
         sec: i64,
@@ -61,27 +82,55 @@ fn parseIp4(s: []const u8, out: *[4]u8) bool {
     return (i == 4);
 }
 
+fn getDnsServerIp() [4]u8 {
+    const out: [4]u8 = .{ 1, 1, 1, 1 };
+    const fd_rc = std.os.linux.syscall2(.open, @intFromPtr("/etc/resolv.conf"), 0);
+    if (@as(isize, @bitCast(fd_rc)) < 0) return out;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, fd))));
+
+    var buf: [1024]u8 = undefined;
+    const rd = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&buf), buf.len);
+    const signed: isize = @bitCast(rd);
+    if (signed <= 0) return out;
+    const content = buf[0..@intCast(signed)];
+
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "nameserver")) {
+            const rest = std.mem.trim(u8, trimmed["nameserver".len..], " \t");
+            var ip: [4]u8 = undefined;
+            if (parseIp4(rest, &ip)) {
+                return ip;
+            }
+        }
+    }
+    return out;
+}
+
 fn resolveDnsA(domain: []const u8, out_ip: *[4]u8) bool {
     const sock_rc = std.os.linux.syscall3(.socket, 2, 2, 0);
     if (@as(isize, @bitCast(sock_rc)) < 0) return false;
     const sock: i32 = @intCast(sock_rc);
     defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, sock))));
 
-    const timeout = extern struct { sec: i64 = 2, usec: i64 = 0 }{};
+    const timeout = extern struct { sec: i64 = 3, usec: i64 = 0 }{};
     _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, sock))), 1, 20, @intFromPtr(&timeout), @sizeOf(@TypeOf(timeout)));
 
+    const dns_ip = getDnsServerIp();
     const dns_server = sockaddr_in{
         .family = 2,
         .port = std.mem.nativeToBig(u16, 53),
-        .addr = @as(u32, @bitCast([4]u8{ 77, 88, 8, 8 })),
+        .addr = @as(u32, @bitCast(dns_ip)),
     };
 
     const conn_rc = std.os.linux.syscall3(.connect, @as(usize, @bitCast(@as(isize, sock))), @intFromPtr(&dns_server), @sizeOf(sockaddr_in));
     if (@as(isize, @bitCast(conn_rc)) < 0) return false;
 
     var query_buf: [512]u8 = undefined;
-    query_buf[0] = 0x12;
-    query_buf[1] = 0x34;
+    query_buf[0] = 0x24;
+    query_buf[1] = 0x68;
     query_buf[2] = 0x01;
     query_buf[3] = 0x00;
     query_buf[4] = 0x00;
@@ -121,7 +170,7 @@ fn resolveDnsA(domain: []const u8, out_ip: *[4]u8) bool {
     if (read_len < 12) return false;
 
     const r_len: usize = @intCast(read_len);
-    if (resp_buf[0] != 0x12 or resp_buf[1] != 0x34) return false;
+    if (resp_buf[0] != 0x24 or resp_buf[1] != 0x68) return false;
     const ancount = std.mem.readInt(u16, resp_buf[6..8], .big);
     if (ancount == 0) return false;
 
@@ -178,43 +227,90 @@ fn listenOn(host: []const u8, port: u16) !i32 {
     return fd;
 }
 
+const RingBuffer = struct {
+    data: []u8,
+    read_index: usize = 0,
+    write_index: usize = 0,
+    count: usize = 0,
+    mutex: Mutex = .{},
+
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) !RingBuffer {
+        return .{
+            .data = try allocator.alloc(u8, capacity),
+            .read_index = 0,
+            .write_index = 0,
+            .count = 0,
+        };
+    }
+
+    pub fn deinit(self: *RingBuffer, allocator: std.mem.Allocator) void {
+        allocator.free(self.data);
+    }
+
+    pub fn push(self: *RingBuffer, bytes: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.count + bytes.len > self.data.len) return false;
+
+        const first = @min(bytes.len, self.data.len - self.write_index);
+        @memcpy(self.data[self.write_index .. self.write_index + first], bytes[0..first]);
+
+        const second = bytes.len - first;
+        if (second > 0) {
+            @memcpy(self.data[0..second], bytes[first..]);
+        }
+
+        self.write_index = (self.write_index + bytes.len) % self.data.len;
+        self.count += bytes.len;
+        return true;
+    }
+
+    pub fn drainAtMost(self: *RingBuffer, dest: []u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const to_read = @min(self.count, dest.len);
+        if (to_read == 0) return 0;
+
+        const first = @min(to_read, self.data.len - self.read_index);
+        @memcpy(dest[0..first], self.data[self.read_index .. self.read_index + first]);
+
+        const second = to_read - first;
+        if (second > 0) {
+            @memcpy(dest[first..to_read], self.data[0..second]);
+        }
+
+        self.read_index = (self.read_index + to_read) % self.data.len;
+        self.count -= to_read;
+        return to_read;
+    }
+};
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     host: []const u8,
     port: u16,
-    buffer_capacity: usize,
-    downstream_sink: ?protocol.SocketStream = null,
-    sink_mutex: Mutex = .{},
-    downstream_backup: std.ArrayList(u8) = .empty,
-    backup_mutex: Mutex = .{},
+    downstream_ring: RingBuffer,
+    downstream_sem: Semaphore = .{},
     streams: std.AutoHashMap(u32, protocol.SocketStream),
     streams_mutex: Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, buf_mb: usize) Server {
+        const ring = RingBuffer.init(allocator, buf_mb * 1024 * 1024) catch unreachable;
         return .{
             .allocator = allocator,
             .io = io,
             .host = host,
             .port = port,
-            .buffer_capacity = buf_mb * 1024 * 1024,
-            .downstream_backup = .empty,
+            .downstream_ring = ring,
             .streams = std.AutoHashMap(u32, protocol.SocketStream).init(allocator),
         };
     }
 
     pub fn deinit(self: *Server) void {
-        self.sink_mutex.lock();
-        if (self.downstream_sink) |sink| {
-            sink.shutdown();
-            sink.close();
-            self.downstream_sink = null;
-        }
-        self.sink_mutex.unlock();
-
-        self.backup_mutex.lock();
-        self.downstream_backup.deinit(self.allocator);
-        self.backup_mutex.unlock();
+        self.downstream_ring.deinit(self.allocator);
 
         self.streams_mutex.lock();
         var it = self.streams.iterator();
@@ -226,63 +322,27 @@ pub const Server = struct {
         self.streams_mutex.unlock();
     }
 
-    pub fn sendDownstreamDirect(self: *Server, frame: []const u8) void {
-        self.sink_mutex.lock();
-        if (self.downstream_sink) |sink| {
-            var chunk_hdr: [32]u8 = undefined;
-            const hdr = std.fmt.bufPrint(&chunk_hdr, "{x}\r\n", .{frame.len}) catch {
-                self.sink_mutex.unlock();
-                return;
-            };
-
-            sink.writeAll(hdr) catch {
-                self.downstream_sink = null;
-                self.sink_mutex.unlock();
-                self.bufferBackup(frame);
-                return;
-            };
-
-            sink.writeAll(frame) catch {
-                self.downstream_sink = null;
-                self.sink_mutex.unlock();
-                self.bufferBackup(frame);
-                return;
-            };
-
-            sink.writeAll("\r\n") catch {
-                self.downstream_sink = null;
-                self.sink_mutex.unlock();
-                return;
-            };
-
-            self.sink_mutex.unlock();
-        } else {
-            self.sink_mutex.unlock();
-            self.bufferBackup(frame);
-        }
-    }
-
-    fn bufferBackup(self: *Server, frame: []const u8) void {
-        self.backup_mutex.lock();
-        defer self.backup_mutex.unlock();
-        if (self.downstream_backup.items.len + frame.len <= self.buffer_capacity) {
-            self.downstream_backup.appendSlice(self.allocator, frame) catch {};
-        }
-    }
-
     pub fn sendToDownstream(self: *Server, stream_id: u32, cmd: protocol.Cmd, payload: []const u8) void {
         var static_buf: [4096]u8 = undefined;
         const total = @sizeOf(protocol.Header) + payload.len;
 
+        var full_frame: []u8 = undefined;
+        var dyn_buf: ?[]u8 = null;
+        defer if (dyn_buf) |b| self.allocator.free(b);
+
         if (total <= static_buf.len) {
-            const n = protocol.writeFrame(&static_buf, stream_id, cmd, payload) catch return;
-            self.sendDownstreamDirect(static_buf[0..n]);
+            full_frame = static_buf[0..total];
         } else {
-            const dyn_buf = self.allocator.alloc(u8, total) catch return;
-            defer self.allocator.free(dyn_buf);
-            const n = protocol.writeFrame(dyn_buf, stream_id, cmd, payload) catch return;
-            self.sendDownstreamDirect(dyn_buf[0..n]);
+            dyn_buf = self.allocator.alloc(u8, total) catch return;
+            full_frame = dyn_buf.?;
         }
+
+        const n = protocol.writeFrame(full_frame, stream_id, cmd, payload) catch return;
+
+        while (!self.downstream_ring.push(full_frame[0..n])) {
+            sleepMs(2);
+        }
+        self.downstream_sem.post();
     }
 
     pub fn closeStream(self: *Server, stream_id: u32) void {
@@ -309,47 +369,53 @@ pub const Server = struct {
             if (@as(isize, @bitCast(accept_rc)) < 0) continue;
             const client_fd: i32 = @intCast(accept_rc);
             const stream = protocol.SocketStream{ .handle = client_fd };
-            const thread = try std.Thread.spawn(.{}, handleConnection, .{ self, stream });
+            const thread = std.Thread.spawn(.{}, handleConnection, .{ self, stream }) catch {
+                stream.close();
+                continue;
+            };
             thread.detach();
         }
     }
 
+    fn readHeaders(stream: protocol.SocketStream, buf: []u8) ![]const u8 {
+        var total: usize = 0;
+        while (total < buf.len) {
+            var b: [1]u8 = undefined;
+            const n = try stream.read(&b);
+            if (n == 0) return error.ConnectionClosed;
+            buf[total] = b[0];
+            total += 1;
+            if (total >= 4 and std.mem.eql(u8, buf[total - 4 .. total], "\r\n\r\n")) {
+                return buf[0..total];
+            }
+        }
+        return error.HeadersTooLong;
+    }
+
+    fn readExact(stream: protocol.SocketStream, buf: []u8) !void {
+        var total: usize = 0;
+        while (total < buf.len) {
+            const n = try stream.read(buf[total..]);
+            if (n == 0) return error.ConnectionClosed;
+            total += n;
+        }
+    }
+
     fn handleConnection(self: *Server, stream: protocol.SocketStream) void {
-        var read_buf: [8192]u8 = undefined;
+        var header_buf: [8192]u8 = undefined;
 
         while (true) {
-            var total_read: usize = 0;
-            var header_end: ?usize = null;
-
-            while (total_read < read_buf.len) {
-                const n = stream.read(read_buf[total_read..]) catch 0;
-                if (n == 0) {
-                    stream.close();
-                    return;
-                }
-                total_read += n;
-
-                if (std.mem.indexOf(u8, read_buf[0..total_read], "\r\n\r\n")) |idx| {
-                    header_end = idx;
-                    break;
-                }
-            }
-
-            const h_end = header_end orelse {
+            const headers = readHeaders(stream, &header_buf) catch {
                 stream.close();
                 return;
             };
-
-            const headers = read_buf[0..h_end];
-            const body_start = h_end + 4;
-            const initial_body_len = total_read - body_start;
 
             const first_line_end = std.mem.indexOf(u8, headers, "\r\n") orelse headers.len;
             const req_line = headers[0..first_line_end];
 
             if (std.mem.startsWith(u8, req_line, "GET /health") or std.mem.startsWith(u8, req_line, "GET / ")) {
                 const resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
-                _ = stream.writeAll(resp) catch return;
+                stream.writeAll(resp) catch return;
                 continue;
             }
 
@@ -367,26 +433,23 @@ pub const Server = struct {
                     return;
                 };
 
-                self.sink_mutex.lock();
-                if (self.downstream_sink) |old_sink| {
-                    old_sink.shutdown();
-                    old_sink.close();
-                }
-                self.downstream_sink = stream;
-                self.sink_mutex.unlock();
+                var drain_buf: [65536]u8 = undefined;
+                var chunk_hdr: [32]u8 = undefined;
 
-                self.backup_mutex.lock();
-                if (self.downstream_backup.items.len > 0) {
-                    const saved = self.downstream_backup.toOwnedSlice(self.allocator) catch null;
-                    self.backup_mutex.unlock();
-                    if (saved) |buf| {
-                        defer self.allocator.free(buf);
-                        self.sendDownstreamDirect(buf);
-                    }
-                } else {
-                    self.backup_mutex.unlock();
+                while (true) {
+                    self.downstream_sem.wait();
+                    const n = self.downstream_ring.drainAtMost(&drain_buf);
+                    if (n == 0) continue;
+
+                    const frame = drain_buf[0..n];
+                    const hdr = std.fmt.bufPrint(&chunk_hdr, "{x}\r\n", .{frame.len}) catch break;
+
+                    stream.writeAll(hdr) catch break;
+                    stream.writeAll(frame) catch break;
+                    stream.writeAll("\r\n") catch break;
                 }
 
+                stream.close();
                 return;
             }
 
@@ -398,37 +461,27 @@ pub const Server = struct {
 
                 if (content_len == 0) {
                     const resp = "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n";
-                    _ = stream.writeAll(resp) catch return;
+                    stream.writeAll(resp) catch return;
                     continue;
                 }
 
-                var body = self.allocator.alloc(u8, content_len) catch return;
+                const body = self.allocator.alloc(u8, content_len) catch return;
                 defer self.allocator.free(body);
 
-                if (initial_body_len > 0) {
-                    const to_copy = @min(initial_body_len, content_len);
-                    @memcpy(body[0..to_copy], read_buf[body_start .. body_start + to_copy]);
-                }
-
-                var current_body_len = @min(initial_body_len, content_len);
-                while (current_body_len < content_len) {
-                    const n = stream.read(body[current_body_len..]) catch 0;
-                    if (n == 0) {
-                        stream.close();
-                        return;
-                    }
-                    current_body_len += n;
-                }
+                readExact(stream, body) catch {
+                    stream.close();
+                    return;
+                };
 
                 self.processPushBody(body);
 
                 const resp = "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n";
-                _ = stream.writeAll(resp) catch return;
+                stream.writeAll(resp) catch return;
                 continue;
             }
 
             const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            _ = stream.writeAll(not_found) catch return;
+            stream.writeAll(not_found) catch return;
             stream.close();
             return;
         }

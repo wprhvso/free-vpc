@@ -30,6 +30,27 @@ const Mutex = struct {
     }
 };
 
+const Semaphore = struct {
+    count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    pub fn post(self: *Semaphore) void {
+        _ = self.count.fetchAdd(1, .release);
+        _ = std.os.linux.syscall3(.futex, @intFromPtr(&self.count.raw), 1, 1);
+    }
+
+    pub fn wait(self: *Semaphore) void {
+        while (true) {
+            var c = self.count.load(.acquire);
+            while (c > 0) {
+                if (self.count.cmpxchgWeak(c, c - 1, .acquire, .monotonic)) |actual| {
+                    c = actual;
+                } else return;
+            }
+            _ = std.os.linux.syscall4(.futex, @intFromPtr(&self.count.raw), 0, 0, 0);
+        }
+    }
+};
+
 fn sleepMs(ms: u64) void {
     const timespec = extern struct {
         sec: i64,
@@ -51,6 +72,124 @@ fn parseIp4(s: []const u8, out: *[4]u8) bool {
         i += 1;
     }
     return (i == 4);
+}
+
+fn getDnsServerIp() [4]u8 {
+    const out: [4]u8 = .{ 77, 88, 8, 8 };
+    const fd_rc = std.os.linux.syscall2(.open, @intFromPtr("/etc/resolv.conf"), 0);
+    if (@as(isize, @bitCast(fd_rc)) < 0) return out;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, fd))));
+
+    var buf: [1024]u8 = undefined;
+    const rd = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&buf), buf.len);
+    const signed: isize = @bitCast(rd);
+    if (signed <= 0) return out;
+    const content = buf[0..@intCast(signed)];
+
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "nameserver")) {
+            const rest = std.mem.trim(u8, trimmed["nameserver".len..], " \t");
+            var ip: [4]u8 = undefined;
+            if (parseIp4(rest, &ip)) {
+                return ip;
+            }
+        }
+    }
+    return out;
+}
+
+fn resolveDnsA(domain: []const u8, out_ip: *[4]u8) bool {
+    const sock_rc = std.os.linux.syscall3(.socket, 2, 2, 0);
+    if (@as(isize, @bitCast(sock_rc)) < 0) return false;
+    const sock: i32 = @intCast(sock_rc);
+    defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, sock))));
+
+    const timeout = extern struct { sec: i64 = 3, usec: i64 = 0 }{};
+    _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, sock))), 1, 20, @intFromPtr(&timeout), @sizeOf(@TypeOf(timeout)));
+
+    const dns_ip = getDnsServerIp();
+    const dns_server = sockaddr_in{
+        .family = 2,
+        .port = std.mem.nativeToBig(u16, 53),
+        .addr = @as(u32, @bitCast(dns_ip)),
+    };
+
+    const conn_rc = std.os.linux.syscall3(.connect, @as(usize, @bitCast(@as(isize, sock))), @intFromPtr(&dns_server), @sizeOf(sockaddr_in));
+    if (@as(isize, @bitCast(conn_rc)) < 0) return false;
+
+    var query_buf: [512]u8 = undefined;
+    query_buf[0] = 0x33;
+    query_buf[1] = 0x77;
+    query_buf[2] = 0x01;
+    query_buf[3] = 0x00;
+    query_buf[4] = 0x00;
+    query_buf[5] = 0x01;
+    query_buf[6] = 0x00;
+    query_buf[7] = 0x00;
+    query_buf[8] = 0x00;
+    query_buf[9] = 0x00;
+    query_buf[10] = 0x00;
+    query_buf[11] = 0x00;
+
+    var q_idx: usize = 12;
+    var it = std.mem.splitScalar(u8, domain, '.');
+    while (it.next()) |part| {
+        if (part.len == 0 or part.len > 63) return false;
+        if (q_idx + 1 + part.len >= query_buf.len - 5) return false;
+        query_buf[q_idx] = @intCast(part.len);
+        q_idx += 1;
+        @memcpy(query_buf[q_idx .. q_idx + part.len], part);
+        q_idx += part.len;
+    }
+    query_buf[q_idx] = 0;
+    q_idx += 1;
+
+    query_buf[q_idx] = 0x00;
+    query_buf[q_idx + 1] = 0x01;
+    query_buf[q_idx + 2] = 0x00;
+    query_buf[q_idx + 3] = 0x01;
+    q_idx += 4;
+
+    const write_rc = std.os.linux.syscall3(.write, @as(usize, @bitCast(@as(isize, sock))), @intFromPtr(&query_buf), q_idx);
+    if (@as(isize, @bitCast(write_rc)) <= 0) return false;
+
+    var resp_buf: [512]u8 = undefined;
+    const read_rc = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, sock))), @intFromPtr(&resp_buf), resp_buf.len);
+    const read_len: isize = @bitCast(read_rc);
+    if (read_len < 12) return false;
+
+    const r_len: usize = @intCast(read_len);
+    if (resp_buf[0] != 0x33 or resp_buf[1] != 0x77) return false;
+    const ancount = std.mem.readInt(u16, resp_buf[6..8], .big);
+    if (ancount == 0) return false;
+
+    var r_idx = q_idx;
+    var a_i: usize = 0;
+    while (a_i < ancount and r_idx + 12 <= r_len) : (a_i += 1) {
+        if ((resp_buf[r_idx] & 0xc0) == 0xc0) {
+            r_idx += 2;
+        } else {
+            while (r_idx < r_len and resp_buf[r_idx] != 0) : (r_idx += 1) {}
+            r_idx += 1;
+        }
+
+        if (r_idx + 10 > r_len) return false;
+        const qtype = std.mem.readInt(u16, resp_buf[r_idx..][0..2], .big);
+        const rdlength = std.mem.readInt(u16, resp_buf[r_idx + 8 ..][0..2], .big);
+        r_idx += 10;
+
+        if (r_idx + rdlength > r_len) return false;
+        if (qtype == 1 and rdlength == 4) {
+            @memcpy(out_ip, resp_buf[r_idx .. r_idx + 4]);
+            return true;
+        }
+        r_idx += rdlength;
+    }
+
+    return false;
 }
 
 fn listenOn(host: []const u8, port: u16) !i32 {
@@ -144,17 +283,74 @@ const RingBuffer = struct {
     }
 };
 
-const DirectStream = struct {
+const RemoteConnection = struct {
     fd: i32,
+    is_tls: bool,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: std.Io.File = undefined,
+    file_reader: std.Io.File.Reader = undefined,
+    file_writer: std.Io.File.Writer = undefined,
+    tls_client: ?std.crypto.tls.Client = null,
+    tls_raw_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    tls_raw_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    tls_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    tls_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
 
-    pub fn read(self: DirectStream, buffer: []u8) !usize {
-        const rc = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(buffer.ptr), buffer.len);
-        const signed: isize = @bitCast(rc);
-        if (signed < 0) return error.ReadFailed;
-        return @intCast(signed);
+    pub fn init(fd: i32, is_tls: bool, host: []const u8, io: std.Io, allocator: std.mem.Allocator) !*RemoteConnection {
+        const conn = try allocator.create(RemoteConnection);
+        conn.* = .{
+            .fd = fd,
+            .is_tls = is_tls,
+            .io = io,
+            .allocator = allocator,
+        };
+
+        if (is_tls) {
+            conn.file = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+            conn.file_reader = conn.file.readerStreaming(io, &conn.tls_raw_read_buf);
+            conn.file_writer = conn.file.writerStreaming(io, &conn.tls_raw_write_buf);
+
+            var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+            _ = std.os.linux.syscall3(.getrandom, @intFromPtr(&entropy), entropy.len, 0);
+
+            var ts: std.posix.timespec = undefined;
+            _ = std.os.linux.syscall2(.clock_gettime, 0, @intFromPtr(&ts));
+            const now = std.Io.Timestamp{ .nanoseconds = @as(i96, ts.sec) * std.time.ns_per_s + ts.nsec };
+
+            conn.tls_client = std.crypto.tls.Client.init(
+                &conn.file_reader.interface,
+                &conn.file_writer.interface,
+                .{
+                    .host = .{ .explicit = host },
+                    .ca = .no_verification,
+                    .write_buffer = &conn.tls_write_buf,
+                    .read_buffer = &conn.tls_read_buf,
+                    .entropy = &entropy,
+                    .realtime_now = now,
+                    .allow_truncation_attacks = true,
+                },
+            ) catch |err| {
+                conn.close();
+                return err;
+            };
+        }
+
+        return conn;
     }
 
-    pub fn readExact(self: DirectStream, buffer: []u8) !void {
+    pub fn read(self: *RemoteConnection, buffer: []u8) !usize {
+        if (self.is_tls) {
+            return self.tls_client.?.reader.readSliceShort(buffer) catch 0;
+        } else {
+            const rc = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(buffer.ptr), buffer.len);
+            const signed: isize = @bitCast(rc);
+            if (signed <= 0) return 0;
+            return @intCast(signed);
+        }
+    }
+
+    pub fn readExact(self: *RemoteConnection, buffer: []u8) !void {
         var total: usize = 0;
         while (total < buffer.len) {
             const n = try self.read(buffer[total..]);
@@ -163,7 +359,7 @@ const DirectStream = struct {
         }
     }
 
-    pub fn readLine(self: DirectStream, buffer: []u8) !usize {
+    pub fn readLine(self: *RemoteConnection, buffer: []u8) !usize {
         var i: usize = 0;
         while (i < buffer.len) {
             var b: [1]u8 = undefined;
@@ -181,18 +377,47 @@ const DirectStream = struct {
         return error.LineTooLong;
     }
 
-    pub fn writeAll(self: DirectStream, bytes: []const u8) !void {
-        var index: usize = 0;
-        while (index < bytes.len) {
-            const rc = std.os.linux.syscall3(.write, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(bytes.ptr + index), bytes.len - index);
-            const signed: isize = @bitCast(rc);
-            if (signed <= 0) return error.WriteFailed;
-            index += @intCast(signed);
+    pub fn readHeaders(self: *RemoteConnection, buffer: []u8) ![]const u8 {
+        var total: usize = 0;
+        while (total < buffer.len) {
+            var b: [1]u8 = undefined;
+            const n = try self.read(&b);
+            if (n == 0) return error.ConnectionClosed;
+            buffer[total] = b[0];
+            total += 1;
+            if (total >= 4 and std.mem.eql(u8, buffer[total - 4 .. total], "\r\n\r\n")) {
+                return buffer[0..total];
+            }
+        }
+        return error.HeadersTooLong;
+    }
+
+    pub fn writeAll(self: *RemoteConnection, bytes: []const u8) !void {
+        if (self.is_tls) {
+            try self.tls_client.?.writer.writeAll(bytes);
+            try self.tls_client.?.writer.flush();
+        } else {
+            var index: usize = 0;
+            while (index < bytes.len) {
+                const rc = std.os.linux.syscall3(.write, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(bytes.ptr + index), bytes.len - index);
+                const signed: isize = @bitCast(rc);
+                if (signed <= 0) return error.WriteFailed;
+                index += @intCast(signed);
+            }
         }
     }
 
-    pub fn close(self: DirectStream) void {
-        _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, self.fd))));
+    pub fn close(self: *RemoteConnection) void {
+        if (self.is_tls) {
+            if (self.tls_client) |*tc| tc.end() catch {};
+            self.tls_client = null;
+        }
+        if (self.fd >= 0) {
+            _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, self.fd))));
+            self.fd = -1;
+        }
+        const alloc = self.allocator;
+        alloc.destroy(self);
     }
 };
 
@@ -202,13 +427,13 @@ pub const Client = struct {
     remote_url: []const u8,
     remote_host_hdr: []const u8,
     remote_addr: sockaddr_in,
+    is_tls: bool,
     socks_addr: ?[]const u8,
     forward_rule: ?[]const u8,
     num_workers: usize,
     max_chunk_size: usize,
     ring: RingBuffer,
-    workers_free: []bool,
-    pool_mutex: Mutex = .{},
+    workers_sem: Semaphore = .{},
     local_streams: std.AutoHashMap(u32, protocol.SocketStream),
     streams_mutex: Mutex = .{},
     connect_waiters: std.AutoHashMap(u32, *ConnectWaiter),
@@ -226,18 +451,19 @@ pub const Client = struct {
         buf_mb: usize,
     ) Client {
         const ring = RingBuffer.init(allocator, buf_mb * 1024 * 1024) catch unreachable;
-        const workers_free = allocator.alloc(bool, num_workers) catch unreachable;
-        @memset(workers_free, true);
 
         var host_part: []const u8 = remote_url;
         var port: u16 = 80;
+        var is_tls = false;
 
         if (std.mem.startsWith(u8, host_part, "http://")) {
             host_part = host_part["http://".len..];
             port = 80;
+            is_tls = false;
         } else if (std.mem.startsWith(u8, host_part, "https://")) {
             host_part = host_part["https://".len..];
             port = 443;
+            is_tls = true;
         }
 
         if (std.mem.indexOfScalar(u8, host_part, '/')) |slash| {
@@ -252,7 +478,11 @@ pub const Client = struct {
         }
 
         var octets: [4]u8 = .{ 127, 0, 0, 1 };
-        _ = parseIp4(host_part, &octets);
+        if (!parseIp4(host_part, &octets)) {
+            if (!resolveDnsA(host_part, &octets)) {
+                std.debug.print("Warning: unable to resolve {s}, defaulting to 127.0.0.1\n", .{host_part});
+            }
+        }
 
         const remote_addr = sockaddr_in{
             .family = 2,
@@ -266,12 +496,12 @@ pub const Client = struct {
             .remote_url = remote_url,
             .remote_host_hdr = host_header,
             .remote_addr = remote_addr,
+            .is_tls = is_tls,
             .socks_addr = socks_addr,
             .forward_rule = forward_rule,
             .num_workers = num_workers,
             .max_chunk_size = max_body_mb * 1024 * 1024,
             .ring = ring,
-            .workers_free = workers_free,
             .local_streams = std.AutoHashMap(u32, protocol.SocketStream).init(allocator),
             .connect_waiters = std.AutoHashMap(u32, *ConnectWaiter).init(allocator),
         };
@@ -279,7 +509,6 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         self.ring.deinit(self.allocator);
-        self.allocator.free(self.workers_free);
         self.allocator.free(self.remote_host_hdr);
 
         self.streams_mutex.lock();
@@ -296,7 +525,7 @@ pub const Client = struct {
         self.waiters_mutex.unlock();
     }
 
-    fn connectRemoteTcp(self: *Client) !DirectStream {
+    fn connectRemote(self: *Client) !*RemoteConnection {
         const rc = std.os.linux.syscall3(.socket, 2, 1, 0);
         if (@as(isize, @bitCast(rc)) < 0) return error.SocketFailed;
         const fd: i32 = @intCast(rc);
@@ -308,7 +537,7 @@ pub const Client = struct {
         const conn_rc = std.os.linux.syscall3(.connect, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&self.remote_addr), @sizeOf(sockaddr_in));
         if (@as(isize, @bitCast(conn_rc)) < 0) return error.ConnectFailed;
 
-        return DirectStream{ .fd = fd };
+        return RemoteConnection.init(fd, self.is_tls, self.remote_host_hdr, self.io, self.allocator);
     }
 
     pub fn sendToUpstream(self: *Client, stream_id: u32, cmd: protocol.Cmd, payload: []const u8) void {
@@ -331,6 +560,7 @@ pub const Client = struct {
         while (!self.ring.push(full_frame[0..n])) {
             sleepMs(2);
         }
+        self.workers_sem.post();
     }
 
     pub fn closeLocalStream(self: *Client, stream_id: u32) void {
@@ -376,115 +606,50 @@ pub const Client = struct {
     }
 
     fn upstreamWorkerThread(self: *Client, worker_id: usize) void {
+        _ = worker_id;
         const chunk_buf = self.allocator.alloc(u8, self.max_chunk_size) catch return;
         defer self.allocator.free(chunk_buf);
 
-        var seed: u64 = @as(u64, @intCast(worker_id)) ^ 0xdeadbeef;
-        _ = std.os.linux.syscall3(.getrandom, @intFromPtr(&seed), @sizeOf(u64), 0);
-        var prng = std.Random.DefaultPrng.init(seed);        
-
-        var opt_conn: ?DirectStream = null;
-        defer if (opt_conn) |c| c.close();
-
         while (true) {
-            const should_run = self.acquireRandomWorkerSlot(worker_id, prng.random());
-            if (!should_run) {
-                sleepMs(2);
-                continue;
-            }
+            self.workers_sem.wait();
 
             const bytes_read = self.ring.drainAtMost(chunk_buf);
-            if (bytes_read == 0) {
-                self.releaseWorkerSlot(worker_id);
-                sleepMs(2);
-                continue;
-            }
+            if (bytes_read == 0) continue;
 
             const payload = chunk_buf[0..bytes_read];
 
-            if (opt_conn == null) {
-                opt_conn = self.connectRemoteTcp() catch {
-                    self.releaseWorkerSlot(worker_id);
-                    sleepMs(50);
-                    continue;
-                };
-            }
-
-            var conn = opt_conn.?;
+            var conn = self.connectRemote() catch {
+                sleepMs(50);
+                continue;
+            };
+            defer conn.close();
 
             var req_hdr: [256]u8 = undefined;
             const hdr_text = std.fmt.bufPrint(&req_hdr,
                 "POST /push HTTP/1.1\r\n" ++
                 "Host: {s}\r\n" ++
                 "Content-Length: {d}\r\n" ++
-                "Connection: keep-alive\r\n\r\n",
+                "Connection: close\r\n\r\n",
                 .{ self.remote_host_hdr, payload.len }
-            ) catch {
-                self.releaseWorkerSlot(worker_id);
-                continue;
-            };
+            ) catch continue;
 
-            conn.writeAll(hdr_text) catch {
-                conn.close();
-                opt_conn = null;
-                self.releaseWorkerSlot(worker_id);
-                sleepMs(10);
-                continue;
-            };
+            conn.writeAll(hdr_text) catch continue;
+            conn.writeAll(payload) catch continue;
 
-            conn.writeAll(payload) catch {
-                conn.close();
-                opt_conn = null;
-                self.releaseWorkerSlot(worker_id);
-                sleepMs(10);
-                continue;
-            };
+            var resp_buf: [512]u8 = undefined;
+            _ = conn.read(&resp_buf) catch 0;
 
-            var resp_buf: [256]u8 = undefined;
-            const n = conn.read(&resp_buf) catch 0;
-            if (n == 0) {
-                conn.close();
-                opt_conn = null;
-            }
-
-            self.releaseWorkerSlot(worker_id);
-        }
-    }
-
-    fn acquireRandomWorkerSlot(self: *Client, worker_id: usize, rand: std.Random) bool {
-        self.pool_mutex.lock();
-        defer self.pool_mutex.unlock();
-
-        var free_count: usize = 0;
-        var free_indices: [64]usize = undefined;
-
-        for (self.workers_free, 0..) |is_free, idx| {
-            if (is_free and free_count < free_indices.len) {
-                free_indices[free_count] = idx;
-                free_count += 1;
+            if (self.ring.count > 0) {
+                self.workers_sem.post();
             }
         }
-
-        if (free_count == 0) return false;
-
-        const picked_idx = free_indices[rand.uintLessThan(usize, free_count)];
-        if (picked_idx == worker_id) {
-            self.workers_free[worker_id] = false;
-            return true;
-        }
-
-        return false;
-    }
-
-    fn releaseWorkerSlot(self: *Client, worker_id: usize) void {
-        self.pool_mutex.lock();
-        defer self.pool_mutex.unlock();
-        self.workers_free[worker_id] = true;
     }
 
     fn downstreamSseWorker(self: *Client) void {
+        var header_buf: [8192]u8 = undefined;
+
         while (true) {
-            var conn = self.connectRemoteTcp() catch {
+            var conn = self.connectRemote() catch {
                 sleepMs(200);
                 continue;
             };
@@ -502,11 +667,7 @@ pub const Client = struct {
 
             conn.writeAll(hdr_text) catch continue;
 
-            while (true) {
-                var line_buf: [256]u8 = undefined;
-                const line_len = conn.readLine(&line_buf) catch break;
-                if (line_len == 0) break;
-            }
+            _ = conn.readHeaders(&header_buf) catch continue;
 
             var chunk_hdr_buf: [32]u8 = undefined;
             var frame_scratch: [65536]u8 = undefined;
@@ -606,7 +767,10 @@ pub const Client = struct {
             if (@as(isize, @bitCast(accept_rc)) < 0) continue;
             const client_fd: i32 = @intCast(accept_rc);
             const stream = protocol.SocketStream{ .handle = client_fd };
-            const thread = try std.Thread.spawn(.{}, handleSocksConnection, .{ self, stream });
+            const thread = std.Thread.spawn(.{}, handleSocksConnection, .{ self, stream }) catch {
+                stream.close();
+                continue;
+            };
             thread.detach();
         }
     }
@@ -749,6 +913,7 @@ pub const Client = struct {
 
         if (!connected) {
             _ = stream.writeAll(&[_]u8{ 5, 5, 0, 1, 0, 0, 0, 0, 0, 0 }) catch {};
+            sleepMs(50);
             self.closeLocalStream(stream_id);
             return;
         }
