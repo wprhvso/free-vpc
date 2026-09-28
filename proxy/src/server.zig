@@ -38,8 +38,8 @@ const ServerPipeContext = struct {
     gen: u64,
     stream: protocol.SocketStream,
     retired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    wake_event: futex.Event = .{},
     done_event: futex.Event = .{},
-    mutex: futex.Mutex = .{},
 };
 
 pub const Server = struct {
@@ -74,6 +74,15 @@ pub const Server = struct {
         ) catch return;
 
         _ = self.downstream_queue.push(0, 0, .log, msg);
+        self.notifyLeader();
+    }
+
+    pub fn notifyLeader(self: *Server) void {
+        self.leader_mutex.lock();
+        if (self.active_leader.load(.acquire)) |ldr| {
+            ldr.wake_event.set();
+        }
+        self.leader_mutex.unlock();
     }
 
     pub fn start(self: *Server) !void {
@@ -157,15 +166,17 @@ pub const Server = struct {
                 self.processFrames(body);
             }
 
-            var pipe_ctx = ServerPipeContext{
+            const pipe_ctx = self.allocator.create(ServerPipeContext) catch { stream.close(); return; };
+            pipe_ctx.* = .{
                 .gen = req_gen,
                 .stream = stream,
             };
 
             self.leader_mutex.lock();
-            const prev_leader = self.active_leader.swap(&pipe_ctx, .acq_rel);
+            const prev_leader = self.active_leader.swap(pipe_ctx, .acq_rel);
             if (prev_leader) |old| {
                 old.retired.store(true, .release);
+                old.wake_event.set();
                 var ret_log: [64]u8 = undefined;
                 const ret_slice = std.fmt.bufPrint(&ret_log, "{{\"old_gen\":{d},\"new_gen\":{d}}}", .{ old.gen, req_gen }) catch "{}";
                 self.emitRemoteLog("info", "baton", "preempt", 0, ret_slice);
@@ -181,15 +192,37 @@ pub const Server = struct {
                 "Connection: keep-alive\r\n\r\n";
 
             stream.writeAll(init_resp) catch {
+                self.allocator.destroy(pipe_ctx);
                 stream.close();
                 return;
             };
 
-            const drain_buf = self.allocator.alloc(u8, Config.common.http_chunk_size) catch { stream.close(); return; };
+            var init_ping_buf: [16]u8 = undefined;
+            const init_ping_hdr = protocol.Header{
+                .magic = 0xCF01,
+                .payload_len = 0,
+                .stream_id = 0,
+                .seq_id = 0,
+                .cmd = .ping,
+            };
+            const init_hdr_bytes: *const [16]u8 = @ptrCast(&init_ping_hdr);
+            @memcpy(init_ping_buf[0..16], init_hdr_bytes);
+
+            var init_ch_hdr: [32]u8 = undefined;
+            const init_ch_text = std.fmt.bufPrint(&init_ch_hdr, "{x}\r\n", .{init_ping_buf.len}) catch unreachable;
+            stream.writeAll(init_ch_text) catch { self.allocator.destroy(pipe_ctx); stream.close(); return; };
+            stream.writeAll(&init_ping_buf) catch { self.allocator.destroy(pipe_ctx); stream.close(); return; };
+            stream.writeAll("\r\n") catch { self.allocator.destroy(pipe_ctx); stream.close(); return; };
+
+            const drain_buf = self.allocator.alloc(u8, Config.common.http_chunk_size) catch {
+                self.allocator.destroy(pipe_ctx);
+                stream.close();
+                return;
+            };
             defer self.allocator.free(drain_buf);
 
             while (!pipe_ctx.retired.load(.acquire)) {
-                _ = self.downstream_queue.waitData(500);
+                _ = pipe_ctx.wake_event.wait(500);
 
                 if (pipe_ctx.retired.load(.acquire)) break;
 
@@ -205,6 +238,7 @@ pub const Server = struct {
 
             stream.writeAll("0\r\n\r\n") catch {};
             pipe_ctx.done_event.set();
+            self.allocator.destroy(pipe_ctx);
         }
     }
 
@@ -333,6 +367,7 @@ pub const Server = struct {
         self.streams_mutex.unlock();
 
         _ = self.downstream_queue.push(stream_id, 0, .connect_ok, "");
+        self.notifyLeader();
 
         const th = std.Thread.spawn(.{}, targetReaderWorker, .{ self, stream_id, target_conn, state }) catch {
             self.closeStream(stream_id);
@@ -353,11 +388,13 @@ pub const Server = struct {
             while (!self.downstream_queue.push(stream_id, s_seq, .data, buf[0..n])) {
                 futex.Futex.wait(&state.downstream_seq, 0, 1);
             }
+            self.notifyLeader();
         }
     }
 
     fn sendClose(self: *Server, stream_id: u32) void {
         _ = self.downstream_queue.push(stream_id, 0, .close, "");
+        self.notifyLeader();
     }
 
     pub fn closeStream(self: *Server, stream_id: u32) void {

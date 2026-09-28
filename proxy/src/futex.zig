@@ -1,5 +1,15 @@
 const std = @import("std");
 
+fn getMilliTimestamp() u64 {
+    const timespec = extern struct {
+        sec: i64,
+        nsec: i64,
+    };
+    var ts: timespec = undefined;
+    _ = std.os.linux.syscall2(.clock_gettime, 0, @intFromPtr(&ts));
+    return @intCast((ts.sec * 1000) + @divTrunc(ts.nsec, 1_000_000));
+}
+
 pub const Futex = struct {
     pub fn wait(val: *const std.atomic.Value(u32), expected: u32, timeout_ms: ?u64) void {
         const timespec = extern struct {
@@ -44,11 +54,23 @@ pub const Event = struct {
     state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn wait(self: *Event, timeout_ms: ?u64) bool {
-        while (self.state.load(.acquire) == 0) {
-            Futex.wait(&self.state, 0, timeout_ms);
-            if (timeout_ms != null and self.state.load(.acquire) == 0) return false;
+        if (timeout_ms) |t_ms| {
+            const start = getMilliTimestamp();
+            while (self.state.load(.acquire) == 0) {
+                const now = getMilliTimestamp();
+                if (now >= start + t_ms) return false;
+                const remaining = (start + t_ms) - now;
+                Futex.wait(&self.state, 0, remaining);
+                if (self.state.load(.acquire) != 0) return true;
+                if (getMilliTimestamp() >= start + t_ms) return false;
+            }
+            return true;
+        } else {
+            while (self.state.load(.acquire) == 0) {
+                Futex.wait(&self.state, 0, null);
+            }
+            return true;
         }
-        return true;
     }
 
     pub fn set(self: *Event) void {
