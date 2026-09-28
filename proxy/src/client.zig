@@ -28,6 +28,7 @@ pub const Client = struct {
         self.upstream_queue.deinit(self.allocator);
         var it = self.local_streams.iterator();
         while (it.next()) |entry| {
+            std.posix.shutdown(entry.value_ptr.handle, .both) catch {};
             entry.value_ptr.close();
         }
         self.local_streams.deinit();
@@ -46,6 +47,7 @@ pub const Client = struct {
         self.streams_mutex.unlock();
         if (removed) |entry| {
             var stream = entry.value;
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             self.sendToUpstream(stream_id, .close, "");
         }
@@ -132,8 +134,6 @@ pub const Client = struct {
         const uri = std.Uri.parse(poll_url) catch return;
 
         var transfer_buf: [64]u8 = undefined;
-        var body_buf: std.ArrayList(u8) = .{};
-        defer body_buf.deinit(self.allocator);
 
         while (true) {
             var req = http_client.request(.GET, uri, .{}) catch {
@@ -155,18 +155,24 @@ pub const Client = struct {
             };
 
             if (resp.head.status == .ok) {
-                body_buf.clearRetainingCapacity();
-                const reader = resp.reader(&transfer_buf);
-                var chunk_buf: [4096]u8 = undefined;
+                const clen: usize = @intCast(resp.head.content_length orelse 0);
+                if (clen > 0) {
+                    const reader = resp.reader(&transfer_buf);
+                    const body = self.allocator.alloc(u8, clen) catch {
+                        req.deinit();
+                        continue;
+                    };
+                    defer self.allocator.free(body);
 
-                while (true) {
-                    const n = reader.readSliceShort(&chunk_buf) catch 0;
-                    if (n == 0) break;
-                    body_buf.appendSlice(self.allocator, chunk_buf[0..n]) catch break;
+                    reader.readSliceAll(body) catch {
+                        req.deinit();
+                        continue;
+                    };
+                    req.deinit();
+                    self.processPollBody(body);
+                } else {
+                    req.deinit();
                 }
-
-                req.deinit();
-                self.processPollBody(body_buf.items);
             } else {
                 req.deinit();
                 if (resp.head.status != .no_content) {
@@ -205,12 +211,23 @@ pub const Client = struct {
                     self.streams_mutex.unlock();
                     if (removed) |entry| {
                         var stream = entry.value;
+                        std.posix.shutdown(stream.handle, .both) catch {};
                         stream.close();
                     }
                 },
                 else => {},
             }
         }
+    }
+
+    fn readExact(stream: std.net.Stream, buf: []u8) bool {
+        var total: usize = 0;
+        while (total < buf.len) {
+            const n = stream.read(buf[total..]) catch 0;
+            if (n == 0) return false;
+            total += n;
+        }
+        return true;
     }
 
     fn socksListener(self: *Client, socks_str: []const u8) !void {
@@ -234,28 +251,46 @@ pub const Client = struct {
     }
 
     fn handleSocksConnection(self: *Client, stream: std.net.Stream) void {
-        var hand_buf: [257]u8 = undefined;
-        var n = stream.read(hand_buf[0..2]) catch 0;
-        if (n < 2 or hand_buf[0] != 5) {
+        var hand_buf: [2]u8 = undefined;
+        if (!readExact(stream, &hand_buf)) {
+            std.posix.shutdown(stream.handle, .both) catch {};
+            stream.close();
+            return;
+        }
+
+        if (hand_buf[0] != 5) {
+            if (hand_buf[0] == 'G' or hand_buf[0] == 'P' or hand_buf[0] == 'H') {
+                const msg = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nThis is a SOCKS5 proxy port. Use: curl -x socks5h://127.0.0.1:1080 <url>\r\n";
+                _ = stream.writeAll(msg) catch {};
+            }
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             return;
         }
 
         const nmethods = hand_buf[1];
-        n = stream.read(hand_buf[0..nmethods]) catch 0;
-        if (n < nmethods) {
+        var methods_buf: [256]u8 = undefined;
+        if (!readExact(stream, methods_buf[0..nmethods])) {
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             return;
         }
 
         _ = stream.writeAll(&[_]u8{ 5, 0 }) catch {
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             return;
         };
 
         var req_buf: [4]u8 = undefined;
-        n = stream.read(req_buf[0..4]) catch 0;
-        if (n < 4 or req_buf[0] != 5 or req_buf[1] != 1) {
+        if (!readExact(stream, &req_buf)) {
+            std.posix.shutdown(stream.handle, .both) catch {};
+            stream.close();
+            return;
+        }
+
+        if (req_buf[0] != 5 or req_buf[1] != 1) {
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             return;
         }
@@ -266,39 +301,40 @@ pub const Client = struct {
 
         if (atyp == 1) {
             addr_len = 4;
-            n = stream.read(addr_buf[0..4]) catch 0;
-            if (n < 4) {
+            if (!readExact(stream, addr_buf[0..4])) {
+                std.posix.shutdown(stream.handle, .both) catch {};
                 stream.close();
                 return;
             }
         } else if (atyp == 3) {
             var domain_len_buf: [1]u8 = undefined;
-            n = stream.read(domain_len_buf[0..1]) catch 0;
-            if (n < 1) {
+            if (!readExact(stream, &domain_len_buf)) {
+                std.posix.shutdown(stream.handle, .both) catch {};
                 stream.close();
                 return;
             }
             addr_len = domain_len_buf[0];
-            n = stream.read(addr_buf[0..addr_len]) catch 0;
-            if (n < addr_len) {
+            if (!readExact(stream, addr_buf[0..addr_len])) {
+                std.posix.shutdown(stream.handle, .both) catch {};
                 stream.close();
                 return;
             }
         } else if (atyp == 4) {
             addr_len = 16;
-            n = stream.read(addr_buf[0..16]) catch 0;
-            if (n < 16) {
+            if (!readExact(stream, addr_buf[0..16])) {
+                std.posix.shutdown(stream.handle, .both) catch {};
                 stream.close();
                 return;
             }
         } else {
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             return;
         }
 
         var port_buf: [2]u8 = undefined;
-        n = stream.read(port_buf[0..2]) catch 0;
-        if (n < 2) {
+        if (!readExact(stream, &port_buf)) {
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             return;
         }
@@ -308,18 +344,22 @@ pub const Client = struct {
         var conn_payload: std.ArrayList(u8) = .{};
         defer conn_payload.deinit(self.allocator);
         conn_payload.appendSlice(self.allocator, &port_buf) catch {
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             return;
         };
         conn_payload.append(self.allocator, if (atyp == 3) 2 else atyp) catch {
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             return;
         };
         conn_payload.append(self.allocator, addr_len) catch {
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             return;
         };
         conn_payload.appendSlice(self.allocator, addr_buf[0..addr_len]) catch {
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             return;
         };
@@ -327,6 +367,7 @@ pub const Client = struct {
         self.streams_mutex.lock();
         self.local_streams.put(stream_id, stream) catch {
             self.streams_mutex.unlock();
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             return;
         };
@@ -367,6 +408,7 @@ pub const Client = struct {
         while (true) {
             const conn = listener.accept() catch continue;
             const thread = std.Thread.spawn(.{}, handleForwardConnection, .{ self, conn.stream, r_host, r_port }) catch {
+                std.posix.shutdown(conn.stream.handle, .both) catch {};
                 conn.stream.close();
                 continue;
             };
@@ -383,34 +425,41 @@ pub const Client = struct {
         var port_bytes: [2]u8 = undefined;
         std.mem.writeInt(u16, &port_bytes, r_port, .big);
         conn_payload.appendSlice(self.allocator, &port_bytes) catch {
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             return;
         };
 
         if (std.net.Address.parseIp4(r_host, 0)) |ip4| {
             conn_payload.append(self.allocator, 1) catch {
+                std.posix.shutdown(stream.handle, .both) catch {};
                 stream.close();
                 return;
             };
             conn_payload.append(self.allocator, 4) catch {
+                std.posix.shutdown(stream.handle, .both) catch {};
                 stream.close();
                 return;
             };
             const octets = @as(*const [4]u8, @ptrCast(&ip4.in.sa.addr));
             conn_payload.appendSlice(self.allocator, octets) catch {
+                std.posix.shutdown(stream.handle, .both) catch {};
                 stream.close();
                 return;
             };
         } else |_| {
             conn_payload.append(self.allocator, 2) catch {
+                std.posix.shutdown(stream.handle, .both) catch {};
                 stream.close();
                 return;
             };
             conn_payload.append(self.allocator, @intCast(r_host.len)) catch {
+                std.posix.shutdown(stream.handle, .both) catch {};
                 stream.close();
                 return;
             };
             conn_payload.appendSlice(self.allocator, r_host) catch {
+                std.posix.shutdown(stream.handle, .both) catch {};
                 stream.close();
                 return;
             };
@@ -419,6 +468,7 @@ pub const Client = struct {
         self.streams_mutex.lock();
         self.local_streams.put(stream_id, stream) catch {
             self.streams_mutex.unlock();
+            std.posix.shutdown(stream.handle, .both) catch {};
             stream.close();
             return;
         };
