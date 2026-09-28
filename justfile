@@ -4,11 +4,11 @@ default:
     @just --list
 
 spawn node_id="1":
-    gh workflow run node.yml --repo wprhvso/free-vpc --ref init-free-vpc -f node_id={{node_id}}
+    gh workflow run node.yml --repo wprhvso/free-vpc --ref main -f node_id={{node_id}}
 
 spawn-all:
     @for i in $(seq 1 20); do \
-      gh workflow run node.yml --repo wprhvso/free-vpc --ref init-free-vpc -f node_id=$$i; \
+      gh workflow run node.yml --repo wprhvso/free-vpc --ref main -f node_id=$$i; \
       sleep 0.5; \
     done
 

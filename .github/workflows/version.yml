@@ -2,9 +2,9 @@ name: version-check
 
 on:
   push:
-    branches: [init-free-vpc]
+    branches: [main]
   pull_request:
-    branches: [init-free-vpc]
+    branches: [main]
 
 jobs:
   validate:
