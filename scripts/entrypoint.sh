@@ -63,7 +63,17 @@ if [ -f "${SCRIPT_DIR}/../proxy/zig-out/bin/cf-proxy-server" ]; then
     sudo chmod +x /usr/local/bin/cf-proxy-server
 fi
 
-/usr/local/bin/cf-proxy-server server --port 8022 >/tmp/cf-proxy-server.log 2>&1 &
+/usr/local/bin/cf-proxy-server --host 0.0.0.0 --port 8022 >/tmp/cf-proxy-server.log 2>&1 &
+
+sleep 1
+
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "ERROR: cf-proxy-server failed to start! Crash log:" >&2
+    cat /tmp/cf-proxy-server.log >&2
+    exit 1
+fi
+
+echo "cf-proxy-server started successfully (PID $SERVER_PID)"
 
 CREATE_RESP=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector" \
     -H "Authorization: Bearer ${CF_API_TOKEN}" \
