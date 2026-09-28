@@ -483,13 +483,16 @@ pub const Server = struct {
     }
 
     fn serverHeartbeatWorker(self: *Server) void {
+        var ping_payload: [4096]u8 = undefined;
+        @memset(&ping_payload, 0);
+
         while (true) {
             sleepMs(1000);
             if (self.active_stream_fd.load(.acquire) < 0) continue;
 
-            var ts_bytes: [8]u8 = undefined;
-            std.mem.writeInt(i64, &ts_bytes, getTimeMs(), .little);
-            self.sendToDownstream(0, 0, .ping, &ts_bytes);
+            std.mem.writeInt(i64, ping_payload[0..8], getTimeMs(), .little);
+
+            self.sendToDownstream(0, 0, .ping, &ping_payload);
         }
     }
 
