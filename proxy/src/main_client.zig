@@ -1,19 +1,13 @@
 const std = @import("std");
 const Client = @import("client.zig").Client;
+const ClientOptions = @import("client.zig").ClientOptions;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    var remote_url: []const u8 = "https://ssh.unsafie.com";
-    var socks_addr: ?[]const u8 = "127.0.0.1:1080";
-    var forward_rule: ?[]const u8 = null;
-    var num_workers: usize = 8;
-    var max_body_mb: usize = 1;
-    var buf_mb: usize = 16;
-    var name: []const u8 = "client-default";
-    var token: []const u8 = "default_secret";
+    var opts = ClientOptions{};
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -21,51 +15,82 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--remote")) {
             if (i + 1 < args.len) {
                 i += 1;
-                remote_url = args[i];
+                opts.remote_url = args[i];
+            }
+        } else if (std.mem.eql(u8, arg, "--path")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                opts.sync_path = args[i];
             }
         } else if (std.mem.eql(u8, arg, "--socks")) {
             if (i + 1 < args.len) {
                 i += 1;
-                socks_addr = args[i];
+                opts.socks_addr = args[i];
             }
         } else if (std.mem.eql(u8, arg, "--forward")) {
             if (i + 1 < args.len) {
                 i += 1;
-                forward_rule = args[i];
+                opts.forward_rule = args[i];
             }
-        } else if (std.mem.eql(u8, arg, "-n")) {
+        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--workers")) {
             if (i + 1 < args.len) {
                 i += 1;
-                num_workers = std.fmt.parseInt(usize, args[i], 10) catch 8;
+                opts.num_workers = std.fmt.parseInt(usize, args[i], 10) catch 8;
             }
-        } else if (std.mem.eql(u8, arg, "-s")) {
+        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--chunk-kb")) {
             if (i + 1 < args.len) {
                 i += 1;
-                max_body_mb = std.fmt.parseInt(usize, args[i], 10) catch 1;
+                opts.chunk_kb = std.fmt.parseInt(usize, args[i], 10) catch 64;
             }
-        } else if (std.mem.eql(u8, arg, "-b")) {
+        } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--buf-mb")) {
             if (i + 1 < args.len) {
                 i += 1;
-                buf_mb = std.fmt.parseInt(usize, args[i], 10) catch 16;
+                opts.buf_mb = std.fmt.parseInt(usize, args[i], 10) catch 32;
             }
-        } else if (std.mem.eql(u8, arg, "--name")) {
+        } else if (std.mem.eql(u8, arg, "--timeout-req-ms")) {
             if (i + 1 < args.len) {
                 i += 1;
-                name = args[i];
+                opts.timeout_req_ms = std.fmt.parseInt(u64, args[i], 10) catch 2500;
+            }
+        } else if (std.mem.eql(u8, arg, "--timeout-conn-ms")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                opts.timeout_conn_ms = std.fmt.parseInt(u64, args[i], 10) catch 3000;
+            }
+        } else if (std.mem.eql(u8, arg, "--reorder-limit")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                opts.reorder_limit = std.fmt.parseInt(usize, args[i], 10) catch 512;
             }
         } else if (std.mem.eql(u8, arg, "--token")) {
             if (i + 1 < args.len) {
                 i += 1;
-                token = args[i];
+                opts.token = args[i];
+            }
+        } else if (std.mem.eql(u8, arg, "--token-header")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                opts.token_header = args[i];
+            }
+        } else if (std.mem.eql(u8, arg, "--user-agent")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                opts.user_agent = args[i];
+            }
+        } else if (std.mem.eql(u8, arg, "--name")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                opts.name = args[i];
+            }
+        } else if (std.mem.eql(u8, arg, "--log-level")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                opts.log_level = args[i];
             }
         }
     }
 
-    std.debug.print("Starting cf-proxy-client [{s}] (remote: {s}, workers: {d}, buffer: {d}MB)...\n", .{
-        name, remote_url, num_workers, buf_mb,
-    });
-
-    var client = Client.init(allocator, io, remote_url, socks_addr, forward_rule, num_workers, max_body_mb, buf_mb, name, token);
+    var client = Client.init(allocator, io, opts);
     defer client.deinit();
     try client.start();
 }

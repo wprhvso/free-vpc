@@ -1,6 +1,24 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 
+pub const ClientOptions = struct {
+    remote_url: []const u8 = "https://ssh.unsafie.com",
+    sync_path: []const u8 = "/api/v1/sync",
+    socks_addr: ?[]const u8 = "127.0.0.1:1080",
+    forward_rule: ?[]const u8 = null,
+    num_workers: usize = 8,
+    chunk_kb: usize = 64,
+    buf_mb: usize = 32,
+    timeout_req_ms: u64 = 2500,
+    timeout_conn_ms: u64 = 3000,
+    reorder_limit: usize = 512,
+    token: []const u8 = "default_secret",
+    token_header: []const u8 = "X-Auth-Token",
+    user_agent: []const u8 = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    name: []const u8 = "client-default",
+    log_level: []const u8 = "info",
+};
+
 const sockaddr_in = extern struct {
     family: u16 = 2,
     port: u16,
@@ -63,10 +81,28 @@ fn sleepMs(ms: u64) void {
     _ = std.os.linux.syscall2(.nanosleep, @intFromPtr(&ts), 0);
 }
 
-fn getTimeMs() i64 {
-    var ts: std.posix.timespec = undefined;
-    _ = std.os.linux.syscall2(.clock_gettime, 0, @intFromPtr(&ts));
-    return (@as(i64, ts.sec) * 1000) + @divTrunc(ts.nsec, 1_000_000);
+fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    for (needle, 0..) |c, i| {
+        if (std.ascii.toLower(haystack[i]) != std.ascii.toLower(c)) return false;
+    }
+    return true;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var match = true;
+        for (needle, 0..) |c, j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(c)) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
 }
 
 fn parseIp4(s: []const u8, out: *[4]u8) bool {
@@ -99,9 +135,7 @@ fn getDnsServerIp() [4]u8 {
         if (std.mem.startsWith(u8, trimmed, "nameserver")) {
             const rest = std.mem.trim(u8, trimmed["nameserver".len..], " \t");
             var ip: [4]u8 = undefined;
-            if (parseIp4(rest, &ip)) {
-                return ip;
-            }
+            if (parseIp4(rest, &ip)) return ip;
         }
     }
     return default_dns;
@@ -152,7 +186,6 @@ fn resolveDnsA(domain: []const u8, out_ip: *[4]u8) bool {
     }
     query_buf[q_idx] = 0;
     q_idx += 1;
-
     query_buf[q_idx] = 0x00;
     query_buf[q_idx + 1] = 0x01;
     query_buf[q_idx + 2] = 0x00;
@@ -181,12 +214,10 @@ fn resolveDnsA(domain: []const u8, out_ip: *[4]u8) bool {
             while (r_idx < r_len and resp_buf[r_idx] != 0) : (r_idx += 1) {}
             r_idx += 1;
         }
-
         if (r_idx + 10 > r_len) return false;
         const qtype = std.mem.readInt(u16, resp_buf[r_idx..][0..2], .big);
         const rdlength = std.mem.readInt(u16, resp_buf[r_idx + 8 ..][0..2], .big);
         r_idx += 10;
-
         if (r_idx + rdlength > r_len) return false;
         if (qtype == 1 and rdlength == 4) {
             @memcpy(out_ip, resp_buf[r_idx .. r_idx + 4]);
@@ -194,7 +225,6 @@ fn resolveDnsA(domain: []const u8, out_ip: *[4]u8) bool {
         }
         r_idx += rdlength;
     }
-
     return false;
 }
 
@@ -224,10 +254,6 @@ fn listenOn(host: []const u8, port: u16) !i32 {
 
     return fd;
 }
-
-const ConnectWaiter = struct {
-    status: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-};
 
 const RingBuffer = struct {
     data: []u8,
@@ -365,24 +391,6 @@ const RemoteConnection = struct {
         }
     }
 
-    pub fn readLine(self: *RemoteConnection, buffer: []u8) !usize {
-        var i: usize = 0;
-        while (i < buffer.len) {
-            var b: [1]u8 = undefined;
-            const n = try self.read(&b);
-            if (n == 0) return error.ConnectionClosed;
-            if (b[0] == '\n') {
-                if (i > 0 and buffer[i - 1] == '\r') {
-                    return i - 1;
-                }
-                return i;
-            }
-            buffer[i] = b[0];
-            i += 1;
-        }
-        return error.LineTooLong;
-    }
-
     pub fn readHeaders(self: *RemoteConnection, buffer: []u8) ![]const u8 {
         var total: usize = 0;
         while (total < buffer.len) {
@@ -428,45 +436,36 @@ const RemoteConnection = struct {
     }
 };
 
+const StreamContext = struct {
+    stream: protocol.SocketStream,
+    expected_seq: u32 = 0,
+    reorder_queue: std.AutoHashMap(u32, []u8),
+    mutex: Mutex = .{},
+};
+
+const ConnectWaiter = struct {
+    status: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+};
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    remote_url: []const u8,
+    opts: ClientOptions,
     remote_host_hdr: []const u8,
     remote_addr: sockaddr_in,
     is_tls: bool,
-    socks_addr: ?[]const u8,
-    forward_rule: ?[]const u8,
-    num_workers: usize,
-    max_chunk_size: usize,
-    name: []const u8,
-    token: []const u8,
     ring: RingBuffer,
     workers_sem: Semaphore = .{},
-    local_streams: std.AutoHashMap(u32, protocol.SocketStream),
+    local_streams: std.AutoHashMap(u32, *StreamContext),
     streams_mutex: Mutex = .{},
     connect_waiters: std.AutoHashMap(u32, *ConnectWaiter),
     waiters_mutex: Mutex = .{},
     next_stream_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
-    last_ping_ts: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
-    tunnel_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    active_sse_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        remote_url: []const u8,
-        socks_addr: ?[]const u8,
-        forward_rule: ?[]const u8,
-        num_workers: usize,
-        max_body_mb: usize,
-        buf_mb: usize,
-        name: []const u8,
-        token: []const u8,
-    ) Client {
-        const ring = RingBuffer.init(allocator, buf_mb * 1024 * 1024) catch unreachable;
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, opts: ClientOptions) Client {
+        const ring = RingBuffer.init(allocator, opts.buf_mb * 1024 * 1024) catch unreachable;
 
-        var host_part: []const u8 = remote_url;
+        var host_part: []const u8 = opts.remote_url;
         var port: u16 = 80;
         var is_tls = false;
 
@@ -493,12 +492,7 @@ pub const Client = struct {
 
         var octets: [4]u8 = .{ 127, 0, 0, 1 };
         if (!parseIp4(host_part, &octets)) {
-            std.debug.print("\x1b[36m[DNS]\x1b[0m Resolving {s}...\n", .{host_part});
-            if (!resolveDnsA(host_part, &octets)) {
-                std.debug.print("\x1b[31m[DNS ERROR]\x1b[0m Unable to resolve {s}, defaulting to 127.0.0.1\n", .{host_part});
-            } else {
-                std.debug.print("\x1b[32m[DNS]\x1b[0m Resolved {s} -> {d}.{d}.{d}.{d}\n", .{ host_part, octets[0], octets[1], octets[2], octets[3] });
-            }
+            _ = resolveDnsA(host_part, &octets);
         }
 
         const remote_addr = sockaddr_in{
@@ -507,25 +501,15 @@ pub const Client = struct {
             .addr = @as(u32, @bitCast(octets)),
         };
 
-        std.debug.print("\x1b[35m[CONFIG]\x1b[0m Remote target: {d}.{d}.{d}.{d}:{d} (Host: '{s}', TLS: {})\n", .{
-            octets[0], octets[1], octets[2], octets[3], port, host_header, is_tls,
-        });
-
         return .{
             .allocator = allocator,
             .io = io,
-            .remote_url = remote_url,
+            .opts = opts,
             .remote_host_hdr = host_header,
             .remote_addr = remote_addr,
             .is_tls = is_tls,
-            .socks_addr = socks_addr,
-            .forward_rule = forward_rule,
-            .num_workers = num_workers,
-            .max_chunk_size = max_body_mb * 1024 * 1024,
-            .name = name,
-            .token = token,
             .ring = ring,
-            .local_streams = std.AutoHashMap(u32, protocol.SocketStream).init(allocator),
+            .local_streams = std.AutoHashMap(u32, *StreamContext).init(allocator),
             .connect_waiters = std.AutoHashMap(u32, *ConnectWaiter).init(allocator),
         };
     }
@@ -537,8 +521,13 @@ pub const Client = struct {
         self.streams_mutex.lock();
         var it = self.local_streams.iterator();
         while (it.next()) |entry| {
-            entry.value_ptr.shutdown();
-            entry.value_ptr.close();
+            const ctx = entry.value_ptr.*;
+            ctx.stream.shutdown();
+            ctx.stream.close();
+            var q_it = ctx.reorder_queue.iterator();
+            while (q_it.next()) |q_e| self.allocator.free(q_e.value_ptr.*);
+            ctx.reorder_queue.deinit();
+            self.allocator.destroy(ctx);
         }
         self.local_streams.deinit();
         self.streams_mutex.unlock();
@@ -546,17 +535,6 @@ pub const Client = struct {
         self.waiters_mutex.lock();
         self.connect_waiters.deinit();
         self.waiters_mutex.unlock();
-    }
-
-    pub fn emitLog(self: *Client, lvl: []const u8, evt: []const u8, sid: u32, target: []const u8, msg: []const u8) void {
-        var log_buf: [1024]u8 = undefined;
-        const now = getTimeMs();
-        const json = std.fmt.bufPrint(&log_buf, "{{\"ts\":{d},\"src\":\"client\",\"name\":\"{s}\",\"lvl\":\"{s}\",\"evt\":\"{s}\",\"sid\":{d},\"target\":\"{s}\",\"msg\":\"{s}\"}}", .{
-            now, self.name, lvl, evt, sid, target, msg,
-        }) catch return;
-
-        std.debug.print("\x1b[36m[{s}]\x1b[0m ({d}) {s}: {s}\n", .{ evt, sid, target, msg });
-        self.sendToUpstream(0, 0, .log, json);
     }
 
     fn connectRemote(self: *Client) !*RemoteConnection {
@@ -568,8 +546,15 @@ pub const Client = struct {
         const one: c_int = 1;
         _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, fd))), 6, 1, @intFromPtr(&one), @sizeOf(c_int));
 
-        const rcv_timeout = extern struct { sec: i64 = 10, usec: i64 = 0 }{};
+        const rcv_timeout = extern struct {
+            sec: i64,
+            usec: i64 = 0,
+        }{
+            .sec = @intCast(self.opts.timeout_req_ms / 1000),
+            .usec = @intCast((self.opts.timeout_req_ms % 1000) * 1000),
+        };
         _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, fd))), 1, 20, @intFromPtr(&rcv_timeout), @sizeOf(@TypeOf(rcv_timeout)));
+        _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, fd))), 1, 21, @intFromPtr(&rcv_timeout), @sizeOf(@TypeOf(rcv_timeout)));
 
         const conn_rc = std.os.linux.syscall3(.connect, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&self.remote_addr), @sizeOf(sockaddr_in));
         if (@as(isize, @bitCast(conn_rc)) < 0) return error.ConnectFailed;
@@ -577,7 +562,6 @@ pub const Client = struct {
         return RemoteConnection.init(fd, self.is_tls, self.remote_host_hdr, self.io, self.allocator);
     }
 
-    // Каждый фрейм отправляется с указанием stream_id и seq_id
     pub fn sendToUpstream(self: *Client, stream_id: u32, seq_id: u32, cmd: protocol.Cmd, payload: []const u8) void {
         var static_buf: [4096]u8 = undefined;
         const total = @sizeOf(protocol.Header) + payload.len;
@@ -595,14 +579,8 @@ pub const Client = struct {
 
         const n = protocol.writeFrame(full_frame, stream_id, seq_id, cmd, payload) catch return;
 
-        var retry: usize = 0;
         while (!self.ring.push(full_frame[0..n])) {
-            sleepMs(2);
-            retry += 1;
-            if (retry > 1000) {
-                std.debug.print("\x1b[31m[BUFFER OVERFLOW]\x1b[0m Upstream ring buffer full, dropped frame stream={d} cmd={s}\n", .{ stream_id, @tagName(cmd) });
-                return;
-            }
+            sleepMs(1);
         }
         self.workers_sem.post();
     }
@@ -619,221 +597,161 @@ pub const Client = struct {
         self.streams_mutex.unlock();
 
         if (removed) |entry| {
-            const stream = entry.value;
-            stream.shutdown();
-            stream.close();
+            const ctx = entry.value;
+            ctx.stream.shutdown();
+            ctx.stream.close();
+            var q_it = ctx.reorder_queue.iterator();
+            while (q_it.next()) |q_e| self.allocator.free(q_e.value_ptr.*);
+            ctx.reorder_queue.deinit();
+            self.allocator.destroy(ctx);
             self.sendToUpstream(stream_id, 0, .close, "");
         }
     }
 
     pub fn start(self: *Client) !void {
-        const sse_thread = try std.Thread.spawn(.{}, downstreamSseWorker, .{self});
-        sse_thread.detach();
-
-        const watchdog_thread = try std.Thread.spawn(.{}, downstreamWatchdogWorker, .{self});
-        watchdog_thread.detach();
-
-        for (0..self.num_workers) |w_idx| {
-            const push_thread = try std.Thread.spawn(.{}, upstreamWorkerThread, .{ self, w_idx });
-            push_thread.detach();
+        for (0..self.opts.num_workers) |w_idx| {
+            const th = try std.Thread.spawn(.{}, duplexWorkerThread, .{ self, w_idx });
+            th.detach();
         }
 
-        if (self.forward_rule) |fwd| {
-            const fwd_thread = try std.Thread.spawn(.{}, forwardListener, .{ self, fwd });
-            fwd_thread.detach();
+        if (self.opts.forward_rule) |fwd| {
+            const fwd_th = try std.Thread.spawn(.{}, forwardListener, .{ self, fwd });
+            fwd_th.detach();
         }
 
-        if (self.socks_addr) |socks| {
+        if (self.opts.socks_addr) |socks| {
             try self.socksListener(socks);
         } else {
-            while (true) {
-                sleepMs(1000);
-            }
+            while (true) sleepMs(1000);
         }
     }
 
-    fn downstreamWatchdogWorker(self: *Client) void {
+    fn duplexWorkerThread(self: *Client, worker_id: usize) void {
+        _ = worker_id;
+        const max_chunk = self.opts.chunk_kb * 1024;
+        const send_buf = self.allocator.alloc(u8, max_chunk) catch return;
+        defer self.allocator.free(send_buf);
+
+        const resp_body_buf = self.allocator.alloc(u8, max_chunk + 16384) catch return;
+        defer self.allocator.free(resp_body_buf);
+
+        var header_buf: [4096]u8 = undefined;
+        var conn: ?*RemoteConnection = null;
+
         while (true) {
-            sleepMs(1000);
-            if (!self.tunnel_ready.load(.acquire)) continue;
-
-            const now = getTimeMs();
-            const last = self.last_ping_ts.load(.acquire);
-            if (last > 0 and (now - last) > 6000) {
-                const diff = now - last;
-                std.debug.print("\x1b[33m[WATCHDOG WARN]\x1b[0m Downstream stalled! No heartbeat for {d}ms (>6000ms). Forcing reconnect...\x1b[0m\n", .{diff});
-
-                const active_fd = self.active_sse_fd.load(.acquire);
-                if (active_fd >= 0) {
-                    _ = std.os.linux.syscall2(.shutdown, @as(usize, @bitCast(@as(isize, active_fd))), 2);
-                }
-                self.tunnel_ready.store(false, .release);
+            if (conn == null) {
+                conn = self.connectRemote() catch {
+                    sleepMs(50);
+                    continue;
+                };
             }
-        }
-    }
 
-    fn upstreamWorkerThread(self: *Client, worker_id: usize) void {
-        const chunk_buf = self.allocator.alloc(u8, self.max_chunk_size) catch return;
-        defer self.allocator.free(chunk_buf);
+            const to_send_len = self.ring.drainAtMost(send_buf);
+            const req_body = send_buf[0..to_send_len];
 
-        while (true) {
-            self.workers_sem.wait();
-
-            const bytes_read = self.ring.drainAtMost(chunk_buf);
-            if (bytes_read == 0) continue;
-
-            const payload = chunk_buf[0..bytes_read];
-
-            var conn = self.connectRemote() catch |err| {
-                std.debug.print("\x1b[31m[PUSH ERROR]\x1b[0m Worker #{d} failed to connect upstream: {s}\n", .{ worker_id, @errorName(err) });
-                sleepMs(100);
+            var req_hdr_scratch: [1024]u8 = undefined;
+            const hdr_text = std.fmt.bufPrint(&req_hdr_scratch,
+                "POST {s} HTTP/1.1\r\n" ++
+                "Host: {s}\r\n" ++
+                "User-Agent: {s}\r\n" ++
+                "{s}: {s}\r\n" ++
+                "Content-Type: application/octet-stream\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: keep-alive\r\n\r\n",
+                .{ self.opts.sync_path, self.remote_host_hdr, self.opts.user_agent, self.opts.token_header, self.opts.token, req_body.len }
+            ) catch {
+                if (conn) |c| { c.close(); conn = null; }
                 continue;
             };
-            defer conn.close();
 
-            var req_hdr: [256]u8 = undefined;
-            const hdr_text = std.fmt.bufPrint(&req_hdr,
-                "POST /push HTTP/1.1\r\n" ++
-                "Host: {s}\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: close\r\n\r\n",
-                .{ self.remote_host_hdr, payload.len }
-            ) catch continue;
-
-            conn.writeAll(hdr_text) catch continue;
-            conn.writeAll(payload) catch continue;
-
-            var resp_buf: [512]u8 = undefined;
-            const n = conn.read(&resp_buf) catch 0;
-            if (n > 0) {
-                const resp = resp_buf[0..n];
-                if (std.mem.startsWith(u8, resp, "HTTP/1.1 4") or std.mem.startsWith(u8, resp, "HTTP/1.1 5")) {
-                    const first_line = resp[0 .. std.mem.indexOf(u8, resp, "\r\n") orelse resp.len];
-                    std.debug.print("\x1b[31m[PUSH ERROR]\x1b[0m Upstream rejected: {s}\n", .{first_line});
+            const write_res = blk: {
+                conn.?.writeAll(hdr_text) catch break :blk false;
+                if (req_body.len > 0) {
+                    conn.?.writeAll(req_body) catch break :blk false;
                 }
+                break :blk true;
+            };
+
+            if (!write_res) {
+                if (req_body.len > 0) {
+                    _ = self.ring.push(req_body);
+                    self.workers_sem.post();
+                }
+                if (conn) |c| { c.close(); conn = null; }
+                sleepMs(20);
+                continue;
+            }
+
+            const hdrs = conn.?.readHeaders(&header_buf) catch {
+                if (req_body.len > 0) {
+                    _ = self.ring.push(req_body);
+                    self.workers_sem.post();
+                }
+                if (conn) |c| { c.close(); conn = null; }
+                sleepMs(20);
+                continue;
+            };
+
+            var content_len: usize = 0;
+            var is_close = false;
+
+            var h_it = std.mem.splitSequence(u8, hdrs, "\r\n");
+            _ = h_it.next();
+            while (h_it.next()) |line| {
+                if (line.len == 0) break;
+                if (startsWithIgnoreCase(line, "content-length:")) {
+                    content_len = std.fmt.parseInt(usize, std.mem.trim(u8, line["content-length:".len..], " \t"), 10) catch 0;
+                } else if (startsWithIgnoreCase(line, "connection:")) {
+                    if (containsIgnoreCase(line, "close")) {
+                        is_close = true;
+                    }
+                }
+            }
+
+            if (content_len > 0) {
+                var target_resp = resp_body_buf;
+                var dyn_resp: ?[]u8 = null;
+                defer if (dyn_resp) |b| self.allocator.free(b);
+
+                if (content_len > resp_body_buf.len) {
+                    dyn_resp = self.allocator.alloc(u8, content_len) catch null;
+                    if (dyn_resp == null) {
+                        if (conn) |c| { c.close(); conn = null; }
+                        continue;
+                    }
+                    target_resp = dyn_resp.?;
+                }
+
+                const r_slice = target_resp[0..content_len];
+                conn.?.readExact(r_slice) catch {
+                    if (conn) |c| { c.close(); conn = null; }
+                    continue;
+                };
+
+                self.dispatchFrames(r_slice);
+            }
+
+            if (is_close) {
+                if (conn) |c| { c.close(); conn = null; }
             }
 
             if (self.ring.count > 0) {
                 self.workers_sem.post();
+            } else if (content_len == 0) {
+                sleepMs(5);
             }
-        }
-    }
-
-    fn downstreamSseWorker(self: *Client) void {
-        var header_buf: [8192]u8 = undefined;
-
-        while (true) {
-            std.debug.print("\x1b[36m[SSE]\x1b[0m Connecting to downstream stream ({s})...\n", .{self.remote_host_hdr});
-            var conn = self.connectRemote() catch |err| {
-                std.debug.print("\x1b[31m[SSE ERROR]\x1b[0m Connect failed ({s}). Retrying in 1s...\n", .{@errorName(err)});
-                sleepMs(1000);
-                continue;
-            };
-            self.active_sse_fd.store(conn.fd, .release);
-
-            const teardown = struct {
-                fn run(c: *Client, rc: *RemoteConnection) void {
-                    c.active_sse_fd.store(-1, .release);
-                    c.tunnel_ready.store(false, .release);
-                    rc.close();
-                }
-            };
-            defer teardown.run(self, conn);
-
-            var req_hdr: [512]u8 = undefined;
-            const hdr_text = std.fmt.bufPrint(&req_hdr,
-                "GET /stream HTTP/1.1\r\n" ++
-                "Host: {s}\r\n" ++
-                "Accept: application/octet-stream\r\n" ++
-                "Cache-Control: no-cache\r\n" ++
-                "X-Client-Name: {s}\r\n" ++
-                "Connection: keep-alive\r\n\r\n",
-                .{ self.remote_host_hdr, self.name }
-            ) catch return;
-
-            conn.writeAll(hdr_text) catch |err| {
-                std.debug.print("\x1b[31m[SSE ERROR]\x1b[0m Failed sending GET /stream ({s}). Retrying...\n", .{@errorName(err)});
-                sleepMs(1000);
-                continue;
-            };
-
-            const hdrs = conn.readHeaders(&header_buf) catch |err| {
-                std.debug.print("\x1b[31m[SSE ERROR]\x1b[0m Failed reading response headers ({s}). Retrying in 1s...\n", .{@errorName(err)});
-                sleepMs(1000);
-                continue;
-            };
-
-            const first_line = hdrs[0 .. std.mem.indexOf(u8, hdrs, "\r\n") orelse hdrs.len];
-            if (!std.mem.containsAtLeast(u8, first_line, 1, " 200 ")) {
-                std.debug.print("\x1b[31m[SSE ERROR]\x1b[0m Remote server rejected stream! Status: '{s}'\n", .{first_line});
-                sleepMs(2000);
-                continue;
-            }
-
-            std.debug.print("\x1b[32m[SSE OK]\x1b[0m Downstream tunnel established (HTTP 200). Listening for frames...\n", .{});
-            self.tunnel_ready.store(true, .release);
-            self.last_ping_ts.store(getTimeMs(), .release);
-
-            var chunk_hdr_buf: [32]u8 = undefined;
-            var frame_scratch: [65536]u8 = undefined;
-
-            while (true) {
-                const hex_line_len = conn.readLine(&chunk_hdr_buf) catch |err| {
-                    std.debug.print("\x1b[33m[SSE WARN]\x1b[0m Read line interrupted or timed out: {s}\n", .{@errorName(err)});
-                    break;
-                };
-                if (hex_line_len == 0) continue;
-
-                const trimmed_hex = std.mem.trim(u8, chunk_hdr_buf[0..hex_line_len], " \t\r");
-                const chunk_size = std.fmt.parseInt(usize, trimmed_hex, 16) catch |err| {
-                    std.debug.print("\x1b[31m[SSE ERROR]\x1b[0m Invalid chunk size hex '{s}': {s}\n", .{ trimmed_hex, @errorName(err) });
-                    break;
-                };
-                if (chunk_size == 0) {
-                    std.debug.print("\x1b[33m[SSE]\x1b[0m Remote sent clean EOF chunk (0)\n", .{});
-                    break;
-                }
-
-                var target_buf: []u8 = frame_scratch[0..chunk_size];
-                var dyn_alloc: ?[]u8 = null;
-                defer if (dyn_alloc) |b| self.allocator.free(b);
-
-                if (chunk_size > frame_scratch.len) {
-                    dyn_alloc = self.allocator.alloc(u8, chunk_size) catch |err| {
-                        std.debug.print("\x1b[31m[SSE ERROR]\x1b[0m OOM allocating {d} bytes: {s}\n", .{ chunk_size, @errorName(err) });
-                        break;
-                    };
-                    target_buf = dyn_alloc.?;
-                }
-
-                conn.readExact(target_buf) catch |err| {
-                    std.debug.print("\x1b[31m[SSE ERROR]\x1b[0m Incomplete chunk body read: {s}\n", .{@errorName(err)});
-                    break;
-                };
-
-                var crlf: [2]u8 = undefined;
-                conn.readExact(&crlf) catch break;
-
-                self.dispatchFrames(target_buf);
-            }
-
-            self.tunnel_ready.store(false, .release);
-            std.debug.print("\x1b[33m[SSE]\x1b[0m Downstream connection lost. Reconnecting in 500ms...\n", .{});
-            sleepMs(500);
         }
     }
 
     fn dispatchFrames(self: *Client, bytes: []const u8) void {
         var offset: usize = 0;
-
         while (offset + @sizeOf(protocol.Header) <= bytes.len) {
             const hdr: *const protocol.Header = @ptrCast(@alignCast(bytes[offset..].ptr));
-            const frame_len = @sizeOf(protocol.Header) + hdr.payload_len;
+            offset += @sizeOf(protocol.Header);
 
-            if (offset + frame_len > bytes.len) break;
-
-            const payload = bytes[offset + @sizeOf(protocol.Header) .. offset + frame_len];
-            offset += frame_len;
+            if (offset + hdr.payload_len > bytes.len) break;
+            const payload = bytes[offset .. offset + hdr.payload_len];
+            offset += hdr.payload_len;
 
             switch (hdr.cmd) {
                 .connect_ok => {
@@ -844,33 +762,50 @@ pub const Client = struct {
                     self.waiters_mutex.unlock();
                 },
                 .data => {
-                    self.streams_mutex.lock();
-                    const s_opt = self.local_streams.get(hdr.stream_id);
-                    self.streams_mutex.unlock();
-                    if (s_opt) |local_stream| {
-                        local_stream.writeAll(payload) catch {
-                            self.closeLocalStream(hdr.stream_id);
-                        };
-                    }
+                    self.handleDownstreamData(hdr.stream_id, hdr.seq_id, payload);
                 },
                 .close => {
                     self.closeLocalStream(hdr.stream_id);
                 },
-                .ping => {
-                    const now = getTimeMs();
-                    self.last_ping_ts.store(now, .release);
-                    if (payload.len >= 8) {
-                        const srv_ts = std.mem.readInt(i64, payload[0..8], .little);
-                        if (srv_ts > 0) {
-                            const rtt = now - srv_ts;
-                            std.debug.print("\x1b[32m[HEALTH]\x1b[0m Heartbeat received | Server RTT: {d}ms\n", .{rtt});
-                        }
-                    }
-                },
-                .log => {
-                    std.debug.print("\x1b[36m[SERVER-LOG]\x1b[0m {s}\n", .{payload});
-                },
                 else => {},
+            }
+        }
+    }
+
+    fn handleDownstreamData(self: *Client, stream_id: u32, seq_id: u32, payload: []const u8) void {
+        self.streams_mutex.lock();
+        const ctx_opt = self.local_streams.get(stream_id);
+        self.streams_mutex.unlock();
+
+        if (ctx_opt) |ctx| {
+            ctx.mutex.lock();
+            defer ctx.mutex.unlock();
+
+            if (seq_id == ctx.expected_seq) {
+                ctx.stream.writeAll(payload) catch {
+                    self.closeLocalStream(stream_id);
+                    return;
+                };
+                ctx.expected_seq +%= 1;
+
+                while (ctx.reorder_queue.fetchRemove(ctx.expected_seq)) |entry| {
+                    const q_payload = entry.value;
+                    defer self.allocator.free(q_payload);
+
+                    ctx.stream.writeAll(q_payload) catch {
+                        self.closeLocalStream(stream_id);
+                        return;
+                    };
+                    ctx.expected_seq +%= 1;
+                }
+            } else if (seq_id > ctx.expected_seq) {
+                if (ctx.reorder_queue.count() < self.opts.reorder_limit) {
+                    const copy = self.allocator.alloc(u8, payload.len) catch return;
+                    @memcpy(copy, payload);
+                    ctx.reorder_queue.put(seq_id, copy) catch {
+                        self.allocator.free(copy);
+                    };
+                }
             }
         }
     }
@@ -897,8 +832,6 @@ pub const Client = struct {
         const listen_fd = try listenOn(host, port);
         defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, listen_fd))));
 
-        std.debug.print("\x1b[32m[SOCKS]\x1b[0m SOCKS5 proxy listening on {s}:{d}\n", .{ host, port });
-
         while (true) {
             var client_addr: sockaddr = undefined;
             var client_len: u32 = @sizeOf(sockaddr);
@@ -906,11 +839,11 @@ pub const Client = struct {
             if (@as(isize, @bitCast(accept_rc)) < 0) continue;
             const client_fd: i32 = @intCast(accept_rc);
             const stream = protocol.SocketStream{ .handle = client_fd };
-            const thread = std.Thread.spawn(.{}, handleSocksConnection, .{ self, stream }) catch {
+            const th = std.Thread.spawn(.{}, handleSocksConnection, .{ self, stream }) catch {
                 stream.close();
                 continue;
             };
-            thread.detach();
+            th.detach();
         }
     }
 
@@ -923,10 +856,6 @@ pub const Client = struct {
         }
 
         if (hand_buf[0] != 5) {
-            if (hand_buf[0] == 'G' or hand_buf[0] == 'P' or hand_buf[0] == 'H') {
-                const msg = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nThis is a SOCKS5 proxy port. Use: curl -x socks5h://127.0.0.1:1080 <url>\r\n";
-                _ = stream.writeAll(msg) catch {};
-            }
             stream.shutdown();
             stream.close();
             return;
@@ -1005,14 +934,7 @@ pub const Client = struct {
             return;
         }
 
-        const target_port = std.mem.readInt(u16, &port_buf, .big);
         const stream_id = self.next_stream_id.fetchAdd(1, .monotonic);
-
-        if (atyp == 1) {
-            std.debug.print("\x1b[36m[SOCKS]\x1b[0m Stream #{d} -> {d}.{d}.{d}.{d}:{d}\n", .{ stream_id, addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3], target_port });
-        } else if (atyp == 3) {
-            std.debug.print("\x1b[36m[SOCKS]\x1b[0m Stream #{d} -> {s}:{d}\n", .{ stream_id, addr_buf[0..addr_len], target_port });
-        }
 
         var payload_buf: [300]u8 = undefined;
         @memcpy(payload_buf[0..2], &port_buf);
@@ -1032,9 +954,24 @@ pub const Client = struct {
         };
         self.waiters_mutex.unlock();
 
+        const ctx = self.allocator.create(StreamContext) catch {
+            self.waiters_mutex.lock();
+            _ = self.connect_waiters.remove(stream_id);
+            self.waiters_mutex.unlock();
+            stream.shutdown();
+            stream.close();
+            return;
+        };
+        ctx.* = .{
+            .stream = stream,
+            .expected_seq = 0,
+            .reorder_queue = std.AutoHashMap(u32, []u8).init(self.allocator),
+        };
+
         self.streams_mutex.lock();
-        self.local_streams.put(stream_id, stream) catch {
+        self.local_streams.put(stream_id, ctx) catch {
             self.streams_mutex.unlock();
+            self.allocator.destroy(ctx);
             self.waiters_mutex.lock();
             _ = self.connect_waiters.remove(stream_id);
             self.waiters_mutex.unlock();
@@ -1044,7 +981,6 @@ pub const Client = struct {
         };
         self.streams_mutex.unlock();
 
-        // Счётчик порядковых номеров пакетов внутри этого стрима
         var seq: u32 = 0;
         self.sendToUpstream(stream_id, seq, .connect, conn_payload);
         seq += 1;
@@ -1061,9 +997,8 @@ pub const Client = struct {
         const connected = (waiter.status.load(.acquire) == 1);
 
         if (!connected) {
-            std.debug.print("\x1b[31m[SOCKS ERROR]\x1b[0m Stream #{d} connect timed out or rejected\n", .{stream_id});
             _ = stream.writeAll(&[_]u8{ 5, 5, 0, 1, 0, 0, 0, 0, 0, 0 }) catch {};
-            sleepMs(50);
+            sleepMs(20);
             self.closeLocalStream(stream_id);
             return;
         }
@@ -1083,7 +1018,7 @@ pub const Client = struct {
                 return;
             }
             self.sendToUpstream(stream_id, seq, .data, data_buf[0..rd]);
-            seq += 1;
+            seq +%= 1;
         }
     }
 
@@ -1096,13 +1031,8 @@ pub const Client = struct {
         const l_port = std.fmt.parseInt(u16, l_port_str, 10) catch return;
         const r_port = std.fmt.parseInt(u16, r_port_str, 10) catch return;
 
-        const listen_fd = listenOn("127.0.0.1", l_port) catch {
-            std.debug.print("\x1b[31m[FWD ERROR]\x1b[0m Cannot bind to 127.0.0.1:{d}\n", .{l_port});
-            return;
-        };
+        const listen_fd = listenOn("127.0.0.1", l_port) catch return;
         defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, listen_fd))));
-
-        std.debug.print("\x1b[32m[FWD]\x1b[0m Forwarding 127.0.0.1:{d} -> {s}:{d}\n", .{ l_port, r_host, r_port });
 
         while (true) {
             var client_addr: sockaddr = undefined;
@@ -1111,12 +1041,12 @@ pub const Client = struct {
             if (@as(isize, @bitCast(accept_rc)) < 0) continue;
             const client_fd: i32 = @intCast(accept_rc);
             const stream = protocol.SocketStream{ .handle = client_fd };
-            const thread = std.Thread.spawn(.{}, handleForwardConnection, .{ self, stream, r_host, r_port }) catch {
+            const th = std.Thread.spawn(.{}, handleForwardConnection, .{ self, stream, r_host, r_port }) catch {
                 stream.shutdown();
                 stream.close();
                 continue;
             };
-            thread.detach();
+            th.detach();
         }
     }
 
@@ -1153,9 +1083,24 @@ pub const Client = struct {
         };
         self.waiters_mutex.unlock();
 
+        const ctx = self.allocator.create(StreamContext) catch {
+            self.waiters_mutex.lock();
+            _ = self.connect_waiters.remove(stream_id);
+            self.waiters_mutex.unlock();
+            stream.shutdown();
+            stream.close();
+            return;
+        };
+        ctx.* = .{
+            .stream = stream,
+            .expected_seq = 0,
+            .reorder_queue = std.AutoHashMap(u32, []u8).init(self.allocator),
+        };
+
         self.streams_mutex.lock();
-        self.local_streams.put(stream_id, stream) catch {
+        self.local_streams.put(stream_id, ctx) catch {
             self.streams_mutex.unlock();
+            self.allocator.destroy(ctx);
             self.waiters_mutex.lock();
             _ = self.connect_waiters.remove(stream_id);
             self.waiters_mutex.unlock();
@@ -1181,9 +1126,8 @@ pub const Client = struct {
         const connected = (waiter.status.load(.acquire) == 1);
 
         if (!connected) {
-            std.debug.print("\x1b[31m[FWD ERROR]\x1b[0m Stream #{d} connect to {s}:{d} rejected or timed out\n", .{ stream_id, r_host, r_port });
             _ = stream.writeAll(&[_]u8{ 5, 5, 0, 1, 0, 0, 0, 0, 0, 0 }) catch {};
-            sleepMs(50);
+            sleepMs(20);
             self.closeLocalStream(stream_id);
             return;
         }
@@ -1197,7 +1141,7 @@ pub const Client = struct {
                 return;
             }
             self.sendToUpstream(stream_id, seq, .data, data_buf[0..rd]);
-            seq += 1;
+            seq +%= 1;
         }
     }
 };
