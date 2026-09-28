@@ -136,6 +136,10 @@ pub const Server = struct {
                 return;
             }
 
+            var pipe_log: [64]u8 = undefined;
+            const pipe_slice = std.fmt.bufPrint(&pipe_log, "{{\"gen\":{d},\"bytes\":{d}}}", .{ req_gen, content_len }) catch "{}";
+            self.emitRemoteLog("debug", "pipe", "request_received", 0, pipe_slice);
+
             if (content_len > 0) {
                 const body = self.allocator.alloc(u8, content_len) catch { stream.close(); return; };
                 defer self.allocator.free(body);
@@ -162,6 +166,9 @@ pub const Server = struct {
             const prev_leader = self.active_leader.swap(&pipe_ctx, .acq_rel);
             if (prev_leader) |old| {
                 old.retired.store(true, .release);
+                var ret_log: [64]u8 = undefined;
+                const ret_slice = std.fmt.bufPrint(&ret_log, "{{\"old_gen\":{d},\"new_gen\":{d}}}", .{ old.gen, req_gen }) catch "{}";
+                self.emitRemoteLog("info", "baton", "preempt", 0, ret_slice);
             }
             self.leader_mutex.unlock();
 
@@ -177,10 +184,6 @@ pub const Server = struct {
                 stream.close();
                 return;
             };
-
-            var gen_data: [64]u8 = undefined;
-            const gen_slice = std.fmt.bufPrint(&gen_data, "{{\"gen\":{d}}}", .{req_gen}) catch "{}";
-            self.emitRemoteLog("info", "baton", "leader_acquired", 0, gen_slice);
 
             const drain_buf = self.allocator.alloc(u8, Config.common.http_chunk_size) catch { stream.close(); return; };
             defer self.allocator.free(drain_buf);
@@ -268,16 +271,20 @@ pub const Server = struct {
             if (addr_len != 4) { self.sendClose(stream_id); return; }
             @memcpy(&octets, raw_addr);
         } else if (target_type == 2) {
+            var dns_start_buf: [128]u8 = undefined;
+            const dns_start_slice = std.fmt.bufPrint(&dns_start_buf, "{{\"domain\":\"{s}\"}}", .{raw_addr}) catch "{}";
+            self.emitRemoteLog("info", "dns", "start", stream_id, dns_start_slice);
+
             const start_dns = getMilliTimestamp();
             if (!protocol.resolveDnsA(raw_addr, &octets)) {
-                self.emitRemoteLog("error", "dns", "resolve_failed", stream_id, "{\"error\":\"dns_query_timeout\"}");
+                self.emitRemoteLog("error", "dns", "failed", stream_id, "{\"error\":\"resolve_timeout\"}");
                 self.sendClose(stream_id);
                 return;
             }
             const dns_dur = getMilliTimestamp() - start_dns;
             var dns_res: [128]u8 = undefined;
-            const res_slice = std.fmt.bufPrint(&dns_res, "{{\"dur_ms\":{d},\"ip\":\"{d}.{d}.{d}.{d}\"}}", .{ dns_dur, octets[0], octets[1], octets[2], octets[3] }) catch "{}";
-            self.emitRemoteLog("info", "dns", "resolve_ok", stream_id, res_slice);
+            const res_slice = std.fmt.bufPrint(&dns_res, "{{\"domain\":\"{s}\",\"ip\":\"{d}.{d}.{d}.{d}\",\"dur_ms\":{d}}}", .{ raw_addr, octets[0], octets[1], octets[2], octets[3], dns_dur }) catch "{}";
+            self.emitRemoteLog("info", "dns", "done", stream_id, res_slice);
         } else {
             self.sendClose(stream_id);
             return;
@@ -295,6 +302,10 @@ pub const Server = struct {
             .addr = @as(u32, @bitCast(octets)),
         };
 
+        var conn_start_buf: [128]u8 = undefined;
+        const conn_start_slice = std.fmt.bufPrint(&conn_start_buf, "{{\"ip\":\"{d}.{d}.{d}.{d}\",\"port\":{d}}}", .{ octets[0], octets[1], octets[2], octets[3], port }) catch "{}";
+        self.emitRemoteLog("info", "target", "connect_start", stream_id, conn_start_slice);
+
         const start_tcp = getMilliTimestamp();
         const conn_rc = std.os.linux.syscall3(.connect, @as(usize, @bitCast(@as(isize, sock))), @intFromPtr(&target_addr), @sizeOf(sockaddr_in));
         if (@as(isize, @bitCast(conn_rc)) < 0) {
@@ -305,9 +316,9 @@ pub const Server = struct {
         }
 
         const tcp_dur = getMilliTimestamp() - start_tcp;
-        var tcp_res: [64]u8 = undefined;
-        const tcp_slice = std.fmt.bufPrint(&tcp_res, "{{\"dur_ms\":{d}}}", .{tcp_dur}) catch "{}";
-        self.emitRemoteLog("info", "target", "connect_ok", stream_id, tcp_slice);
+        var tcp_res: [128]u8 = undefined;
+        const tcp_slice = std.fmt.bufPrint(&tcp_res, "{{\"ip\":\"{d}.{d}.{d}.{d}\",\"port\":{d},\"dur_ms\":{d}}}", .{ octets[0], octets[1], octets[2], octets[3], port, tcp_dur }) catch "{}";
+        self.emitRemoteLog("info", "target", "connect_done", stream_id, tcp_slice);
 
         const target_conn = protocol.SocketStream{ .handle = sock };
         const state = self.allocator.create(StreamState) catch unreachable;

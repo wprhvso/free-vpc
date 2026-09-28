@@ -26,6 +26,18 @@ fn getMilliTimestamp() u64 {
     return @intCast((ts.sec * 1000) + @divTrunc(ts.nsec, 1_000_000));
 }
 
+fn sleepMs(ms: u64) void {
+    const timespec = extern struct {
+        sec: i64,
+        nsec: i64,
+    };
+    const ts = timespec{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * 1_000_000),
+    };
+    _ = std.os.linux.syscall2(.nanosleep, @intFromPtr(&ts), 0);
+}
+
 fn clientLog(level: []const u8, component: []const u8, event: []const u8, stream_id: u32, data_json: []const u8) void {
     var scratch: [1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&scratch,
@@ -303,15 +315,19 @@ pub const Client = struct {
     fn poolRotationThread(self: *Client) void {
         const step = Config.client.socket_ttl_ms / Config.client.pool_size;
         while (true) {
-            futex.Futex.wait(&self.gen_counter, 0, step);
+            sleepMs(step);
             const now = getMilliTimestamp();
             for (0..Config.client.pool_size) |i| {
                 const s = &self.pool[i];
                 s.mutex.lock();
-                if (s.conn != null and !s.in_use and (now - s.created_at >= Config.client.socket_ttl_ms)) {
+                if (s.conn != null and !s.in_use and s.created_at > 0 and (now >= s.created_at + Config.client.socket_ttl_ms)) {
                     s.conn.?.close();
                     s.conn = null;
-                    clientLog("debug", "pool", "socket_rotated", 0, "{\"idx\":0}");
+                    const age = now - s.created_at;
+                    s.created_at = 0;
+                    var rot_data: [64]u8 = undefined;
+                    const rot_slice = std.fmt.bufPrint(&rot_data, "{{\"idx\":{d},\"age_ms\":{d}}}", .{ i, age }) catch "{}";
+                    clientLog("debug", "pool", "socket_rotated", 0, rot_slice);
                 }
                 s.mutex.unlock();
             }
@@ -335,15 +351,22 @@ pub const Client = struct {
                     s.conn = self.connectRemote() catch {
                         s.in_use = false;
                         s.mutex.unlock();
+                        var err_data: [64]u8 = undefined;
+                        const err_slice = std.fmt.bufPrint(&err_data, "{{\"idx\":{d},\"error\":\"on_demand_connect_failed\"}}", .{i}) catch "{}";
+                        clientLog("error", "pool", "socket_connect_failed", 0, err_slice);
                         continue;
                     };
                     s.created_at = getMilliTimestamp();
+                    var conn_data: [64]u8 = undefined;
+                    const conn_slice = std.fmt.bufPrint(&conn_data, "{{\"idx\":{d},\"on_demand\":true}}", .{i}) catch "{}";
+                    clientLog("debug", "pool", "socket_connected", 0, conn_slice);
                 }
                 s.mutex.unlock();
                 return s;
             }
             s.mutex.unlock();
         }
+        clientLog("warn", "pool", "pool_exhausted", 0, "{}");
         return null;
     }
 
@@ -385,6 +408,11 @@ pub const Client = struct {
             .{ Config.common.pipe_path, Config.client.remote_host, Config.client.user_agent, Config.common.token_header, Config.common.token, gen, batch_len }
         ) catch unreachable;
 
+        var req_log: [128]u8 = undefined;
+        const req_slice = std.fmt.bufPrint(&req_log, "{{\"idx\":{d},\"gen\":{d},\"bytes\":{d}}}", .{ ps.id, gen, batch_len }) catch "{}";
+        clientLog("info", "baton", "request_sent", 0, req_slice);
+
+        const start_time = getMilliTimestamp();
         var conn = ps.conn.?;
         const send_ok = blk: {
             conn.writeAll(hdrs) catch break :blk false;
@@ -395,17 +423,25 @@ pub const Client = struct {
         };
 
         if (!send_ok) {
+            clientLog("error", "baton", "write_failed", 0, req_slice);
             conn.close();
             ps.conn = null;
             return;
         }
 
         var resp_hdr_buf: [2048]u8 = undefined;
-        _ = conn.readHeadersFast(&resp_hdr_buf) catch {
+        const resp_hdrs = conn.readHeadersFast(&resp_hdr_buf) catch {
+            clientLog("error", "baton", "headers_read_failed", 0, req_slice);
             conn.close();
             ps.conn = null;
             return;
         };
+
+        const rtt = getMilliTimestamp() - start_time;
+        const first_line = resp_hdrs[0 .. std.mem.indexOf(u8, resp_hdrs, "\r\n") orelse resp_hdrs.len];
+        var resp_log: [256]u8 = undefined;
+        const resp_slice = std.fmt.bufPrint(&resp_log, "{{\"idx\":{d},\"gen\":{d},\"status\":\"{s}\",\"rtt_ms\":{d}}}", .{ ps.id, gen, first_line, rtt }) catch "{}";
+        clientLog("info", "baton", "response_headers", 0, resp_slice);
 
         const chunk_buf = self.allocator.alloc(u8, Config.common.http_chunk_size) catch return;
         defer self.allocator.free(chunk_buf);
@@ -419,6 +455,9 @@ pub const Client = struct {
 
             if (chunk_len == 0) {
                 conn.skipCrLf() catch {};
+                var end_log: [64]u8 = undefined;
+                const end_slice = std.fmt.bufPrint(&end_log, "{{\"idx\":{d},\"gen\":{d}}}", .{ ps.id, gen }) catch "{}";
+                clientLog("debug", "baton", "stream_ended", 0, end_slice);
                 break;
             }
 
@@ -454,11 +493,22 @@ pub const Client = struct {
     fn poolWorkerLoop(self: *Client, id: usize) void {
         const s = &self.pool[id];
         const initial_delay = id * (Config.client.socket_ttl_ms / Config.client.pool_size);
-        futex.Futex.wait(&self.gen_counter, 0, initial_delay);
+        if (initial_delay > 0) {
+            sleepMs(initial_delay);
+        }
 
         s.mutex.lock();
         s.conn = self.connectRemote() catch null;
-        s.created_at = getMilliTimestamp();
+        if (s.conn != null) {
+            s.created_at = getMilliTimestamp();
+            var conn_data: [64]u8 = undefined;
+            const conn_slice = std.fmt.bufPrint(&conn_data, "{{\"idx\":{d}}}", .{id}) catch "{}";
+            clientLog("debug", "pool", "socket_connected", 0, conn_slice);
+        } else {
+            var err_data: [64]u8 = undefined;
+            const err_slice = std.fmt.bufPrint(&err_data, "{{\"idx\":{d},\"error\":\"connect_failed\"}}", .{id}) catch "{}";
+            clientLog("error", "pool", "socket_connect_failed", 0, err_slice);
+        }
         s.mutex.unlock();
     }
 
@@ -551,6 +601,7 @@ pub const Client = struct {
             self.allocator.destroy(ctx);
 
             _ = self.upstream_queue.push(stream_id, 0, .close, "");
+            clientLog("info", "socks", "stream_closed", stream_id, "{}");
         }
     }
 
@@ -579,13 +630,17 @@ pub const Client = struct {
     }
 
     fn handleSocks(self: *Client, stream: protocol.SocketStream) void {
+        clientLog("info", "socks", "accept", 0, "{}");
+
         var greeting_hdr: [2]u8 = undefined;
         if (!protocol.readExactStream(stream, &greeting_hdr)) {
+            clientLog("warn", "socks", "handshake_read_failed", 0, "{}");
             stream.close();
             return;
         }
 
         if (greeting_hdr[0] != 5) {
+            clientLog("warn", "socks", "unsupported_version", 0, "{}");
             stream.close();
             return;
         }
@@ -593,19 +648,25 @@ pub const Client = struct {
         const nmethods = greeting_hdr[1];
         var methods_buf: [256]u8 = undefined;
         if (nmethods == 0 or !protocol.readExactStream(stream, methods_buf[0..nmethods])) {
+            clientLog("warn", "socks", "methods_read_failed", 0, "{}");
             stream.close();
             return;
         }
 
-        stream.writeAll(&[_]u8{ 5, 0 }) catch { stream.close(); return; };
+        stream.writeAll(&[_]u8{ 5, 0 }) catch {
+            stream.close();
+            return;
+        };
 
         var req_hdr: [4]u8 = undefined;
         if (!protocol.readExactStream(stream, &req_hdr)) {
+            clientLog("warn", "socks", "req_hdr_read_failed", 0, "{}");
             stream.close();
             return;
         }
 
         if (req_hdr[0] != 5 or req_hdr[1] != 1) {
+            clientLog("warn", "socks", "unsupported_command", 0, "{}");
             _ = stream.writeAll(&[_]u8{ 5, 7, 0, 1, 0, 0, 0, 0, 0, 0 }) catch {};
             stream.close();
             return;
@@ -649,6 +710,13 @@ pub const Client = struct {
         const target_port = std.mem.readInt(u16, &port_buf, .big);
         const stream_id = self.next_stream_id.fetchAdd(1, .monotonic);
 
+        var req_log: [256]u8 = undefined;
+        const req_slice = if (target_type == 1)
+            std.fmt.bufPrint(&req_log, "{{\"target\":\"{d}.{d}.{d}.{d}\",\"port\":{d}}}", .{ addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3], target_port }) catch "{}"
+        else
+            std.fmt.bufPrint(&req_log, "{{\"target\":\"{s}\",\"port\":{d}}}", .{ addr_buf[0..addr_len], target_port }) catch "{}";
+        clientLog("info", "socks", "cmd_connect", stream_id, req_slice);
+
         var payload_buf: [300]u8 = undefined;
         @memcpy(payload_buf[0..2], &port_buf);
         payload_buf[2] = target_type;
@@ -688,14 +756,17 @@ pub const Client = struct {
         self.waiters_mutex.unlock();
 
         if (!ok) {
+            var fail_log: [128]u8 = undefined;
+            const fail_slice = std.fmt.bufPrint(&fail_log, "{{\"dur_ms\":{d},\"error\":\"timeout_or_rejected\"}}", .{dur}) catch "{}";
+            clientLog("error", "socks", "connect_failed", stream_id, fail_slice);
             _ = stream.writeAll(&[_]u8{ 5, 5, 0, 1, 0, 0, 0, 0, 0, 0 }) catch {};
             self.closeLocalStream(stream_id);
             return;
         }
 
-        var log_data: [128]u8 = undefined;
-        const log_slice = std.fmt.bufPrint(&log_data, "{{\"target_port\":{d},\"dur_ms\":{d}}}", .{ target_port, dur }) catch "{}";
-        clientLog("info", "socks", "connect_ok", stream_id, log_slice);
+        var ok_log: [128]u8 = undefined;
+        const ok_slice = std.fmt.bufPrint(&ok_log, "{{\"dur_ms\":{d}}}", .{dur}) catch "{}";
+        clientLog("info", "socks", "connect_established", stream_id, ok_slice);
 
         stream.writeAll(&[_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 }) catch {
             self.closeLocalStream(stream_id);
