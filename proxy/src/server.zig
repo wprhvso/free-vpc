@@ -548,7 +548,7 @@ pub const Server = struct {
 
                 const sse_headers =
                     "HTTP/1.1 200 OK\r\n" ++
-                    "Content-Type: text/event-stream\r\n" ++
+                    "Content-Type: application/octet-stream\r\n" ++
                     "Cache-Control: no-cache, no-transform, private\r\n" ++
                     "X-Accel-Buffering: no\r\n" ++
                     "Connection: keep-alive\r\n" ++

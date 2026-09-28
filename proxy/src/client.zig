@@ -744,7 +744,7 @@ pub const Client = struct {
             const hdr_text = std.fmt.bufPrint(&req_hdr,
                 "GET /stream HTTP/1.1\r\n" ++
                 "Host: {s}\r\n" ++
-                "Accept: text/event-stream\r\n" ++
+                "Accept: application/octet-stream\r\n" ++
                 "Cache-Control: no-cache\r\n" ++
                 "X-Client-Name: {s}\r\n" ++
                 "Connection: keep-alive\r\n\r\n",
