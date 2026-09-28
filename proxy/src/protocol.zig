@@ -5,6 +5,9 @@ pub const Cmd = enum(u8) {
     connect_ok = 2,
     data = 3,
     close = 4,
+    ping = 5,
+    pong = 6,
+    log = 7,
     _,
 };
 
@@ -100,7 +103,7 @@ pub fn getDnsServerIp() [4]u8 {
 pub fn resolveDnsA(domain: []const u8, out_ip: *[4]u8) bool {
     if (parseIp4(domain, out_ip)) return true;
 
-    const sock_rc = std.os.linux.syscall3(.socket, 2, 2, 0); // AF_INET, SOCK_DGRAM
+    const sock_rc = std.os.linux.syscall3(.socket, 2, 2, 0);
     if (@as(isize, @bitCast(sock_rc)) < 0) return false;
     const sock: i32 = @intCast(sock_rc);
     defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, sock))));

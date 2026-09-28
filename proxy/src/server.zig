@@ -16,11 +16,29 @@ const sockaddr = extern struct {
     data: [14]u8,
 };
 
+fn getMilliTimestamp() u64 {
+    const timespec = extern struct {
+        sec: i64,
+        nsec: i64,
+    };
+    var ts: timespec = undefined;
+    _ = std.os.linux.syscall2(.clock_gettime, 0, @intFromPtr(&ts));
+    return @intCast((ts.sec * 1000) + @divTrunc(ts.nsec, 1_000_000));
+}
+
 const StreamState = struct {
     stream: protocol.SocketStream,
     expected_seq: u32 = 1,
     downstream_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     reorder_queue: std.AutoHashMap(u32, []u8),
+    mutex: futex.Mutex = .{},
+};
+
+const ServerPipeContext = struct {
+    gen: u64,
+    stream: protocol.SocketStream,
+    retired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    done_event: futex.Event = .{},
     mutex: futex.Mutex = .{},
 };
 
@@ -30,6 +48,8 @@ pub const Server = struct {
     downstream_queue: FrameQueue,
     streams: std.AutoHashMap(u32, *StreamState),
     streams_mutex: futex.Mutex = .{},
+    active_leader: std.atomic.Value(?*ServerPipeContext) = std.atomic.Value(?*ServerPipeContext).init(null),
+    leader_mutex: futex.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Server {
         const dq = FrameQueue.init(allocator, Config.common.queue_capacity) catch unreachable;
@@ -46,11 +66,19 @@ pub const Server = struct {
         self.streams.deinit();
     }
 
+    pub fn emitRemoteLog(self: *Server, level: []const u8, component: []const u8, event: []const u8, stream_id: u32, data_json: []const u8) void {
+        var scratch: [1024]u8 = undefined;
+        const msg = std.fmt.bufPrint(&scratch,
+            "{{\"ts\":{d},\"node\":\"server\",\"component\":\"{s}\",\"level\":\"{s}\",\"event\":\"{s}\",\"stream_id\":{d},\"data\":{s}}}",
+            .{ getMilliTimestamp(), component, level, event, stream_id, data_json }
+        ) catch return;
+
+        _ = self.downstream_queue.push(0, 0, .log, msg);
+    }
+
     pub fn start(self: *Server) !void {
         const listen_fd = try listenOn(Config.server.bind_host, Config.server.bind_port);
         defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, listen_fd))));
-
-        std.debug.print("\x1b[32m[SERVER]\x1b[0m Edge listener ready on {s}:{d}\n", .{ Config.server.bind_host, Config.server.bind_port });
 
         while (true) {
             var client_addr: sockaddr = undefined;
@@ -72,42 +100,30 @@ pub const Server = struct {
 
     fn handleHttp(self: *Server, stream: protocol.SocketStream) void {
         var header_buf: [4096]u8 = undefined;
-        const drain_buf = self.allocator.alloc(u8, Config.common.http_chunk_size) catch { stream.close(); return; };
-        defer self.allocator.free(drain_buf);
-
-        std.debug.print("\x1b[33m[SERVER]\x1b[0m Incoming connection accepted\n", .{});
 
         while (true) {
             var leftover: []const u8 = undefined;
-            const hdrs = readHeadersFast(stream, &header_buf, &leftover) catch |err| {
-                std.debug.print("\x1b[33m[SERVER]\x1b[0m Connection closed / error: {s}\n", .{@errorName(err)});
-                stream.close();
-                return;
-            };
+            const hdrs = readHeadersFast(stream, &header_buf, &leftover) catch { stream.close(); return; };
 
             const first_line = hdrs[0 .. std.mem.indexOf(u8, hdrs, "\r\n") orelse hdrs.len];
-            std.debug.print("\x1b[33m[SERVER]\x1b[0m Got HTTP request: {s}\n", .{first_line});
+            const is_pipe = std.mem.indexOf(u8, first_line, Config.common.pipe_path) != null;
 
-            const is_push = std.mem.indexOf(u8, first_line, Config.common.push_path) != null;
-            const is_pull = std.mem.indexOf(u8, first_line, Config.common.pull_path) != null;
-
-            if (!is_push and !is_pull) {
-                std.debug.print("\x1b[33m[SERVER]\x1b[0m Unknown path, returning 200 OK\n", .{});
+            if (!is_pipe) {
                 _ = stream.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK") catch {};
                 continue;
             }
 
             var content_len: usize = 0;
-            var is_keep_alive = true;
             var auth_ok = false;
+            var req_gen: u64 = 0;
 
             var h_it = std.mem.splitSequence(u8, hdrs, "\r\n");
             while (h_it.next()) |line| {
                 if (line.len == 0) break;
                 if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
                     content_len = std.fmt.parseInt(usize, std.mem.trim(u8, line["content-length:".len..], " \t"), 10) catch 0;
-                } else if (std.ascii.startsWithIgnoreCase(line, "connection:")) {
-                    if (std.mem.indexOf(u8, line, "close") != null) is_keep_alive = false;
+                } else if (std.ascii.startsWithIgnoreCase(line, "x-gen:")) {
+                    req_gen = std.fmt.parseInt(u64, std.mem.trim(u8, line["x-gen:".len..], " \t"), 10) catch 0;
                 } else if (std.ascii.startsWithIgnoreCase(line, Config.common.token_header)) {
                     const token_val = std.mem.trim(u8, line[Config.common.token_header.len + 1 ..], " \t");
                     if (std.mem.eql(u8, token_val, Config.common.token)) auth_ok = true;
@@ -115,69 +131,77 @@ pub const Server = struct {
             }
 
             if (!auth_ok) {
-                std.debug.print("\x1b[31m[SERVER]\x1b[0m 403 Forbidden: Invalid token\n", .{});
                 _ = stream.writeAll("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n") catch {};
                 stream.close();
                 return;
             }
 
-            if (is_push) {
-                if (content_len > 0) {
-                    const body = self.allocator.alloc(u8, content_len) catch { stream.close(); return; };
-                    defer self.allocator.free(body);
+            if (content_len > 0) {
+                const body = self.allocator.alloc(u8, content_len) catch { stream.close(); return; };
+                defer self.allocator.free(body);
 
-                    if (leftover.len > 0) {
-                        const from_lo = @min(leftover.len, content_len);
-                        @memcpy(body[0..from_lo], leftover[0..from_lo]);
-                        if (content_len > from_lo) {
-                            if (!protocol.readExactStream(stream, body[from_lo..content_len])) { stream.close(); return; }
-                        }
-                    } else {
-                        if (!protocol.readExactStream(stream, body)) { stream.close(); return; }
+                if (leftover.len > 0) {
+                    const from_lo = @min(leftover.len, content_len);
+                    @memcpy(body[0..from_lo], leftover[0..from_lo]);
+                    if (content_len > from_lo) {
+                        if (!protocol.readExactStream(stream, body[from_lo..content_len])) { stream.close(); return; }
                     }
-
-                    std.debug.print("\x1b[35m[SERVER PUSH]\x1b[0m Processing {d} bytes\n", .{body.len});
-                    self.processFrames(body);
-                }
-                _ = stream.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n") catch { stream.close(); return; };
-            } else if (is_pull) {
-                var batch_len = self.downstream_queue.drainBatch(drain_buf);
-                if (batch_len == 0) {
-                    std.debug.print("\x1b[34m[SERVER PULL]\x1b[0m Waiting for data (hold 10s)...\n", .{});
-                    if (self.downstream_queue.waitData(Config.server.hold_timeout_ms)) {
-                        batch_len = self.downstream_queue.drainBatch(drain_buf);
-                    }
-                }
-
-                if (batch_len > 0) {
-                    std.debug.print("\x1b[34m[SERVER PULL]\x1b[0m Returning {d} bytes\n", .{batch_len});
-                    var resp_hdr: [256]u8 = undefined;
-                    const hdr_text = std.fmt.bufPrint(&resp_hdr,
-                        "HTTP/1.1 200 OK\r\n" ++
-                        "Content-Type: application/octet-stream\r\n" ++
-                        "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n" ++
-                        "Pragma: no-cache\r\n" ++
-                        "Content-Length: {d}\r\n" ++
-                        "Connection: {s}\r\n\r\n",
-                        .{ batch_len, if (is_keep_alive) "keep-alive" else "close" }
-                    ) catch unreachable;
-
-                    stream.writeAll(hdr_text) catch { stream.close(); return; };
-                    stream.writeAll(drain_buf[0..batch_len]) catch { stream.close(); return; };
                 } else {
-                    std.debug.print("\x1b[34m[SERVER PULL]\x1b[0m Hold timeout, returning 204 No Content\n", .{});
-                    const no_content = if (is_keep_alive)
-                        "HTTP/1.1 204 No Content\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n"
-                    else
-                        "HTTP/1.1 204 No Content\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
-                    stream.writeAll(no_content) catch { stream.close(); return; };
+                    if (!protocol.readExactStream(stream, body)) { stream.close(); return; }
                 }
+
+                self.processFrames(body);
             }
 
-            if (!is_keep_alive) {
+            var pipe_ctx = ServerPipeContext{
+                .gen = req_gen,
+                .stream = stream,
+            };
+
+            self.leader_mutex.lock();
+            const prev_leader = self.active_leader.swap(&pipe_ctx, .acq_rel);
+            if (prev_leader) |old| {
+                old.retired.store(true, .release);
+            }
+            self.leader_mutex.unlock();
+
+            const init_resp =
+                "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: application/octet-stream\r\n" ++
+                "Transfer-Encoding: chunked\r\n" ++
+                "Cache-Control: no-cache, no-store, no-transform\r\n" ++
+                "X-Accel-Buffering: no\r\n" ++
+                "Connection: keep-alive\r\n\r\n";
+
+            stream.writeAll(init_resp) catch {
                 stream.close();
                 return;
+            };
+
+            var gen_data: [64]u8 = undefined;
+            const gen_slice = std.fmt.bufPrint(&gen_data, "{{\"gen\":{d}}}", .{req_gen}) catch "{}";
+            self.emitRemoteLog("info", "baton", "leader_acquired", 0, gen_slice);
+
+            const drain_buf = self.allocator.alloc(u8, Config.common.http_chunk_size) catch { stream.close(); return; };
+            defer self.allocator.free(drain_buf);
+
+            while (!pipe_ctx.retired.load(.acquire)) {
+                _ = self.downstream_queue.waitData(500);
+
+                if (pipe_ctx.retired.load(.acquire)) break;
+
+                const batch_len = self.downstream_queue.drainBatch(drain_buf);
+                if (batch_len > 0) {
+                    var ch_hdr: [32]u8 = undefined;
+                    const ch_hdr_text = std.fmt.bufPrint(&ch_hdr, "{x}\r\n", .{batch_len}) catch unreachable;
+                    stream.writeAll(ch_hdr_text) catch break;
+                    stream.writeAll(drain_buf[0..batch_len]) catch break;
+                    stream.writeAll("\r\n") catch break;
+                }
             }
+
+            stream.writeAll("0\r\n\r\n") catch {};
+            pipe_ctx.done_event.set();
         }
     }
 
@@ -191,8 +215,6 @@ pub const Server = struct {
             if (offset + hdr.payload_len > body.len) break;
             const payload = body[offset .. offset + hdr.payload_len];
             offset += hdr.payload_len;
-
-            std.debug.print("\x1b[35m[SERVER FRAME]\x1b[0m Stream #{d} cmd={any} len={d}\n", .{ hdr.stream_id, hdr.cmd, hdr.payload_len });
 
             switch (hdr.cmd) {
                 .connect => self.handleConnect(hdr.stream_id, payload),
@@ -246,20 +268,20 @@ pub const Server = struct {
             if (addr_len != 4) { self.sendClose(stream_id); return; }
             @memcpy(&octets, raw_addr);
         } else if (target_type == 2) {
-            std.debug.print("\x1b[36m[SERVER DNS]\x1b[0m Resolving {s}...\n", .{raw_addr});
+            const start_dns = getMilliTimestamp();
             if (!protocol.resolveDnsA(raw_addr, &octets)) {
-                std.debug.print("\x1b[31m[SERVER ERROR]\x1b[0m Failed to resolve DNS for {s}\n", .{raw_addr});
+                self.emitRemoteLog("error", "dns", "resolve_failed", stream_id, "{\"error\":\"dns_query_timeout\"}");
                 self.sendClose(stream_id);
                 return;
             }
+            const dns_dur = getMilliTimestamp() - start_dns;
+            var dns_res: [128]u8 = undefined;
+            const res_slice = std.fmt.bufPrint(&dns_res, "{{\"dur_ms\":{d},\"ip\":\"{d}.{d}.{d}.{d}\"}}", .{ dns_dur, octets[0], octets[1], octets[2], octets[3] }) catch "{}";
+            self.emitRemoteLog("info", "dns", "resolve_ok", stream_id, res_slice);
         } else {
             self.sendClose(stream_id);
             return;
         }
-
-        std.debug.print("\x1b[32m[SERVER]\x1b[0m Connecting Stream #{d} to {d}.{d}.{d}.{d}:{d}...\n", .{
-            stream_id, octets[0], octets[1], octets[2], octets[3], port,
-        });
 
         const rc = std.os.linux.syscall3(.socket, 2, 1, 0);
         if (@as(isize, @bitCast(rc)) < 0) { self.sendClose(stream_id); return; }
@@ -273,15 +295,19 @@ pub const Server = struct {
             .addr = @as(u32, @bitCast(octets)),
         };
 
+        const start_tcp = getMilliTimestamp();
         const conn_rc = std.os.linux.syscall3(.connect, @as(usize, @bitCast(@as(isize, sock))), @intFromPtr(&target_addr), @sizeOf(sockaddr_in));
         if (@as(isize, @bitCast(conn_rc)) < 0) {
-            std.debug.print("\x1b[31m[SERVER]\x1b[0m Connect failed to target\n", .{});
             _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, sock))));
+            self.emitRemoteLog("error", "target", "connect_failed", stream_id, "{\"error\":\"econnrefused\"}");
             self.sendClose(stream_id);
             return;
         }
 
-        std.debug.print("\x1b[32m[SERVER]\x1b[0m Connected target for Stream #{d}\n", .{stream_id});
+        const tcp_dur = getMilliTimestamp() - start_tcp;
+        var tcp_res: [64]u8 = undefined;
+        const tcp_slice = std.fmt.bufPrint(&tcp_res, "{{\"dur_ms\":{d}}}", .{tcp_dur}) catch "{}";
+        self.emitRemoteLog("info", "target", "connect_ok", stream_id, tcp_slice);
 
         const target_conn = protocol.SocketStream{ .handle = sock };
         const state = self.allocator.create(StreamState) catch unreachable;
@@ -296,7 +322,6 @@ pub const Server = struct {
         self.streams_mutex.unlock();
 
         _ = self.downstream_queue.push(stream_id, 0, .connect_ok, "");
-        std.debug.print("\x1b[32m[SERVER]\x1b[0m Sent connect_ok for Stream #{d}\n", .{stream_id});
 
         const th = std.Thread.spawn(.{}, targetReaderWorker, .{ self, stream_id, target_conn, state }) catch {
             self.closeStream(stream_id);
@@ -310,7 +335,6 @@ pub const Server = struct {
         while (true) {
             const n = target_stream.read(&buf) catch 0;
             if (n == 0) {
-                std.debug.print("\x1b[33m[SERVER]\x1b[0m Stream #{d} target socket closed (EOF)\n", .{stream_id});
                 self.closeStream(stream_id);
                 return;
             }
@@ -340,6 +364,7 @@ pub const Server = struct {
             state.reorder_queue.deinit();
             self.allocator.destroy(state);
 
+            self.emitRemoteLog("info", "stream", "closed", stream_id, "{}");
             self.sendClose(stream_id);
         }
     }

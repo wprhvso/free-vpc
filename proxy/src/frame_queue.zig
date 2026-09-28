@@ -29,7 +29,7 @@ pub const FrameQueue = struct {
 
         if (self.count + frame_size > self.data.len) return false;
 
-        var hdr = protocol.Header{
+        const hdr = protocol.Header{
             .magic = 0xCF01,
             .payload_len = @intCast(payload.len),
             .stream_id = stream_id,
