@@ -64,6 +64,7 @@ if [ -f "${SCRIPT_DIR}/../proxy/zig-out/bin/cf-proxy-server" ]; then
 fi
 
 /usr/local/bin/cf-proxy-server --host 0.0.0.0 --port 8022 >/tmp/cf-proxy-server.log 2>&1 &
+SERVER_PID=$!
 
 sleep 1
 
