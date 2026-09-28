@@ -58,6 +58,36 @@ NODE_NAME="free-vpc-${GITHUB_RUN_ID:-manual}-${NODE_NUM}"
 
 download_assets
 
+cat << 'SBEOF' | sudo tee /tmp/sing-box-server.json > /dev/null
+{
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "127.0.0.1",
+      "listen_port": 8022,
+      "users": [
+        {"uuid": "00000000-0000-0000-0000-000000000001"}
+      ],
+      "transport": {
+        "type": "grpc",
+        "service_name": "free-vpc"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct",
+      "override_address": "127.0.0.1",
+      "override_port": 22
+    }
+  ]
+}
+SBEOF
+
+/usr/local/bin/sing-box run -c /tmp/sing-box-server.json > /tmp/sing-box.log 2>&1 &
+
 CREATE_RESP=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector" \
   -H "Authorization: Bearer ${CF_API_TOKEN}" \
   -H "Content-Type: application/json" \
@@ -127,7 +157,6 @@ if [ "$NODE_NUM" = "1" ]; then
 
   python3 "${SCRIPT_DIR}/dashboard_server.py" 8080 > /tmp/dashboard.log 2>&1 &
   /usr/local/bin/ttyd -p 7681 -b /ssh -W -t fontSize=14 -t theme='{"background": "#0b0f19"}' bash > /tmp/ttyd.log 2>&1 &
-  /usr/local/bin/gost -L "forward+grpc://:8022/127.0.0.1:22" > /tmp/gost.log 2>&1 &
 
   if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
     /usr/local/bin/cloudflared tunnel run --token "${CF_TUNNEL_TOKEN}" > /tmp/cf_named_tunnel.log 2>&1 &
@@ -146,7 +175,6 @@ else
   sleep 3
 
   /usr/local/bin/ttyd -p 7681 -b /ssh -W -t fontSize=14 -t theme='{"background": "#0b0f19"}' bash > /tmp/ttyd.log 2>&1 &
-  /usr/local/bin/gost -L "forward+grpc://:8022/127.0.0.1:22" > /tmp/gost.log 2>&1 &
 fi
 
 NOW=$(date +%s)
@@ -159,7 +187,7 @@ curl -s -X POST "http://127.0.0.1:4001/db/execute" \
 bash "${SCRIPT_DIR}/cluster_orchestrator.sh" "$NODE_NUM" "${GITHUB_REPOSITORY:-wprhvso/free-vpc}" "${GH_PAT:-}" 20 > /tmp/orchestrator.log 2>&1 &
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  printf "## Free VPC P2P Node Online\n- Slot: \`#%s\`\n- Mesh IP: \`%s\`\n- Web Portal: https://vm.unsafie.com\n- Web SSH Terminal: https://vm.unsafie.com/ssh\n- CLI SSH (No Access Auth): \`gost -L tcp://:2222 -F forward+grpc://ssh.unsafie.com:443\` -> \`ssh -p 2222 runner@127.0.0.1\`\n" "$NODE_NUM" "${MESH_IP:-none}" >> "$GITHUB_STEP_SUMMARY"
+  printf "## Free VPC Node Online\n- Slot: \`#%s\`\n- Mesh IP: \`%s\`\n- Web Portal: https://vm.unsafie.com\n- Web SSH Terminal: https://vm.unsafie.com/ssh\n- CLI SSH via gRPC: \`ssh.unsafie.com:443\`\n" "$NODE_NUM" "${MESH_IP:-none}" >> "$GITHUB_STEP_SUMMARY"
 fi
 
 START_TIME=$SECONDS
