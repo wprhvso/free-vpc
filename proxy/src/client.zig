@@ -16,6 +16,16 @@ const sockaddr = extern struct {
     data: [14]u8,
 };
 
+fn getMilliTimestamp() i64 {
+    const timespec = extern struct {
+        sec: i64,
+        nsec: i64,
+    };
+    var ts: timespec = undefined;
+    _ = std.os.linux.syscall2(.clock_gettime, 0, @intFromPtr(&ts));
+    return (ts.sec * 1000) + @divTrunc(ts.nsec, 1_000_000);
+}
+
 const RemoteConnection = struct {
     fd: i32,
     io: std.Io,
@@ -29,7 +39,6 @@ const RemoteConnection = struct {
     tls_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
     tls_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
 
-    // Буфер быстрого чтения (исключает побайтовые сисколы)
     read_buf: [16384]u8 = undefined,
     read_pos: usize = 0,
     read_len: usize = 0,
@@ -105,7 +114,6 @@ const RemoteConnection = struct {
 
     pub fn readHeadersFast(self: *RemoteConnection, out_buf: []u8, leftover: *[]const u8) ![]const u8 {
         var total: usize = 0;
-        // Переносим остаток
         if (self.read_pos < self.read_len) {
             const avail = self.read_len - self.read_pos;
             @memcpy(out_buf[0..avail], self.read_buf[self.read_pos..self.read_len]);
@@ -181,9 +189,12 @@ pub const Client = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Client {
         const uq = FrameQueue.init(allocator, Config.common.queue_capacity) catch unreachable;
 
-        // Резолв целевого хоста при старте
         var octets: [4]u8 = .{ 127, 0, 0, 1 };
-        _ = resolveDnsA(Config.client.remote_host, &octets);
+        if (!protocol.resolveDnsA(Config.client.remote_host, &octets)) {
+            std.debug.print("\x1b[31m[CLIENT ERROR]\x1b[0m Cannot resolve {s}\n", .{Config.client.remote_host});
+        } else {
+            std.debug.print("\x1b[32m[DNS]\x1b[0m {s} -> {d}.{d}.{d}.{d}\n", .{ Config.client.remote_host, octets[0], octets[1], octets[2], octets[3] });
+        }
 
         const r_addr = sockaddr_in{
             .family = 2,
@@ -237,27 +248,26 @@ pub const Client = struct {
         try self.socksListener();
     }
 
-    // 6 PUSH Воркеров: спят на футексе, моментально будятся и пушат батч
     fn pushWorkerThread(self: *Client, id: usize) void {
-        _ = id;
         const send_buf = self.allocator.alloc(u8, Config.common.http_chunk_size) catch return;
         defer self.allocator.free(send_buf);
         var header_scratch: [1024]u8 = undefined;
         var conn: ?*RemoteConnection = null;
 
         while (true) {
-            // Ожидание появления данных без busy-wait
+            while (conn == null) {
+                conn = self.connectRemote() catch |err| {
+                    std.debug.print("\x1b[31m[PUSH #{d}]\x1b[0m Connection to Cloudflare failed: {s}\n", .{ id, @errorName(err) });
+                    _ = futex.Futex.wait(&self.next_stream_id, 0, 500);
+                    continue;
+                };
+                std.debug.print("\x1b[32m[PUSH #{d}]\x1b[0m Connected to Cloudflare\n", .{id});
+            }
+
             _ = self.upstream_queue.waitData(null);
 
             const batch_len = self.upstream_queue.drainBatch(send_buf);
             if (batch_len == 0) continue;
-
-            while (conn == null) {
-                conn = self.connectRemote() catch {
-                    _ = futex.Futex.wait(&self.next_stream_id, 0, 50);
-                    continue;
-                };
-            }
 
             const req_hdrs = std.fmt.bufPrint(&header_scratch,
                 "POST {s} HTTP/1.1\r\n" ++
@@ -282,7 +292,6 @@ pub const Client = struct {
                 continue;
             }
 
-            // Быстро вычитываем 200 OK
             var resp_hdr_buf: [2048]u8 = undefined;
             var leftover: []const u8 = undefined;
             _ = conn.?.readHeadersFast(&resp_hdr_buf, &leftover) catch {
@@ -292,9 +301,7 @@ pub const Client = struct {
         }
     }
 
-    // 6 PULL Воркеров: Long-Polling ровно по 10 секунд
     fn pullWorkerThread(self: *Client, id: usize) void {
-        _ = id;
         const pull_req = std.fmt.comptimePrint(
             "POST {s} HTTP/1.1\r\n" ++
             "Host: {s}\r\n" ++
@@ -312,10 +319,12 @@ pub const Client = struct {
 
         while (true) {
             while (conn == null) {
-                conn = self.connectRemote() catch {
-                    _ = futex.Futex.wait(&self.next_stream_id, 0, 50);
+                conn = self.connectRemote() catch |err| {
+                    std.debug.print("\x1b[31m[PULL #{d}]\x1b[0m Connection to Cloudflare failed: {s}\n", .{ id, @errorName(err) });
+                    _ = futex.Futex.wait(&self.next_stream_id, 0, 500);
                     continue;
                 };
+                std.debug.print("\x1b[32m[PULL #{d}]\x1b[0m Long-Poll worker connected (10s hold)\n", .{id});
             }
 
             if (conn.?.writeAll(pull_req)) |_| {} else |_| {
@@ -346,7 +355,7 @@ pub const Client = struct {
             }
 
             if (status_200 and content_len > 0) {
-                var body_slice = resp_body_buf[0..content_len];
+                const body_slice = resp_body_buf[0..content_len];
                 if (leftover.len > 0) {
                     const from_leftover = @min(leftover.len, content_len);
                     @memcpy(body_slice[0..from_leftover], leftover[0..from_leftover]);
@@ -487,46 +496,97 @@ pub const Client = struct {
     }
 
     fn handleSocks(self: *Client, stream: protocol.SocketStream) void {
-        var buf: [512]u8 = undefined;
+        // 1. Хендшейк версий
+        var greeting_hdr: [2]u8 = undefined;
+        if (!protocol.readExactStream(stream, &greeting_hdr)) {
+            stream.close();
+            return;
+        }
 
-        // Читаем хендшейк
-        var n = stream.read(buf[0..2]) catch 0;
-        if (n < 2 or buf[0] != 5) { stream.close(); return; }
-        const nmethods = buf[1];
-        n = stream.read(buf[0..nmethods]) catch 0;
-        if (n < nmethods) { stream.close(); return; }
+        if (greeting_hdr[0] != 5) {
+            std.debug.print("\x1b[33m[SOCKS]\x1b[0m Rejecting non-socks5 (ver {d})\n", .{greeting_hdr[0]});
+            stream.close();
+            return;
+        }
+
+        const nmethods = greeting_hdr[1];
+        var methods_buf: [256]u8 = undefined;
+        if (nmethods == 0 or !protocol.readExactStream(stream, methods_buf[0..nmethods])) {
+            stream.close();
+            return;
+        }
 
         stream.writeAll(&[_]u8{ 5, 0 }) catch { stream.close(); return; };
 
-        // Читаем запрос на подключение
-        n = stream.read(buf[0..4]) catch 0;
-        if (n < 4 or buf[1] != 1) { stream.close(); return; }
+        // 2. Запрос CONNECT
+        var req_hdr: [4]u8 = undefined;
+        if (!protocol.readExactStream(stream, &req_hdr)) {
+            stream.close();
+            return;
+        }
 
-        const atyp = buf[3];
-        var addr_len: usize = 0;
-        if (atyp == 1) { addr_len = 4; }
-        else if (atyp == 3) {
-            const dn = stream.read(buf[4..5]) catch 0;
-            if (dn < 1) { stream.close(); return; }
-            addr_len = buf[4] + 1;
-        } else if (atyp == 4) { addr_len = 16; }
-        else { stream.close(); return; }
+        if (req_hdr[0] != 5 or req_hdr[1] != 1) {
+            std.debug.print("\x1b[33m[SOCKS]\x1b[0m Unsupported command {d}\n", .{req_hdr[1]});
+            _ = stream.writeAll(&[_]u8{ 5, 7, 0, 1, 0, 0, 0, 0, 0, 0 }) catch {};
+            stream.close();
+            return;
+        }
 
-        n = stream.read(buf[4 .. 4 + addr_len + 2]) catch 0;
-        if (n < addr_len + 2) { stream.close(); return; }
+        const atyp = req_hdr[3];
+        var addr_buf: [256]u8 = undefined;
+        var addr_len: u8 = 0;
+        var target_type: u8 = 0; // 1 = IPv4, 2 = Domain
 
-        const port_idx = 4 + addr_len;
-        const port_slice = buf[port_idx .. port_idx + 2];
+        if (atyp == 1) { // IPv4
+            target_type = 1;
+            addr_len = 4;
+            if (!protocol.readExactStream(stream, addr_buf[0..4])) {
+                stream.close();
+                return;
+            }
+        } else if (atyp == 3) { // Domain name (socks5h)
+            target_type = 2;
+            var dlen: [1]u8 = undefined;
+            if (!protocol.readExactStream(stream, &dlen)) {
+                stream.close();
+                return;
+            }
+            addr_len = dlen[0];
+            if (addr_len == 0 or !protocol.readExactStream(stream, addr_buf[0..addr_len])) {
+                stream.close();
+                return;
+            }
+        } else {
+            std.debug.print("\x1b[33m[SOCKS]\x1b[0m Unsupported atyp {d}\n", .{atyp});
+            _ = stream.writeAll(&[_]u8{ 5, 8, 0, 1, 0, 0, 0, 0, 0, 0 }) catch {};
+            stream.close();
+            return;
+        }
+
+        var port_buf: [2]u8 = undefined;
+        if (!protocol.readExactStream(stream, &port_buf)) {
+            stream.close();
+            return;
+        }
+        const target_port = std.mem.readInt(u16, &port_buf, .big);
         const stream_id = self.next_stream_id.fetchAdd(1, .monotonic);
 
-        var payload_buf: [300]u8 = undefined;
-        @memcpy(payload_buf[0..2], port_slice);
-        payload_buf[2] = if (atyp == 3) 2 else atyp;
-        payload_buf[3] = if (atyp == 3) buf[4] else @intCast(addr_len);
+        if (target_type == 1) {
+            std.debug.print("\x1b[36m[SOCKS]\x1b[0m Stream #{d} -> {d}.{d}.{d}.{d}:{d}\n", .{
+                stream_id, addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3], target_port,
+            });
+        } else {
+            std.debug.print("\x1b[36m[SOCKS]\x1b[0m Stream #{d} -> {s}:{d}\n", .{
+                stream_id, addr_buf[0..addr_len], target_port,
+            });
+        }
 
-        const actual_addr = if (atyp == 3) buf[5 .. 5 + buf[4]] else buf[4 .. 4 + addr_len];
-        @memcpy(payload_buf[4 .. 4 + actual_addr.len], actual_addr);
-        const conn_payload = payload_buf[0 .. 4 + actual_addr.len];
+        var payload_buf: [300]u8 = undefined;
+        @memcpy(payload_buf[0..2], &port_buf);
+        payload_buf[2] = target_type;
+        payload_buf[3] = addr_len;
+        @memcpy(payload_buf[4 .. 4 + addr_len], addr_buf[0..addr_len]);
+        const conn_payload = payload_buf[0 .. 4 + addr_len];
 
         var waiter = ConnectWaiter{};
 
@@ -546,22 +606,27 @@ pub const Client = struct {
         self.streams_mutex.unlock();
 
         var seq: u32 = 0;
-        _ = self.upstream_queue.push(stream_id, seq, .connect, conn_payload);
+        while (!self.upstream_queue.push(stream_id, seq, .connect, conn_payload)) {
+            futex.Futex.wait(&self.next_stream_id, 0, 1);
+        }
         seq += 1;
 
-        // Мгновенное пробуждение по событию Futex (без цикла со сном!)
+        const start_ms = getMilliTimestamp();
         const ok = waiter.event.wait(Config.client.connect_timeout_ms) and waiter.success;
+        const dur = getMilliTimestamp() - start_ms;
 
         self.waiters_mutex.lock();
         _ = self.connect_waiters.remove(stream_id);
         self.waiters_mutex.unlock();
 
         if (!ok) {
+            std.debug.print("\x1b[31m[SOCKS]\x1b[0m Stream #{d} connect FAILED after {d}ms\n", .{ stream_id, dur });
             _ = stream.writeAll(&[_]u8{ 5, 5, 0, 1, 0, 0, 0, 0, 0, 0 }) catch {};
             self.closeLocalStream(stream_id);
             return;
         }
 
+        std.debug.print("\x1b[32m[SOCKS]\x1b[0m Stream #{d} CONNECTED in {d}ms\n", .{ stream_id, dur });
         stream.writeAll(&[_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 }) catch {
             self.closeLocalStream(stream_id);
             return;
@@ -575,7 +640,7 @@ pub const Client = struct {
                 return;
             }
             while (!self.upstream_queue.push(stream_id, seq, .data, data_buf[0..rd])) {
-                _ = futex.Futex.wait(&self.next_stream_id, 0, 1);
+                futex.Futex.wait(&self.next_stream_id, 0, 1);
             }
             seq +%= 1;
         }
@@ -589,7 +654,7 @@ fn listenOn(host: []const u8, port: u16) !i32 {
     _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, fd))), 1, 2, @intFromPtr(&one), @sizeOf(c_int));
 
     var octets: [4]u8 = .{ 127, 0, 0, 1 };
-    _ = parseIp4(host, &octets);
+    _ = protocol.parseIp4(host, &octets);
 
     const addr = sockaddr_in{
         .family = 2,
@@ -599,21 +664,4 @@ fn listenOn(host: []const u8, port: u16) !i32 {
     _ = std.os.linux.syscall3(.bind, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&addr), @sizeOf(sockaddr_in));
     _ = std.os.linux.syscall2(.listen, @as(usize, @bitCast(@as(isize, fd))), 128);
     return fd;
-}
-
-fn parseIp4(s: []const u8, out: *[4]u8) bool {
-    var it = std.mem.splitScalar(u8, s, '.');
-    var i: usize = 0;
-    while (it.next()) |p| {
-        if (i >= 4) return false;
-        out[i] = std.fmt.parseInt(u8, p, 10) catch return false;
-        i += 1;
-    }
-    return i == 4;
-}
-
-fn resolveDnsA(domain: []const u8, out_ip: *[4]u8) bool {
-    if (parseIp4(domain, out_ip)) return true;
-    out_ip.* = .{ 1, 1, 1, 1 };
-    return true;
 }

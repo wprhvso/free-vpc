@@ -50,7 +50,7 @@ pub const Server = struct {
         const listen_fd = try listenOn(Config.server.bind_host, Config.server.bind_port);
         defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, listen_fd))));
 
-        std.debug.print("\x1b[32m[SERVER]\x1b[0m HTTP Edge listener on {s}:{d}\n", .{ Config.server.bind_host, Config.server.bind_port });
+        std.debug.print("\x1b[32m[SERVER]\x1b[0m Edge listener ready on {s}:{d}\n", .{ Config.server.bind_host, Config.server.bind_port });
 
         while (true) {
             var client_addr: sockaddr = undefined;
@@ -106,13 +106,13 @@ pub const Server = struct {
             }
 
             if (!auth_ok) {
+                std.debug.print("\x1b[31m[SERVER]\x1b[0m 403 Forbidden: Invalid token\n", .{});
                 _ = stream.writeAll("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n") catch {};
                 stream.close();
                 return;
             }
 
             if (is_push) {
-                // Прием входящих данных от клиента
                 if (content_len > 0) {
                     const body = self.allocator.alloc(u8, content_len) catch { stream.close(); return; };
                     defer self.allocator.free(body);
@@ -121,16 +121,15 @@ pub const Server = struct {
                         const from_lo = @min(leftover.len, content_len);
                         @memcpy(body[0..from_lo], leftover[0..from_lo]);
                         if (content_len > from_lo) {
-                            readExactStream(stream, body[from_lo..content_len]) catch { stream.close(); return; };
+                            if (!protocol.readExactStream(stream, body[from_lo..content_len])) { stream.close(); return; }
                         }
                     } else {
-                        readExactStream(stream, body) catch { stream.close(); return; };
+                        if (!protocol.readExactStream(stream, body)) { stream.close(); return; }
                     }
                     self.processFrames(body);
                 }
                 _ = stream.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n") catch { stream.close(); return; };
             } else if (is_pull) {
-                // Long-Polling ровно 10 секунд (честный hold на семафоре/футексе)
                 var batch_len = self.downstream_queue.drainBatch(drain_buf);
                 if (batch_len == 0) {
                     if (self.downstream_queue.waitData(Config.server.hold_timeout_ms)) {
@@ -219,18 +218,32 @@ pub const Server = struct {
     fn handleConnect(self: *Server, stream_id: u32, payload: []const u8) void {
         if (payload.len < 4) { self.sendClose(stream_id); return; }
         const port = std.mem.readInt(u16, payload[0..2], .big);
-        const atyp = payload[2];
-        const addr_data = payload[4..];
+        const target_type = payload[2];
+        const addr_len = payload[3];
+
+        if (payload.len < 4 + addr_len) { self.sendClose(stream_id); return; }
+        const raw_addr = payload[4 .. 4 + addr_len];
 
         var octets: [4]u8 = .{ 0, 0, 0, 0 };
-        if (atyp == 1 and addr_data.len >= 4) {
-            @memcpy(&octets, addr_data[0..4]);
-        } else if (atyp == 2) {
-            if (!parseIp4(addr_data, &octets)) { self.sendClose(stream_id); return; }
+
+        if (target_type == 1) { // IPv4
+            if (addr_len != 4) { self.sendClose(stream_id); return; }
+            @memcpy(&octets, raw_addr);
+        } else if (target_type == 2) { // Domain Name
+            std.debug.print("\x1b[36m[SERVER DNS]\x1b[0m Resolving {s}...\n", .{raw_addr});
+            if (!protocol.resolveDnsA(raw_addr, &octets)) {
+                std.debug.print("\x1b[31m[SERVER ERROR]\x1b[0m Failed to resolve DNS for {s}\n", .{raw_addr});
+                self.sendClose(stream_id);
+                return;
+            }
         } else {
             self.sendClose(stream_id);
             return;
         }
+
+        std.debug.print("\x1b[32m[SERVER]\x1b[0m Connecting Stream #{d} to {d}.{d}.{d}.{d}:{d}...\n", .{
+            stream_id, octets[0], octets[1], octets[2], octets[3], port,
+        });
 
         const rc = std.os.linux.syscall3(.socket, 2, 1, 0);
         if (@as(isize, @bitCast(rc)) < 0) { self.sendClose(stream_id); return; }
@@ -246,10 +259,13 @@ pub const Server = struct {
 
         const conn_rc = std.os.linux.syscall3(.connect, @as(usize, @bitCast(@as(isize, sock))), @intFromPtr(&target_addr), @sizeOf(sockaddr_in));
         if (@as(isize, @bitCast(conn_rc)) < 0) {
+            std.debug.print("\x1b[31m[SERVER]\x1b[0m Connect failed to target\n", .{});
             _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, sock))));
             self.sendClose(stream_id);
             return;
         }
+
+        std.debug.print("\x1b[32m[SERVER]\x1b[0m Connected target for Stream #{d}\n", .{stream_id});
 
         const target_conn = protocol.SocketStream{ .handle = sock };
         const state = self.allocator.create(StreamState) catch unreachable;
@@ -282,7 +298,7 @@ pub const Server = struct {
             }
             const s_seq = state.downstream_seq.fetchAdd(1, .monotonic);
             while (!self.downstream_queue.push(stream_id, s_seq, .data, buf[0..n])) {
-                _ = futex.Futex.wait(&state.downstream_seq, 0, 1);
+                futex.Futex.wait(&state.downstream_seq, 0, 1);
             }
         }
     }
@@ -326,15 +342,6 @@ fn readHeadersFast(stream: protocol.SocketStream, out_buf: []u8, leftover: *[]co
     return error.HeadersTooLong;
 }
 
-fn readExactStream(stream: protocol.SocketStream, dest: []u8) !void {
-    var total: usize = 0;
-    while (total < dest.len) {
-        const n = try stream.read(dest[total..]);
-        if (n == 0) return error.ConnectionClosed;
-        total += n;
-    }
-}
-
 fn listenOn(host: []const u8, port: u16) !i32 {
     const rc = std.os.linux.syscall3(.socket, 2, 1, 0);
     const fd: i32 = @intCast(rc);
@@ -342,7 +349,7 @@ fn listenOn(host: []const u8, port: u16) !i32 {
     _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, fd))), 1, 2, @intFromPtr(&one), @sizeOf(c_int));
 
     var octets: [4]u8 = .{ 0, 0, 0, 0 };
-    _ = parseIp4(host, &octets);
+    _ = protocol.parseIp4(host, &octets);
 
     const addr = sockaddr_in{
         .family = 2,
@@ -352,15 +359,4 @@ fn listenOn(host: []const u8, port: u16) !i32 {
     _ = std.os.linux.syscall3(.bind, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&addr), @sizeOf(sockaddr_in));
     _ = std.os.linux.syscall2(.listen, @as(usize, @bitCast(@as(isize, fd))), 128);
     return fd;
-}
-
-fn parseIp4(s: []const u8, out: *[4]u8) bool {
-    var it = std.mem.splitScalar(u8, s, '.');
-    var i: usize = 0;
-    while (it.next()) |p| {
-        if (i >= 4) return false;
-        out[i] = std.fmt.parseInt(u8, p, 10) catch return false;
-        i += 1;
-    }
-    return i == 4;
 }
