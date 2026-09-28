@@ -109,16 +109,12 @@ pub const Client = struct {
                 continue;
             };
 
-            req.transfer_encoding = .{ .content_length = payload.len };
-            var body_writer = req.sendBody(&.{}) catch {
+            req.sendBodyComplete(payload) catch {
                 req.deinit();
                 self.allocator.free(payload);
                 std.Thread.sleep(50 * std.time.ns_per_ms);
                 continue;
             };
-
-            body_writer.writer.writeAll(payload) catch {};
-            body_writer.end() catch {};
             self.allocator.free(payload);
 
             var head_buf: [1024]u8 = undefined;
@@ -171,11 +167,11 @@ pub const Client = struct {
 
                 req.deinit();
                 self.processPollBody(body_buf.items);
-            } else if (resp.head.status == .no_content) {
-                req.deinit();
             } else {
                 req.deinit();
-                std.Thread.sleep(200 * std.time.ns_per_ms);
+                if (resp.head.status != .no_content) {
+                    std.Thread.sleep(100 * std.time.ns_per_ms);
+                }
             }
         }
     }
