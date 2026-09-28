@@ -7,11 +7,13 @@ pub const Cmd = enum(u8) {
     close = 4,
     ping = 5,
     pong = 6,
+    log = 7,
     _,
 };
 
 pub const Header = extern struct {
     stream_id: u32,
+    seq_id: u32,
     cmd: Cmd,
     reserved: u8 = 0,
     payload_len: u16,
@@ -46,7 +48,7 @@ pub const SocketStream = struct {
     }
 };
 
-pub fn writeFrame(dest: []u8, stream_id: u32, cmd: Cmd, payload: []const u8) !usize {
+pub fn writeFrame(dest: []u8, stream_id: u32, seq_id: u32, cmd: Cmd, payload: []const u8) !usize {
     const total = @sizeOf(Header) + payload.len;
     if (dest.len < total) return error.BufferTooSmall;
     if (payload.len > std.math.maxInt(u16)) return error.PayloadTooLarge;
@@ -54,6 +56,7 @@ pub fn writeFrame(dest: []u8, stream_id: u32, cmd: Cmd, payload: []const u8) !us
     const hdr: *Header = @ptrCast(@alignCast(dest.ptr));
     hdr.* = .{
         .stream_id = stream_id,
+        .seq_id = seq_id,
         .cmd = cmd,
         .reserved = 0,
         .payload_len = @intCast(payload.len),

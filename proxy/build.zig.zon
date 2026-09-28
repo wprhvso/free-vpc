@@ -1,0 +1,16 @@
+.{
+    .name = .cf_proxy,
+    .version = "0.4.0",
+    .fingerprint = 0x9ba8856fb2a2c1b8,
+    .dependencies = .{
+        .picohttpparser = .{
+            .url = "https://github.com/h2o/picohttpparser/archive/refs/heads/master.tar.gz",
+            .hash = "N-V-__8AANZVAQD5uN8M5ORmNgznitwna9odzdumn5qaplrv",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

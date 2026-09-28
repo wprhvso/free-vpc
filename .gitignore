@@ -8,5 +8,5 @@ dist/
 __pycache__/
 *.pyc
 .zig-cache/
-zig-out/
+zig-pkg/
 HANDOFF.md

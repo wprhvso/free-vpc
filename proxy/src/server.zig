@@ -71,6 +71,12 @@ fn sleepMs(ms: u64) void {
     _ = std.os.linux.syscall2(.nanosleep, @intFromPtr(&ts), 0);
 }
 
+fn getTimeMs() i64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.os.linux.syscall2(.clock_gettime, 0, @intFromPtr(&ts));
+    return (@as(i64, ts.sec) * 1000) + @divTrunc(ts.nsec, 1_000_000);
+}
+
 fn parseIp4(s: []const u8, out: *[4]u8) bool {
     var it = std.mem.splitScalar(u8, s, '.');
     var i: usize = 0;
@@ -83,16 +89,16 @@ fn parseIp4(s: []const u8, out: *[4]u8) bool {
 }
 
 fn getDnsServerIp() [4]u8 {
-    const out: [4]u8 = .{ 1, 1, 1, 1 };
+    const default_dns: [4]u8 = .{ 1, 1, 1, 1 };
     const fd_rc = std.os.linux.syscall2(.open, @intFromPtr("/etc/resolv.conf"), 0);
-    if (@as(isize, @bitCast(fd_rc)) < 0) return out;
+    if (@as(isize, @bitCast(fd_rc)) < 0) return default_dns;
     const fd: i32 = @intCast(fd_rc);
     defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, fd))));
 
     var buf: [1024]u8 = undefined;
     const rd = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&buf), buf.len);
     const signed: isize = @bitCast(rd);
-    if (signed <= 0) return out;
+    if (signed <= 0) return default_dns;
     const content = buf[0..@intCast(signed)];
 
     var it = std.mem.splitScalar(u8, content, '\n');
@@ -106,7 +112,7 @@ fn getDnsServerIp() [4]u8 {
             }
         }
     }
-    return out;
+    return default_dns;
 }
 
 fn resolveDnsA(domain: []const u8, out_ip: *[4]u8) bool {
@@ -115,7 +121,7 @@ fn resolveDnsA(domain: []const u8, out_ip: *[4]u8) bool {
     const sock: i32 = @intCast(sock_rc);
     defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, sock))));
 
-    const timeout = extern struct { sec: i64 = 3, usec: i64 = 0 }{};
+    const timeout = extern struct { sec: i64 = 2, usec: i64 = 0 }{};
     _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, sock))), 1, 20, @intFromPtr(&timeout), @sizeOf(@TypeOf(timeout)));
 
     const dns_ip = getDnsServerIp();
@@ -287,25 +293,54 @@ const RingBuffer = struct {
     }
 };
 
+// Состояние каждого стрима с очередью переупорядочивания (Reorder Buffer)
+const StreamState = struct {
+    stream: protocol.SocketStream,
+    expected_seq: u32 = 1,
+    close_pending: bool = false,
+    close_seq: u32 = 0,
+    reorder_queue: std.AutoHashMap(u32, []u8),
+    mutex: Mutex = .{},
+};
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     host: []const u8,
     port: u16,
+    buffer_capacity: usize,
+    token: []const u8,
+    rqlite_url: []const u8,
     downstream_ring: RingBuffer,
     downstream_sem: Semaphore = .{},
-    streams: std.AutoHashMap(u32, protocol.SocketStream),
+    active_stream_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    active_stream_gen: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    streams: std.AutoHashMap(u32, *StreamState),
     streams_mutex: Mutex = .{},
+    log_listeners: std.ArrayList(protocol.SocketStream),
+    log_mutex: Mutex = .{},
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, buf_mb: usize) Server {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        host: []const u8,
+        port: u16,
+        buf_mb: usize,
+        token: []const u8,
+        rqlite_url: []const u8,
+    ) Server {
         const ring = RingBuffer.init(allocator, buf_mb * 1024 * 1024) catch unreachable;
         return .{
             .allocator = allocator,
             .io = io,
             .host = host,
             .port = port,
+            .buffer_capacity = buf_mb * 1024 * 1024,
+            .token = token,
+            .rqlite_url = rqlite_url,
             .downstream_ring = ring,
-            .streams = std.AutoHashMap(u32, protocol.SocketStream).init(allocator),
+            .streams = std.AutoHashMap(u32, *StreamState).init(allocator),
+            .log_listeners = std.ArrayList(protocol.SocketStream).empty,
         };
     }
 
@@ -315,14 +350,64 @@ pub const Server = struct {
         self.streams_mutex.lock();
         var it = self.streams.iterator();
         while (it.next()) |entry| {
-            entry.value_ptr.shutdown();
-            entry.value_ptr.close();
+            const state = entry.value_ptr.*;
+            state.stream.shutdown();
+            state.stream.close();
+            var q_it = state.reorder_queue.iterator();
+            while (q_it.next()) |q_entry| {
+                self.allocator.free(q_entry.value_ptr.*);
+            }
+            state.reorder_queue.deinit();
+            self.allocator.destroy(state);
         }
         self.streams.deinit();
         self.streams_mutex.unlock();
+
+        self.log_mutex.lock();
+        self.log_listeners.deinit(self.allocator);
+        self.log_mutex.unlock();
     }
 
-    pub fn sendToDownstream(self: *Server, stream_id: u32, cmd: protocol.Cmd, payload: []const u8) void {
+    pub fn logEvent(self: *Server, json: []const u8) void {
+        self.broadcastLiveLog(json);
+        self.sendToDownstream(0, 0, .log, json);
+        self.storeLogInRqlite(json);
+    }
+
+    fn broadcastLiveLog(self: *Server, json: []const u8) void {
+        self.log_mutex.lock();
+        defer self.log_mutex.unlock();
+
+        var i: usize = 0;
+        while (i < self.log_listeners.items.len) {
+            const stream = self.log_listeners.items[i];
+            var chunk_hdr: [32]u8 = undefined;
+            const full_len = 6 + json.len + 2;
+            const hdr = std.fmt.bufPrint(&chunk_hdr, "{x}\r\n", .{full_len}) catch continue;
+
+            const ok = blk: {
+                stream.writeAll(hdr) catch break :blk false;
+                stream.writeAll("data: ") catch break :blk false;
+                stream.writeAll(json) catch break :blk false;
+                stream.writeAll("\n\n\r\n") catch break :blk false;
+                break :blk true;
+            };
+
+            if (!ok) {
+                stream.close();
+                _ = self.log_listeners.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn storeLogInRqlite(self: *Server, json: []const u8) void {
+        _ = self;
+        _ = json;
+    }
+
+    pub fn sendToDownstream(self: *Server, stream_id: u32, seq_id: u32, cmd: protocol.Cmd, payload: []const u8) void {
         var static_buf: [4096]u8 = undefined;
         const total = @sizeOf(protocol.Header) + payload.len;
 
@@ -337,10 +422,16 @@ pub const Server = struct {
             full_frame = dyn_buf.?;
         }
 
-        const n = protocol.writeFrame(full_frame, stream_id, cmd, payload) catch return;
+        const n = protocol.writeFrame(full_frame, stream_id, seq_id, cmd, payload) catch return;
 
+        var retry: usize = 0;
         while (!self.downstream_ring.push(full_frame[0..n])) {
             sleepMs(2);
+            retry += 1;
+            if (retry > 500) {
+                std.debug.print("\x1b[31m[BUFFER WARN]\x1b[0m Downstream ring buffer full, dropped frame cmd={s}\n", .{@tagName(cmd)});
+                return;
+            }
         }
         self.downstream_sem.post();
     }
@@ -351,16 +442,30 @@ pub const Server = struct {
         self.streams_mutex.unlock();
 
         if (removed) |entry| {
-            const stream = entry.value;
-            stream.shutdown();
-            stream.close();
-            self.sendToDownstream(stream_id, .close, "");
+            const state = entry.value;
+            std.debug.print("\x1b[33m[PROXY CLOSE]\x1b[0m Stream #{d} closed\n", .{stream_id});
+            state.stream.shutdown();
+            state.stream.close();
+
+            var q_it = state.reorder_queue.iterator();
+            while (q_it.next()) |q_entry| {
+                self.allocator.free(q_entry.value_ptr.*);
+            }
+            state.reorder_queue.deinit();
+            self.allocator.destroy(state);
+
+            self.sendToDownstream(stream_id, 0, .close, "");
         }
     }
 
     pub fn start(self: *Server) !void {
+        const ping_thread = try std.Thread.spawn(.{}, serverHeartbeatWorker, .{self});
+        ping_thread.detach();
+
         const listen_fd = try listenOn(self.host, self.port);
         defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, listen_fd))));
+
+        std.debug.print("\x1b[32m[SERVER READY]\x1b[0m Listening on http://{s}:{d}\n", .{ self.host, self.port });
 
         while (true) {
             var client_addr: sockaddr = undefined;
@@ -374,6 +479,17 @@ pub const Server = struct {
                 continue;
             };
             thread.detach();
+        }
+    }
+
+    fn serverHeartbeatWorker(self: *Server) void {
+        while (true) {
+            sleepMs(1000);
+            if (self.active_stream_fd.load(.acquire) < 0) continue;
+
+            var ts_bytes: [8]u8 = undefined;
+            std.mem.writeInt(i64, &ts_bytes, getTimeMs(), .little);
+            self.sendToDownstream(0, 0, .ping, &ts_bytes);
         }
     }
 
@@ -413,6 +529,8 @@ pub const Server = struct {
             const first_line_end = std.mem.indexOf(u8, headers, "\r\n") orelse headers.len;
             const req_line = headers[0..first_line_end];
 
+            std.debug.print("\x1b[36m[HTTP]\x1b[0m Inbound: {s}\n", .{req_line});
+
             if (std.mem.startsWith(u8, req_line, "GET /health") or std.mem.startsWith(u8, req_line, "GET / ")) {
                 const resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
                 stream.writeAll(resp) catch return;
@@ -420,6 +538,14 @@ pub const Server = struct {
             }
 
             if (std.mem.startsWith(u8, req_line, "GET /stream")) {
+                std.debug.print("\x1b[32m[STREAM]\x1b[0m Downstream client subscribed! Initializing tunnel...\n", .{});
+
+                const gen = self.active_stream_gen.fetchAdd(1, .monotonic) + 1;
+                const old_fd = self.active_stream_fd.swap(stream.handle, .release);
+                if (old_fd >= 0) {
+                    _ = std.os.linux.syscall2(.shutdown, @as(usize, @bitCast(@as(isize, old_fd))), 2);
+                }
+
                 const sse_headers =
                     "HTTP/1.1 200 OK\r\n" ++
                     "Content-Type: text/event-stream\r\n" ++
@@ -430,26 +556,90 @@ pub const Server = struct {
 
                 stream.writeAll(sse_headers) catch {
                     stream.close();
+                    _ = self.active_stream_fd.cmpxchgStrong(stream.handle, -1, .release, .monotonic);
                     return;
                 };
+
+                // БЕЗОПАСНЫЙ 4KB BURST: Прямое заполнение буфера без @memcpy
+                var burst_buf: [4096]u8 = undefined;
+                @memset(&burst_buf, 0);
+
+                const hdr_ptr: *protocol.Header = @ptrCast(@alignCast(&burst_buf));
+                hdr_ptr.* = .{
+                    .stream_id = 0,
+                    .seq_id = 0,
+                    .cmd = .ping,
+                    .reserved = 0,
+                    .payload_len = @intCast(burst_buf.len - @sizeOf(protocol.Header)),
+                };
+
+                var burst_hdr: [32]u8 = undefined;
+                const b_hdr = std.fmt.bufPrint(&burst_hdr, "{x}\r\n", .{burst_buf.len}) catch "";
+                stream.writeAll(b_hdr) catch return;
+                stream.writeAll(&burst_buf) catch return;
+                stream.writeAll("\r\n") catch return;
+                std.debug.print("\x1b[32m[STREAM]\x1b[0m 4KB Preamble burst sent successfully!\n", .{});
+
+                var ts_bytes: [8]u8 = undefined;
+                std.mem.writeInt(i64, &ts_bytes, getTimeMs(), .little);
+                self.sendToDownstream(0, 0, .ping, &ts_bytes);
 
                 var drain_buf: [65536]u8 = undefined;
                 var chunk_hdr: [32]u8 = undefined;
 
                 while (true) {
                     self.downstream_sem.wait();
+
+                    if (self.active_stream_gen.load(.acquire) != gen) {
+                        std.debug.print("\x1b[33m[STREAM]\x1b[0m Connection superseded by a new client, exiting worker.\n", .{});
+                        break;
+                    }
+
                     const n = self.downstream_ring.drainAtMost(&drain_buf);
                     if (n == 0) continue;
 
                     const frame = drain_buf[0..n];
-                    const hdr = std.fmt.bufPrint(&chunk_hdr, "{x}\r\n", .{frame.len}) catch break;
+                    const ch_hdr = std.fmt.bufPrint(&chunk_hdr, "{x}\r\n", .{frame.len}) catch break;
 
-                    stream.writeAll(hdr) catch break;
+                    stream.writeAll(ch_hdr) catch break;
                     stream.writeAll(frame) catch break;
                     stream.writeAll("\r\n") catch break;
                 }
 
+                _ = self.active_stream_fd.cmpxchgStrong(stream.handle, -1, .release, .monotonic);
                 stream.close();
+                std.debug.print("\x1b[33m[STREAM]\x1b[0m Downstream connection closed.\n", .{});
+                return;
+            }
+
+            if (std.mem.startsWith(u8, req_line, "GET /logs/stream")) {
+                if (!self.validateToken(req_line)) {
+                    std.debug.print("\x1b[31m[AUTH]\x1b[0m Logs access denied: invalid token\n", .{});
+                    stream.writeAll("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+                    stream.close();
+                    return;
+                }
+
+                const sse_headers =
+                    "HTTP/1.1 200 OK\r\n" ++
+                    "Content-Type: text/event-stream\r\n" ++
+                    "Cache-Control: no-cache\r\n" ++
+                    "Connection: keep-alive\r\n" ++
+                    "Transfer-Encoding: chunked\r\n\r\n";
+
+                stream.writeAll(sse_headers) catch {
+                    stream.close();
+                    return;
+                };
+
+                self.log_mutex.lock();
+                self.log_listeners.append(self.allocator, stream) catch {
+                    self.log_mutex.unlock();
+                    stream.close();
+                    return;
+                };
+                self.log_mutex.unlock();
+                std.debug.print("\x1b[32m[LOGS]\x1b[0m New live log viewer connected\n", .{});
                 return;
             }
 
@@ -460,8 +650,7 @@ pub const Server = struct {
                 }
 
                 if (content_len == 0) {
-                    const resp = "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n";
-                    stream.writeAll(resp) catch return;
+                    stream.writeAll("HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n") catch return;
                     continue;
                 }
 
@@ -475,16 +664,23 @@ pub const Server = struct {
 
                 self.processPushBody(body);
 
-                const resp = "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n";
-                stream.writeAll(resp) catch return;
+                stream.writeAll("HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n") catch return;
                 continue;
             }
 
-            const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            stream.writeAll(not_found) catch return;
+            stream.writeAll("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch return;
             stream.close();
             return;
         }
+    }
+
+    fn validateToken(self: *Server, req_line: []const u8) bool {
+        if (std.mem.indexOf(u8, req_line, "token=")) |idx| {
+            const query_val = req_line[idx + 6 ..];
+            const end_idx = std.mem.indexOfAny(u8, query_val, " &\r\n") orelse query_val.len;
+            return std.mem.eql(u8, query_val[0..end_idx], self.token);
+        }
+        return false;
     }
 
     fn findHeader(headers: []const u8, lower_name: []const u8) ?[]const u8 {
@@ -521,29 +717,87 @@ pub const Server = struct {
                     self.handleConnect(hdr.stream_id, payload);
                 },
                 .data => {
-                    self.streams_mutex.lock();
-                    const s_opt = self.streams.get(hdr.stream_id);
-                    self.streams_mutex.unlock();
-                    if (s_opt) |target_stream| {
-                        target_stream.writeAll(payload) catch {
-                            self.closeStream(hdr.stream_id);
-                        };
-                    }
+                    self.handleOrderedData(hdr.stream_id, hdr.seq_id, payload);
                 },
                 .close => {
-                    self.closeStream(hdr.stream_id);
+                    self.handleOrderedClose(hdr.stream_id, hdr.seq_id);
                 },
-                .ping => {
-                    self.sendToDownstream(hdr.stream_id, .pong, "");
+                .log => {
+                    self.logEvent(payload);
                 },
                 else => {},
             }
         }
     }
 
+    // Обработка входящих данных с гарантией строгого порядка (Reorder Buffer)
+    fn handleOrderedData(self: *Server, stream_id: u32, seq_id: u32, payload: []const u8) void {
+        self.streams_mutex.lock();
+        const state_opt = self.streams.get(stream_id);
+        self.streams_mutex.unlock();
+
+        if (state_opt) |state| {
+            state.mutex.lock();
+            defer state.mutex.unlock();
+
+            if (seq_id == state.expected_seq) {
+                // 1. Пришел ожидаемый пакет — пишем в сокет
+                state.stream.writeAll(payload) catch {
+                    self.closeStream(stream_id);
+                    return;
+                };
+                state.expected_seq +%= 1;
+
+                // 2. Каскадный сброс: выгребаем накопившиеся пакеты из очереди
+                while (state.reorder_queue.fetchRemove(state.expected_seq)) |entry| {
+                    const queued_payload = entry.value;
+                    defer self.allocator.free(queued_payload);
+
+                    state.stream.writeAll(queued_payload) catch {
+                        self.closeStream(stream_id);
+                        return;
+                    };
+                    state.expected_seq +%= 1;
+                }
+
+                // 3. Если ожидалось закрытие и очередь опустела
+                if (state.close_pending and state.expected_seq >= state.close_seq) {
+                    self.closeStream(stream_id);
+                }
+            } else if (seq_id > state.expected_seq) {
+                // Пакет обогнал очередь — сохраняем в буфер
+                if (state.reorder_queue.count() < 256) {
+                    const copy = self.allocator.alloc(u8, payload.len) catch return;
+                    @memcpy(copy, payload);
+                    state.reorder_queue.put(seq_id, copy) catch {
+                        self.allocator.free(copy);
+                    };
+                }
+            }
+        }
+    }
+
+    fn handleOrderedClose(self: *Server, stream_id: u32, seq_id: u32) void {
+        self.streams_mutex.lock();
+        const state_opt = self.streams.get(stream_id);
+        self.streams_mutex.unlock();
+
+        if (state_opt) |state| {
+            state.mutex.lock();
+            defer state.mutex.unlock();
+
+            if (seq_id <= state.expected_seq and state.reorder_queue.count() == 0) {
+                self.closeStream(stream_id);
+            } else {
+                state.close_pending = true;
+                state.close_seq = seq_id;
+            }
+        }
+    }
+
     fn handleConnect(self: *Server, stream_id: u32, payload: []const u8) void {
         if (payload.len < 4) {
-            self.sendToDownstream(stream_id, .close, "");
+            self.sendToDownstream(stream_id, 0, .close, "");
             return;
         }
 
@@ -551,18 +805,23 @@ pub const Server = struct {
         const atyp = payload[2];
         const addr_len = payload[3];
         if (payload.len < 4 + addr_len) {
-            self.sendToDownstream(stream_id, .close, "");
+            self.sendToDownstream(stream_id, 0, .close, "");
             return;
         }
 
         const addr_data = payload[4 .. 4 + addr_len];
 
         if (atyp == 1 and addr_len == 4) {
-            self.connectTcpIpv4(stream_id, addr_data[0..4].*, port);
+            const octets = addr_data[0..4].*;
+            std.debug.print("\x1b[34m[PROXY]\x1b[0m Stream #{d} -> {d}.{d}.{d}.{d}:{d}\n", .{
+                stream_id, octets[0], octets[1], octets[2], octets[3], port,
+            });
+            self.connectTcpIpv4(stream_id, octets, port);
         } else if (atyp == 4 and addr_len == 16) {
+            std.debug.print("\x1b[34m[PROXY]\x1b[0m Stream #{d} -> [IPv6]:{d}\n", .{ stream_id, port });
             const sock_rc = std.os.linux.syscall3(.socket, 10, 1, 0);
             if (@as(isize, @bitCast(sock_rc)) < 0) {
-                self.sendToDownstream(stream_id, .close, "");
+                self.sendToDownstream(stream_id, 0, .close, "");
                 return;
             }
             const sock: i32 = @intCast(sock_rc);
@@ -578,22 +837,35 @@ pub const Server = struct {
             const conn_rc = std.os.linux.syscall3(.connect, @as(usize, @bitCast(@as(isize, sock))), @intFromPtr(&target_addr), @sizeOf(sockaddr_in6));
             if (@as(isize, @bitCast(conn_rc)) < 0) {
                 _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, sock))));
-                self.sendToDownstream(stream_id, .close, "");
+                self.sendToDownstream(stream_id, 0, .close, "");
                 return;
             }
 
             const target_conn = protocol.SocketStream{ .handle = sock };
 
-            self.streams_mutex.lock();
-            self.streams.put(stream_id, target_conn) catch {
-                self.streams_mutex.unlock();
+            const state = self.allocator.create(StreamState) catch {
                 target_conn.close();
-                self.sendToDownstream(stream_id, .close, "");
+                self.sendToDownstream(stream_id, 0, .close, "");
+                return;
+            };
+            state.* = .{
+                .stream = target_conn,
+                .expected_seq = 1,
+                .reorder_queue = std.AutoHashMap(u32, []u8).init(self.allocator),
+            };
+
+            self.streams_mutex.lock();
+            self.streams.put(stream_id, state) catch {
+                self.streams_mutex.unlock();
+                state.reorder_queue.deinit();
+                self.allocator.destroy(state);
+                target_conn.close();
+                self.sendToDownstream(stream_id, 0, .close, "");
                 return;
             };
             self.streams_mutex.unlock();
 
-            self.sendToDownstream(stream_id, .connect_ok, "");
+            self.sendToDownstream(stream_id, 0, .connect_ok, "");
 
             const thread = std.Thread.spawn(.{}, targetReaderWorker, .{ self, stream_id, target_conn }) catch {
                 self.closeStream(stream_id);
@@ -601,23 +873,25 @@ pub const Server = struct {
             };
             thread.detach();
         } else if (atyp == 2) {
+            std.debug.print("\x1b[34m[PROXY]\x1b[0m Stream #{d} -> {s}:{d}\n", .{ stream_id, addr_data, port });
             var octets: [4]u8 = .{ 0, 0, 0, 0 };
             if (parseIp4(addr_data, &octets)) {
                 self.connectTcpIpv4(stream_id, octets, port);
             } else if (resolveDnsA(addr_data, &octets)) {
                 self.connectTcpIpv4(stream_id, octets, port);
             } else {
-                self.sendToDownstream(stream_id, .close, "");
+                std.debug.print("\x1b[31m[PROXY ERROR]\x1b[0m Stream #{d}: DNS resolve failed for {s}\n", .{ stream_id, addr_data });
+                self.sendToDownstream(stream_id, 0, .close, "");
             }
         } else {
-            self.sendToDownstream(stream_id, .close, "");
+            self.sendToDownstream(stream_id, 0, .close, "");
         }
     }
 
     fn connectTcpIpv4(self: *Server, stream_id: u32, octets: [4]u8, port: u16) void {
         const sock_rc = std.os.linux.syscall3(.socket, 2, 1, 0);
         if (@as(isize, @bitCast(sock_rc)) < 0) {
-            self.sendToDownstream(stream_id, .close, "");
+            self.sendToDownstream(stream_id, 0, .close, "");
             return;
         }
         const sock: i32 = @intCast(sock_rc);
@@ -631,22 +905,36 @@ pub const Server = struct {
         const conn_rc = std.os.linux.syscall3(.connect, @as(usize, @bitCast(@as(isize, sock))), @intFromPtr(&target_addr), @sizeOf(sockaddr_in));
         if (@as(isize, @bitCast(conn_rc)) < 0) {
             _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, sock))));
-            self.sendToDownstream(stream_id, .close, "");
+            self.sendToDownstream(stream_id, 0, .close, "");
             return;
         }
 
         const target_conn = protocol.SocketStream{ .handle = sock };
 
-        self.streams_mutex.lock();
-        self.streams.put(stream_id, target_conn) catch {
-            self.streams_mutex.unlock();
+        const state = self.allocator.create(StreamState) catch {
             target_conn.close();
-            self.sendToDownstream(stream_id, .close, "");
+            self.sendToDownstream(stream_id, 0, .close, "");
+            return;
+        };
+        state.* = .{
+            .stream = target_conn,
+            .expected_seq = 1,
+            .reorder_queue = std.AutoHashMap(u32, []u8).init(self.allocator),
+        };
+
+        self.streams_mutex.lock();
+        self.streams.put(stream_id, state) catch {
+            self.streams_mutex.unlock();
+            state.reorder_queue.deinit();
+            self.allocator.destroy(state);
+            target_conn.close();
+            self.sendToDownstream(stream_id, 0, .close, "");
             return;
         };
         self.streams_mutex.unlock();
 
-        self.sendToDownstream(stream_id, .connect_ok, "");
+        self.sendToDownstream(stream_id, 0, .connect_ok, "");
+        std.debug.print("\x1b[32m[PROXY OK]\x1b[0m Stream #{d} connected successfully\n", .{stream_id});
 
         const thread = std.Thread.spawn(.{}, targetReaderWorker, .{ self, stream_id, target_conn }) catch {
             self.closeStream(stream_id);
@@ -663,7 +951,7 @@ pub const Server = struct {
                 self.closeStream(stream_id);
                 return;
             }
-            self.sendToDownstream(stream_id, .data, buf[0..n]);
+            self.sendToDownstream(stream_id, 0, .data, buf[0..n]);
         }
     }
 };
