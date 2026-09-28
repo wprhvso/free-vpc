@@ -5,6 +5,10 @@ FC_VERSION="v1.17.0"
 FC_URL="https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz"
 KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin"
 ROOTFS_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/rootfs/bionic.rootfs.ext4"
+RQLITE_URL="https://github.com/rqlite/rqlite/releases/download/v8.36.11/rqlite-v8.36.11-linux-amd64.tar.gz"
+TTYD_URL="https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64"
+WEBSOCAT_URL="https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl"
+CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 
 setup_kvm() {
   if [ -e /dev/kvm ]; then
@@ -53,13 +57,6 @@ setup_bridge() {
   fi
 }
 
-start_metadata_server() {
-  local gateway_ip="$1"
-  local port="${2:-18080}"
-  pkill -f "metadata_server.py" 2>/dev/null || true
-  python3 "${SCRIPT_DIR}/metadata_server.py" "$gateway_ip" "$port" >/tmp/meta_server.log 2>&1 &
-}
-
 install_firecracker() {
   if ! command -v firecracker >/dev/null 2>&1; then
     mkdir -p /tmp/fc-install
@@ -78,14 +75,28 @@ download_assets() {
   if [ ! -f /tmp/fc-assets/base-rootfs.ext4 ]; then
     curl -fsSL -o /tmp/fc-assets/base-rootfs.ext4 "$ROOTFS_URL"
   fi
-  mkdir -p /tmp/fc-assets/tailscale_bin
-  if command -v tailscale >/dev/null 2>&1; then
-    cp "$(command -v tailscale)" /tmp/fc-assets/tailscale_bin/ 2>/dev/null || true
+
+  if ! command -v rqlited >/dev/null 2>&1; then
+    mkdir -p /tmp/rqlite-dl
+    curl -fsSL "$RQLITE_URL" | tar -xz -C /tmp/rqlite-dl
+    sudo cp /tmp/rqlite-dl/*/rqlited /tmp/rqlite-dl/*/rqlite /usr/local/bin/
+    sudo chmod +x /usr/local/bin/rqlited /usr/local/bin/rqlite
+    rm -rf /tmp/rqlite-dl
   fi
-  if command -v tailscaled >/dev/null 2>&1; then
-    cp "$(command -v tailscaled)" /tmp/fc-assets/tailscale_bin/ 2>/dev/null || true
-  elif [ -x /usr/sbin/tailscaled ]; then
-    cp /usr/sbin/tailscaled /tmp/fc-assets/tailscale_bin/ 2>/dev/null || true
+
+  if ! command -v ttyd >/dev/null 2>&1; then
+    sudo curl -fsSL "$TTYD_URL" -o /usr/local/bin/ttyd
+    sudo chmod +x /usr/local/bin/ttyd
+  fi
+
+  if ! command -v websocat >/dev/null 2>&1; then
+    sudo curl -fsSL "$WEBSOCAT_URL" -o /usr/local/bin/websocat
+    sudo chmod +x /usr/local/bin/websocat
+  fi
+
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    sudo curl -fsSL "$CLOUDFLARED_URL" -o /usr/local/bin/cloudflared
+    sudo chmod +x /usr/local/bin/cloudflared
   fi
 }
 
@@ -114,46 +125,6 @@ spawn_microvm() {
       sudo chmod 600 /tmp/mnt-"$vm_id"/root/.ssh/authorized_keys
     fi
   fi
-
-  if [ -d /tmp/mnt-"$vm_id"/usr/local/bin ] && [ -d /tmp/fc-assets/tailscale_bin ]; then
-    sudo cp /tmp/fc-assets/tailscale_bin/* /tmp/mnt-"$vm_id"/usr/local/bin/ 2>/dev/null || true
-    sudo chmod +x /tmp/mnt-"$vm_id"/usr/local/bin/tailscale /tmp/mnt-"$vm_id"/usr/local/bin/tailscaled 2>/dev/null || true
-  fi
-
-  if [ -d /tmp/mnt-"$vm_id"/etc ]; then
-    local ts_key="${TAILSCALE_AUTH_KEY:-${TAILSCALE_AUTHKEY:-}}"
-    cat << AGENTEOF | sudo tee /tmp/mnt-"$vm_id"/etc/rc.local > /dev/null
-#!/bin/sh -e
-mkdir -p /var/lib/tailscale /run/tailscale /root/.ssh
-if [ -x /usr/local/bin/tailscaled ]; then
-  /usr/local/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock > /var/log/tailscaled.log 2>&1 &
-  sleep 2
-  /usr/local/bin/tailscale up --authkey="${ts_key}" --hostname="free-vpc-vm-${vm_id:0:8}" --ssh 2>/dev/null || true
-fi
-VM_TS_IP=""
-for i in \$(seq 1 30); do
-  VM_TS_IP=\$(/usr/local/bin/tailscale ip -4 2>/dev/null || hostname -I 2>/dev/null | awk '{print \$1}')
-  if [ -n "\$VM_TS_IP" ]; then
-    break
-  fi
-  sleep 1
-done
-curl -sf "http://${gateway_ip}:18080/report_ip?ip=\${VM_TS_IP}&vm_id=${vm_id}" 2>/dev/null || true
-
-while true; do
-  FETCHED_KEYS=\$(curl -sf "http://${gateway_ip}:18080/keys?ip=\${VM_TS_IP}" 2>/dev/null || true)
-  if [ -n "\$FETCHED_KEYS" ]; then
-    echo "\$FETCHED_KEYS" >> /root/.ssh/authorized_keys
-    chmod 600 /root/.ssh/authorized_keys
-    break
-  fi
-  sleep 1
-done &
-exit 0
-AGENTEOF
-    sudo chmod +x /tmp/mnt-"$vm_id"/etc/rc.local
-  fi
-
   sudo umount /tmp/mnt-"$vm_id" 2>/dev/null || true
   rm -rf /tmp/mnt-"$vm_id"
 

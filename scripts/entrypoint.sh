@@ -4,8 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/firecracker_manager.sh"
 
-WORKER_URL="${WORKER_URL:-https://vm.unsafie.com}"
-
 sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd sudo iptables e2fsprogs
 
 sudo mkdir -p /etc/ssh /etc/ssh/sshd_config.d
@@ -54,186 +52,142 @@ setup_zswap
 setup_ksm
 
 NODE_NUM="${NODE_ID:-1}"
-INTERNAL_GATEWAY="10.200.${NODE_NUM}.1"
-INTERNAL_SUBNET="10.200.${NODE_NUM}.0/24"
+NODE_NAME="free-vpc-${GITHUB_RUN_ID:-manual}-${NODE_NUM}"
 
-setup_bridge "$INTERNAL_GATEWAY" "$INTERNAL_SUBNET"
-start_metadata_server "$INTERNAL_GATEWAY" 18080
+download_assets
 
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo systemctl start tailscaled || sudo tailscaled --state=/var/lib/tailscale/tailscaled.state &
-sleep 2
+CREATE_RESP=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector" \
+  -H "Authorization: Bearer ${CF_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\": \"${NODE_NAME}\"}")
+NODE_ID_CF=$(echo "$CREATE_RESP" | jq -r '.result.id // empty')
 
-TS_AUTH="${TAILSCALE_AUTH_KEY:-${TAILSCALE_AUTHKEY:-}}"
-sudo tailscale up --authkey="${TS_AUTH}" --hostname="free-vpc-${NODE_NUM}" --accept-routes --ssh
+if [ -z "$NODE_ID_CF" ]; then
+  echo "Failed to create WARP connector: $CREATE_RESP" >&2
+  exit 1
+fi
 
-TAILSCALE_IP=""
-for i in $(seq 1 30); do
-  TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || true)
-  if [ -n "$TAILSCALE_IP" ]; then
+TOKEN_RESP=$(curl -sS "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector/${NODE_ID_CF}/token" \
+  -H "Authorization: Bearer ${CF_API_TOKEN}")
+CONNECTOR_TOKEN=$(echo "$TOKEN_RESP" | jq -r '.result // empty')
+
+cleanup() {
+  if [ -x /usr/local/bin/rqlited ]; then
+    curl -s -X POST "http://127.0.0.1:4001/db/execute" \
+      -H "Content-Type: application/json" \
+      -d "[[\"UPDATE runners SET status = 'offline' WHERE slot_id = ?\", $NODE_NUM]]" >/dev/null 2>&1 || true
+  fi
+  sudo warp-cli --accept-tos disconnect 2>/dev/null || true
+  if [ -n "${NODE_ID_CF:-}" ]; then
+    curl -sS -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector/${NODE_ID_CF}" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+sudo apt-get update -qq && sudo apt-get install -y -qq cloudflare-warp
+
+sudo warp-cli --accept-tos connector new "$CONNECTOR_TOKEN"
+sudo warp-cli --accept-tos connect
+
+sleep 3
+
+sudo ip route replace 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || sudo ip route add 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || true
+
+MESH_IP=""
+for i in $(seq 1 15); do
+  MESH_IP=$(ip -4 addr show dev CloudflareWARP 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 || true)
+  if [ -n "$MESH_IP" ]; then
     break
   fi
   sleep 1
 done
 
-install_firecracker
-download_assets
+mkdir -p /tmp/rqlite-data
 
-BOOT_DATA=$(curl -sS -X POST "${WORKER_URL}/api/runner/boot" \
-  -H "Content-Type: application/json" \
-  -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID:-5a06f20e534be12f4e259e932af57b57.access}" \
-  -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET:-cfast_clJJ6Rx6HA0bdn2eXV31EO7UNnApjsLaOOdkWCMe71e2052a}" \
-  -d "{\"run_id\": ${GITHUB_RUN_ID:-0}, \"slot_id\": ${NODE_NUM}, \"tailscale_ip\": \"${TAILSCALE_IP}\"}")
+if [ "$NODE_NUM" = "1" ]; then
+  /usr/local/bin/rqlited -node-id "node-${NODE_NUM}" -http-addr "0.0.0.0:4001" -raft-addr "0.0.0.0:4002" /tmp/rqlite-data > /tmp/rqlited.log 2>&1 &
+  sleep 3
 
-CURRENT_KEYS_HASH=""
-
-sync_keys() {
-  local json_keys="$1"
-  local new_hash
-  new_hash=$(echo "$json_keys" | md5sum | awk '{print $1}')
-  if [ "$new_hash" != "$CURRENT_KEYS_HASH" ]; then
-    CURRENT_KEYS_HASH="$new_hash"
-    local tmp_k="/tmp/ts_keys.txt"
-    touch "$tmp_k"
-    if [ -n "$json_keys" ] && [ "$json_keys" != "null" ]; then
-      echo "$json_keys" | jq -r '.[]' 2>/dev/null >> "$tmp_k" || true
-    fi
-    if [ -f "authorized_keys" ]; then
-      cat authorized_keys >> "$tmp_k"
-    fi
-    if [ -n "${SSH_AUTHORIZED_KEYS:-}" ]; then
-      echo "${SSH_AUTHORIZED_KEYS}" >> "$tmp_k"
-    fi
-    curl -sSL "https://github.com/wprhvso.keys" >> "$tmp_k" 2>/dev/null || true
-    sort -u "$tmp_k" | grep -v '^$' > "$AUTH_FILE"
-    sudo cp "$AUTH_FILE" /root/.ssh/authorized_keys
-    sudo cp "$AUTH_FILE" /tmp/free-vpc-auth-keys
-    sudo chmod 600 "$AUTH_FILE" /root/.ssh/authorized_keys /tmp/free-vpc-auth-keys
-    sudo chown -R runner:runner /home/runner/.ssh
-    rm -f "$tmp_k"
-  fi
-}
-
-INIT_KEYS=$(echo "$BOOT_DATA" | jq '.ssh_keys // []')
-sync_keys "$INIT_KEYS"
-
-VMS_COUNT=$(echo "$BOOT_DATA" | jq '.vms | length')
-if [ "$VMS_COUNT" -gt 0 ]; then
-  for row in $(echo "$BOOT_DATA" | jq -r '.vms[] | @base64'); do
-    _jq() {
-      echo "${row}" | base64 --decode | jq -r "${1}"
-    }
-    VM_ID=$(_jq '.id')
-    VM_VCPUS=$(_jq '.vcpus // 1')
-    VM_RAM=$(_jq '.memory_mb // 1024')
-    VM_KEYS=$(_jq '.ssh_keys // empty')
-    if [ -n "$VM_KEYS" ] && [ "$VM_KEYS" != "null" ]; then
-      echo "$VM_KEYS" | jq -r '.[]' 2>/dev/null > "/tmp/keys_${VM_ID}" || true
-    fi
-    spawn_microvm "$VM_ID" "10.200.${NODE_NUM}.2" "$INTERNAL_GATEWAY" "$VM_VCPUS" "$VM_RAM"
-  done
-else
-  spawn_microvm "vm-${NODE_NUM}-standby" "10.200.${NODE_NUM}.2" "$INTERNAL_GATEWAY" 1 1024 || true
-fi
-
-if [ -n "${GH_PAT:-}" ] && [ -n "${TAILSCALE_IP}" ]; then
-  curl -sS -X PATCH "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/NODE_IP" \
-    -H "Authorization: Bearer ${GH_PAT}" \
-    -H "Accept: application/vnd.github.v3+json" \
+  curl -s -X POST "http://127.0.0.1:4001/db/execute" \
     -H "Content-Type: application/json" \
-    -d "{\"name\":\"NODE_IP\",\"value\":\"${TAILSCALE_IP}\"}" || true
+    -d '[["CREATE TABLE IF NOT EXISTS runners (slot_id INTEGER PRIMARY KEY, node_name TEXT, mesh_ip TEXT, web_url TEXT, ssh_url TEXT, status TEXT, started_at INTEGER, last_heartbeat INTEGER, expires_at INTEGER)"], ["CREATE TABLE IF NOT EXISTS vms (id TEXT PRIMARY KEY, slot_id INTEGER, name TEXT, status TEXT, created_at INTEGER)"]]' >/dev/null 2>&1 || true
+
+  if [ -n "${GH_PAT:-}" ] && [ -n "${MESH_IP}" ]; then
+    curl -sS -X PATCH "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/SEED_MESH_IP" \
+      -H "Authorization: Bearer ${GH_PAT}" \
+      -H "Accept: application/vnd.github.v3+json" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"SEED_MESH_IP\",\"value\":\"${MESH_IP}\"}" 2>/dev/null || \
+    curl -sS -X POST "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables" \
+      -H "Authorization: Bearer ${GH_PAT}" \
+      -H "Accept: application/vnd.github.v3+json" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"SEED_MESH_IP\",\"value\":\"${MESH_IP}\"}" 2>/dev/null || true
+  fi
+else
+  SEED_IP=""
+  if [ -n "${GH_PAT:-}" ]; then
+    SEED_IP=$(curl -s -H "Authorization: Bearer ${GH_PAT}" "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/SEED_MESH_IP" | jq -r '.value // empty' 2>/dev/null || true)
+  fi
+
+  if [ -n "$SEED_IP" ] && ping -c 1 -W 2 "$SEED_IP" >/dev/null 2>&1; then
+    /usr/local/bin/rqlited -node-id "node-${NODE_NUM}" -http-addr "0.0.0.0:4001" -raft-addr "0.0.0.0:4002" -join "http://${SEED_IP}:4001" /tmp/rqlite-data > /tmp/rqlited.log 2>&1 &
+  else
+    /usr/local/bin/rqlited -node-id "node-${NODE_NUM}" -http-addr "0.0.0.0:4001" -raft-addr "0.0.0.0:4002" /tmp/rqlite-data > /tmp/rqlited.log 2>&1 &
+  fi
+  sleep 3
 fi
+
+/usr/local/bin/ttyd -p 7681 -W -t fontSize=14 -t theme='{"background": "#0b0f19"}' bash > /tmp/ttyd.log 2>&1 &
+/usr/local/bin/websocat -b ws-listen:0.0.0.0:2222 tcp:127.0.0.1:22 > /tmp/websocat.log 2>&1 &
+
+/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:7681 --no-autoupdate > /tmp/cf_web.log 2>&1 &
+/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:2222 --no-autoupdate > /tmp/cf_ssh.log 2>&1 &
+
+WEB_URL=""
+SSH_URL=""
+for i in $(seq 1 30); do
+  if [ -z "$WEB_URL" ]; then
+    WEB_URL=$(grep -o 'https://[-a-zA-Z0-9.]*trycloudflare.com' /tmp/cf_web.log | head -n1 || true)
+  fi
+  if [ -z "$SSH_URL" ]; then
+    SSH_URL=$(grep -o 'https://[-a-zA-Z0-9.]*trycloudflare.com' /tmp/cf_ssh.log | head -n1 || true)
+  fi
+  if [ -n "$WEB_URL" ] && [ -n "$SSH_URL" ]; then
+    break
+  fi
+  sleep 1
+done
+
+SSH_WSS="${SSH_URL/https:/wss:}"
+
+NOW=$(date +%s)
+EXPIRES=$((NOW + 21600))
+
+curl -s -X POST "http://127.0.0.1:4001/db/execute" \
+  -H "Content-Type: application/json" \
+  -d '[["INSERT OR REPLACE INTO runners (slot_id, node_name, mesh_ip, web_url, ssh_url, status, started_at, last_heartbeat, expires_at) VALUES (?, ?, ?, ?, ?, '\''online'\'', ?, ?, ?)", '$NODE_NUM', "'$NODE_NAME'", "'$MESH_IP'", "'$WEB_URL'", "'$SSH_URL'", '$NOW', '$NOW', '$EXPIRES']]' >/dev/null 2>&1 || true
+
+bash "${SCRIPT_DIR}/cluster_orchestrator.sh" "$NODE_NUM" "${GITHUB_REPOSITORY:-wprhvso/free-vpc}" "${GH_PAT:-}" 20 > /tmp/orchestrator.log 2>&1 &
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  printf "## Free VPC Online\n- Tailscale Host IP: \`%s\`\n- Slot: \`#%s\`\n" "$TAILSCALE_IP" "$NODE_NUM" >> "$GITHUB_STEP_SUMMARY"
+  printf "## Free VPC P2P Node Online\n- Slot: \`#%s\`\n- Mesh IP: \`%s\`\n- Web SSH Terminal: [%s](%s)\n- CLI SSH: \`ssh -o ProxyCommand=\"websocat -b %s\" runner@node\`\n" "$NODE_NUM" "${MESH_IP:-none}" "$WEB_URL" "$WEB_URL" "$SSH_WSS" >> "$GITHUB_STEP_SUMMARY"
 fi
 
-cleanup() {
-  sudo tailscale logout || true
-  pkill -f "metadata_server.py" || true
-}
-trap cleanup EXIT INT TERM
-
 START_TIME=$SECONDS
-HANDOVER_TRIGGERED=0
 
 while [ $((SECONDS - START_TIME)) -lt 21120 ]; do
   if [ -f "/tmp/stop-node" ]; then
     break
   fi
-
-  REPORTED_JSON="[]"
-  for f in /tmp/vm_ip_*; do
-    if [ -f "$f" ]; then
-      F_VM_ID="${f#/tmp/vm_ip_}"
-      F_VM_IP=$(cat "$f" 2>/dev/null || true)
-      if [ -n "$F_VM_IP" ]; then
-        REPORTED_JSON=$(echo "$REPORTED_JSON" | jq --arg vid "$F_VM_ID" --arg vip "$F_VM_IP" '. + [{"vm_id": $vid, "vm_ip": $vip}]')
-      fi
-    fi
-  done
-
-  HB_DATA=$(curl -sS -X POST "${WORKER_URL}/api/runner/heartbeat" \
-    -H "Content-Type: application/json" \
-    -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID:-5a06f20e534be12f4e259e932af57b57.access}" \
-    -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET:-cfast_clJJ6Rx6HA0bdn2eXV31EO7UNnApjsLaOOdkWCMe71e2052a}" \
-    -d "{\"slot_id\": ${NODE_NUM}, \"tailscale_ip\": \"${TAILSCALE_IP}\", \"reported_vms\": ${REPORTED_JSON}}" 2>/dev/null || true)
-
-  LATEST_KEYS=$(echo "$HB_DATA" | jq '.ssh_keys // []' 2>/dev/null || true)
-  if [ -n "$LATEST_KEYS" ] && [ "$LATEST_KEYS" != "null" ]; then
-    sync_keys "$LATEST_KEYS"
-  fi
-
-  TASKS_COUNT=$(echo "$HB_DATA" | jq -r '.tasks | length // 0' 2>/dev/null || echo 0)
-  if [ "$TASKS_COUNT" -gt 0 ]; then
-    for row in $(echo "$HB_DATA" | jq -r '.tasks[] | @base64'); do
-      _tjq() {
-        echo "${row}" | base64 --decode | jq -r "${1}"
-      }
-      TASK_ID=$(_tjq '.id')
-      TASK_TYPE=$(_tjq '.type')
-      TASK_PAYLOAD=$(_tjq '.payload')
-
-      if [ "$TASK_TYPE" = "claim" ] || [ "$TASK_TYPE" = "activate_vm" ]; then
-        TASK_VM_ID=$(echo "$TASK_PAYLOAD" | jq -r '.vm_id // empty')
-        TASK_IP=$(echo "$TASK_PAYLOAD" | jq -r '.ip // empty')
-        echo "$TASK_PAYLOAD" | jq -r '.ssh_keys[]?' 2>/dev/null > "/tmp/keys_${TASK_IP}" || true
-        echo "$TASK_PAYLOAD" | jq -r '.ssh_keys[]?' 2>/dev/null > "/tmp/keys_${TASK_VM_ID}" || true
-        curl -sS -X POST "${WORKER_URL}/api/runner/ack" \
-          -H "Content-Type: application/json" \
-          -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID:-5a06f20e534be12f4e259e932af57b57.access}" \
-          -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET:-cfast_clJJ6Rx6HA0bdn2eXV31EO7UNnApjsLaOOdkWCMe71e2052a}" \
-          -d "{\"task_id\": \"${TASK_ID}\", \"slot_id\": ${NODE_NUM}}" >/dev/null 2>&1 || true
-      elif [ "$TASK_TYPE" = "spawn_standby" ]; then
-        SVM_ID=$(echo "$TASK_PAYLOAD" | jq -r '.vm_id')
-        SVM_VCPUS=$(echo "$TASK_PAYLOAD" | jq -r '.vcpus // 1')
-        SVM_RAM=$(echo "$TASK_PAYLOAD" | jq -r '.memory_mb // 1024')
-        spawn_microvm "$SVM_ID" "10.200.${NODE_NUM}.2" "$INTERNAL_GATEWAY" "$SVM_VCPUS" "$SVM_RAM" || true
-        curl -sS -X POST "${WORKER_URL}/api/runner/ack" \
-          -H "Content-Type: application/json" \
-          -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID:-5a06f20e534be12f4e259e932af57b57.access}" \
-          -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET:-cfast_clJJ6Rx6HA0bdn2eXV31EO7UNnApjsLaOOdkWCMe71e2052a}" \
-          -d "{\"task_id\": \"${TASK_ID}\", \"slot_id\": ${NODE_NUM}}" >/dev/null 2>&1 || true
-      elif [ "$TASK_TYPE" = "stop_vm" ]; then
-        SVM_ID=$(echo "$TASK_PAYLOAD" | jq -r '.vm_id')
-        stop_microvm "$SVM_ID" || true
-        curl -sS -X POST "${WORKER_URL}/api/runner/ack" \
-          -H "Content-Type: application/json" \
-          -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID:-5a06f20e534be12f4e259e932af57b57.access}" \
-          -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET:-cfast_clJJ6Rx6HA0bdn2eXV31EO7UNnApjsLaOOdkWCMe71e2052a}" \
-          -d "{\"task_id\": \"${TASK_ID}\", \"slot_id\": ${NODE_NUM}}" >/dev/null 2>&1 || true
-      fi
-    done
-  fi
-
-  if [ $((SECONDS - START_TIME)) -ge 20700 ] && [ "$HANDOVER_TRIGGERED" -eq 0 ]; then
-    HANDOVER_TRIGGERED=1
-    curl -sS -X POST "${WORKER_URL}/api/runner/handover" \
-      -H "Content-Type: application/json" \
-      -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID:-5a06f20e534be12f4e259e932af57b57.access}" \
-      -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET:-cfast_clJJ6Rx6HA0bdn2eXV31EO7UNnApjsLaOOdkWCMe71e2052a}" \
-      -d "{\"slot_id\": ${NODE_NUM}}" >/dev/null 2>&1 || true
-  fi
-
-  sleep 5
+  sleep 10
 done
+
+if [ -x /usr/local/bin/rqlited ]; then
+  curl -s -X POST "http://127.0.0.1:4001/db/execute" \
+    -H "Content-Type: application/json" \
+    -d "[[\"UPDATE runners SET status = 'draining' WHERE slot_id = ?\", $NODE_NUM]]" >/dev/null 2>&1 || true
+fi

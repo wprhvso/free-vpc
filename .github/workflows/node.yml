@@ -20,15 +20,14 @@ jobs:
 
       - name: Run Free VPC Node
         env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_TEAM_NAME: ${{ secrets.CF_TEAM_NAME }}
           SSH_HOST_ED25519_KEY: ${{ secrets.SSH_HOST_ED25519_KEY }}
           SSH_HOST_RSA_KEY: ${{ secrets.SSH_HOST_RSA_KEY }}
           SSH_AUTHORIZED_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           GH_PAT: ${{ secrets.GH_PAT }}
           NODE_ID: ${{ github.event.inputs.node_id || github.event.client_payload.node_id || '1' }}
-          WORKER_URL: https://vm.unsafie.com
         run: |
-          chmod +x scripts/entrypoint.sh scripts/firecracker_manager.sh
+          chmod +x scripts/entrypoint.sh scripts/firecracker_manager.sh scripts/cluster_orchestrator.sh
           ./scripts/entrypoint.sh
