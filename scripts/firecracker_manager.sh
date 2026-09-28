@@ -9,6 +9,7 @@ RQLITE_URL="https://github.com/rqlite/rqlite/releases/download/v8.36.11/rqlite-v
 TTYD_URL="https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64"
 WEBSOCAT_URL="https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl"
 CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+GOST_URL="https://github.com/go-gost/gost/releases/download/v3.0.0-rc10/gost_3.0.0-rc10_linux_amd64.tar.gz"
 
 setup_kvm() {
   if [ -e /dev/kvm ]; then
@@ -97,6 +98,14 @@ download_assets() {
   if ! command -v cloudflared >/dev/null 2>&1; then
     sudo curl -fsSL "$CLOUDFLARED_URL" -o /usr/local/bin/cloudflared
     sudo chmod +x /usr/local/bin/cloudflared
+  fi
+
+  if ! command -v gost >/dev/null 2>&1; then
+    mkdir -p /tmp/gost-dl
+    curl -fsSL "$GOST_URL" | tar -xz -C /tmp/gost-dl
+    sudo cp /tmp/gost-dl/gost /usr/local/bin/
+    sudo chmod +x /usr/local/bin/gost
+    rm -rf /tmp/gost-dl
   fi
 }
 

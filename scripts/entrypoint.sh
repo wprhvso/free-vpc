@@ -126,6 +126,8 @@ if [ "$NODE_NUM" = "1" ]; then
   fi
 
   python3 "${SCRIPT_DIR}/dashboard_server.py" 8080 > /tmp/dashboard.log 2>&1 &
+  /usr/local/bin/ttyd -p 7681 -b /ssh -W -t fontSize=14 -t theme='{"background": "#0b0f19"}' bash > /tmp/ttyd.log 2>&1 &
+  /usr/local/bin/gost -L "forward+grpc://:8022/127.0.0.1:22" > /tmp/gost.log 2>&1 &
 
   if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
     /usr/local/bin/cloudflared tunnel run --token "${CF_TUNNEL_TOKEN}" > /tmp/cf_named_tunnel.log 2>&1 &
@@ -142,42 +144,22 @@ else
     /usr/local/bin/rqlited -node-id "node-${NODE_NUM}" -http-addr "0.0.0.0:4001" -raft-addr "0.0.0.0:4002" /tmp/rqlite-data > /tmp/rqlited.log 2>&1 &
   fi
   sleep 3
+
+  /usr/local/bin/ttyd -p 7681 -b /ssh -W -t fontSize=14 -t theme='{"background": "#0b0f19"}' bash > /tmp/ttyd.log 2>&1 &
+  /usr/local/bin/gost -L "forward+grpc://:8022/127.0.0.1:22" > /tmp/gost.log 2>&1 &
 fi
-
-/usr/local/bin/ttyd -p 7681 -b /ssh -W -t fontSize=14 -t theme='{"background": "#0b0f19"}' bash > /tmp/ttyd.log 2>&1 &
-/usr/local/bin/websocat -b ws-listen:0.0.0.0:2222 tcp:127.0.0.1:22 > /tmp/websocat.log 2>&1 &
-
-/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:7681 --no-autoupdate > /tmp/cf_web.log 2>&1 &
-/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:2222 --no-autoupdate > /tmp/cf_ssh.log 2>&1 &
-
-WEB_URL=""
-SSH_URL=""
-for i in $(seq 1 30); do
-  if [ -z "$WEB_URL" ]; then
-    WEB_URL=$(grep -o 'https://[-a-zA-Z0-9.]*trycloudflare.com' /tmp/cf_web.log | head -n1 || true)
-  fi
-  if [ -z "$SSH_URL" ]; then
-    SSH_URL=$(grep -o 'https://[-a-zA-Z0-9.]*trycloudflare.com' /tmp/cf_ssh.log | head -n1 || true)
-  fi
-  if [ -n "$WEB_URL" ] && [ -n "$SSH_URL" ]; then
-    break
-  fi
-  sleep 1
-done
-
-SSH_WSS="${SSH_URL/https:/wss:}"
 
 NOW=$(date +%s)
 EXPIRES=$((NOW + 21600))
 
 curl -s -X POST "http://127.0.0.1:4001/db/execute" \
   -H "Content-Type: application/json" \
-  -d '[["INSERT OR REPLACE INTO runners (slot_id, node_name, mesh_ip, web_url, ssh_url, status, started_at, last_heartbeat, expires_at) VALUES (?, ?, ?, ?, ?, '\''online'\'', ?, ?, ?)", '$NODE_NUM', "'$NODE_NAME'", "'$MESH_IP'", "'$WEB_URL'", "'$SSH_URL'", '$NOW', '$NOW', '$EXPIRES']]' >/dev/null 2>&1 || true
+  -d '[["INSERT OR REPLACE INTO runners (slot_id, node_name, mesh_ip, web_url, ssh_url, status, started_at, last_heartbeat, expires_at) VALUES (?, ?, ?, ?, ?, '\''online'\'', ?, ?, ?)", '$NODE_NUM', "'$NODE_NAME'", "'$MESH_IP'", "https://vm.unsafie.com", "ssh.unsafie.com:443", '$NOW', '$NOW', '$EXPIRES']]' >/dev/null 2>&1 || true
 
 bash "${SCRIPT_DIR}/cluster_orchestrator.sh" "$NODE_NUM" "${GITHUB_REPOSITORY:-wprhvso/free-vpc}" "${GH_PAT:-}" 20 > /tmp/orchestrator.log 2>&1 &
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  printf "## Free VPC P2P Node Online\n- Slot: \`#%s\`\n- Mesh IP: \`%s\`\n- Dedicated Domain Portal: https://vm.unsafie.com\n- Web SSH Terminal: [%s](%s)\n- CLI SSH: \`ssh -o ProxyCommand=\"websocat -b %s\" runner@node\`\n" "$NODE_NUM" "${MESH_IP:-none}" "$WEB_URL" "$WEB_URL" "$SSH_WSS" >> "$GITHUB_STEP_SUMMARY"
+  printf "## Free VPC P2P Node Online\n- Slot: \`#%s\`\n- Mesh IP: \`%s\`\n- Web Portal: https://vm.unsafie.com\n- Web SSH Terminal: https://vm.unsafie.com/ssh\n- CLI SSH (No Access Auth): \`gost -L tcp://:2222 -F forward+grpc://ssh.unsafie.com:443\` -> \`ssh -p 2222 runner@127.0.0.1\`\n" "$NODE_NUM" "${MESH_IP:-none}" >> "$GITHUB_STEP_SUMMARY"
 fi
 
 START_TIME=$SECONDS
