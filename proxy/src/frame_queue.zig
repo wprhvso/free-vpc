@@ -75,9 +75,8 @@ pub const FrameQueue = struct {
         var total_drained: usize = 0;
 
         while (self.count >= @sizeOf(protocol.Header)) {
-            var hdr_buf: [@sizeOf(protocol.Header)]u8 = undefined;
-            self.peekBytes(&hdr_buf, total_drained);
-            const hdr: *const protocol.Header = @ptrCast(@alignCast(&hdr_buf));
+            var hdr: protocol.Header = undefined;
+            self.peekBytes(std.mem.asBytes(&hdr), total_drained);
 
             if (hdr.magic != 0xCF01) {
                 self.count = 0;

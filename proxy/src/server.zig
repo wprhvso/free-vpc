@@ -197,16 +197,16 @@ pub const Server = struct {
                 return;
             };
 
-            var init_ping_buf: [16]u8 = undefined;
+            var init_ping_buf: [8192]u8 = @splat(0);
             const init_ping_hdr = protocol.Header{
                 .magic = 0xCF01,
-                .payload_len = 0,
+                .payload_len = 8192 - @sizeOf(protocol.Header),
                 .stream_id = 0,
                 .seq_id = 0,
                 .cmd = .ping,
             };
-            const init_hdr_bytes: *const [16]u8 = @ptrCast(&init_ping_hdr);
-            @memcpy(init_ping_buf[0..16], init_hdr_bytes);
+            const init_hdr_bytes: *const [@sizeOf(protocol.Header)]u8 = @ptrCast(&init_ping_hdr);
+            @memcpy(init_ping_buf[0..@sizeOf(protocol.Header)], init_hdr_bytes);
 
             var init_ch_hdr: [32]u8 = undefined;
             const init_ch_text = std.fmt.bufPrint(&init_ch_hdr, "{x}\r\n", .{init_ping_buf.len}) catch unreachable;
@@ -245,7 +245,9 @@ pub const Server = struct {
     fn processFrames(self: *Server, body: []const u8) void {
         var offset: usize = 0;
         while (offset + @sizeOf(protocol.Header) <= body.len) {
-            const hdr: *const protocol.Header = @ptrCast(@alignCast(body[offset..].ptr));
+            var hdr: protocol.Header = undefined;
+            @memcpy(std.mem.asBytes(&hdr), body[offset .. offset + @sizeOf(protocol.Header)]);
+
             if (hdr.magic != 0xCF01) break;
             offset += @sizeOf(protocol.Header);
 

@@ -164,12 +164,15 @@ const RemoteConnection = struct {
     }
 
     pub fn readChunkHeader(self: *RemoteConnection) !usize {
-        var line_buf: [32]u8 = undefined;
+        var line_buf: [64]u8 = undefined;
         var idx: usize = 0;
         while (idx < line_buf.len) {
             const b = try self.readByte();
             if (b == '\n' and idx > 0 and line_buf[idx - 1] == '\r') {
-                const hex_part = std.mem.trim(u8, line_buf[0 .. idx - 1], " \t");
+                var hex_part = std.mem.trim(u8, line_buf[0 .. idx - 1], " \t");
+                if (std.mem.indexOfScalar(u8, hex_part, ';')) |semi| {
+                    hex_part = hex_part[0..semi];
+                }
                 return std.fmt.parseInt(usize, hex_part, 16);
             }
             line_buf[idx] = b;
@@ -400,6 +403,7 @@ pub const Client = struct {
             "POST {s} HTTP/1.1\r\n" ++
             "Host: {s}\r\n" ++
             "User-Agent: {s}\r\n" ++
+            "Accept-Encoding: identity\r\n" ++
             "{s}: {s}\r\n" ++
             "X-Gen: {d}\r\n" ++
             "Content-Type: application/octet-stream\r\n" ++
@@ -515,7 +519,9 @@ pub const Client = struct {
     fn dispatchFrames(self: *Client, bytes: []const u8) void {
         var offset: usize = 0;
         while (offset + @sizeOf(protocol.Header) <= bytes.len) {
-            const hdr: *const protocol.Header = @ptrCast(@alignCast(bytes[offset..].ptr));
+            var hdr: protocol.Header = undefined;
+            @memcpy(std.mem.asBytes(&hdr), bytes[offset .. offset + @sizeOf(protocol.Header)]);
+
             if (hdr.magic != 0xCF01) break;
             offset += @sizeOf(protocol.Header);
 
