@@ -296,8 +296,8 @@ async function handleAcquireVm(request, env) {
       `SELECT v.* FROM vms v
        JOIN runners r ON v.runner_id = r.id
        WHERE v.slot_id = ?
-         AND v.status = standby
-         AND r.status = online
+         AND v.status = 'standby'
+         AND r.status = 'online'
          AND (? - r.last_heartbeat) < 90000
        ORDER BY v.ip ASC
        LIMIT 1`
@@ -306,8 +306,8 @@ async function handleAcquireVm(request, env) {
     standbyVm = await env.DB.prepare(
       `SELECT v.* FROM vms v
        JOIN runners r ON v.runner_id = r.id
-       WHERE v.status = standby
-         AND r.status = online
+       WHERE v.status = 'standby'
+         AND r.status = 'online'
          AND (? - r.last_heartbeat) < 90000
          AND (r.expires_at - ?) > 7200000
        ORDER BY r.expires_at DESC
@@ -318,8 +318,8 @@ async function handleAcquireVm(request, env) {
       standbyVm = await env.DB.prepare(
         `SELECT v.* FROM vms v
          JOIN runners r ON v.runner_id = r.id
-         WHERE v.status = standby
-           AND r.status = online
+         WHERE v.status = 'standby'
+           AND r.status = 'online'
            AND (? - r.last_heartbeat) < 90000
          ORDER BY r.expires_at DESC
          LIMIT 1`
@@ -328,7 +328,7 @@ async function handleAcquireVm(request, env) {
 
     if (!standbyVm) {
       standbyVm = await env.DB.prepare(
-        "SELECT * FROM vms WHERE status = standby ORDER BY created_at ASC LIMIT 1"
+        "SELECT * FROM vms WHERE status = 'standby' ORDER BY created_at ASC LIMIT 1"
       ).first();
     }
   }
@@ -337,7 +337,7 @@ async function handleAcquireVm(request, env) {
     const assignedName = payload.name || `vm-${standbyVm.slot_id}-${Date.now().toString(36)}`;
     await env.DB.prepare(
       `UPDATE vms
-       SET status = claimed,
+       SET status = 'claimed',
            name = ?,
            ssh_keys = ?,
            claimed_at = ?,
@@ -358,7 +358,7 @@ async function handleAcquireVm(request, env) {
     ).run();
 
     const remainingStandby = await env.DB.prepare(
-      "SELECT COUNT(*) as count FROM vms WHERE slot_id = ? AND status = standby"
+      "SELECT COUNT(*) as count FROM vms WHERE slot_id = ? AND status = 'standby'"
     ).bind(standbyVm.slot_id).first();
 
     if ((remainingStandby?.count || 0) < 1) {
@@ -421,7 +421,7 @@ async function handleAcquireVm(request, env) {
   if (!slotId) {
     const runner = await env.DB.prepare(
       `SELECT slot_id FROM runners
-       WHERE status = online AND (? - last_heartbeat) < 90000
+       WHERE status = 'online' AND (? - last_heartbeat) < 90000
        ORDER BY expires_at DESC`
     ).bind(now).first();
     slotId = runner ? runner.slot_id : 1;
@@ -547,13 +547,13 @@ async function handleRunnerBoot(request, env) {
 
   await env.DB.prepare(
     `INSERT INTO runners (id, run_id, slot_id, ip_gateway, subnet, status, started_at, expires_at, last_heartbeat, zone)
-     VALUES (?, ?, ?, ?, ?, online, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, 'online', ?, ?, ?, ?)
      ON CONFLICT(slot_id) DO UPDATE SET
        id = excluded.id,
        run_id = excluded.run_id,
        ip_gateway = excluded.ip_gateway,
        subnet = excluded.subnet,
-       status = online,
+       status = 'online',
        started_at = excluded.started_at,
        expires_at = excluded.expires_at,
        last_heartbeat = excluded.last_heartbeat,
@@ -617,14 +617,14 @@ async function handleRunnerHeartbeat(request, env) {
   const now = Date.now();
 
   await env.DB.prepare(
-    "UPDATE runners SET last_heartbeat = ?, status = online WHERE slot_id = ?"
+    "UPDATE runners SET last_heartbeat = ?, status = 'online' WHERE slot_id = ?"
   ).bind(now, slotId).run();
 
   const sshKeysQuery = await env.DB.prepare("SELECT public_key FROM ssh_keys ORDER BY created_at ASC").all();
   const sshKeys = (sshKeysQuery.results || []).map(k => k.public_key);
 
   const tasksQuery = await env.DB.prepare(
-    "SELECT * FROM runner_tasks WHERE slot_id = ? AND status = pending ORDER BY created_at ASC LIMIT 10"
+    "SELECT * FROM runner_tasks WHERE slot_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 10"
   ).bind(slotId).all();
 
   const tasks = (tasksQuery.results || []).map(t => {
@@ -650,7 +650,7 @@ async function handleRunnerAck(request, env) {
   const payload = await request.json();
   const taskId = payload.task_id;
   if (taskId) {
-    await env.DB.prepare("UPDATE runner_tasks SET status = completed WHERE id = ?").bind(taskId).run();
+    await env.DB.prepare("UPDATE runner_tasks SET status = 'completed' WHERE id = ?").bind(taskId).run();
   }
   return Response.json({ ok: true }, { headers: corsHeaders() });
 }
@@ -660,7 +660,7 @@ async function handleRunnerHandover(request, env) {
   const slotId = parseInt(payload.slot_id, 10);
 
   await env.DB.prepare(
-    "UPDATE runners SET status = draining WHERE slot_id = ?"
+    "UPDATE runners SET status = 'draining' WHERE slot_id = ?"
   ).bind(slotId).run();
 
   const spawnRes = await dispatchGitHubRunner(env, slotId);
@@ -748,16 +748,16 @@ async function runWatchdog(env) {
   const now = Date.now();
 
   const deadRunners = await env.DB.prepare(
-    "SELECT slot_id FROM runners WHERE status = online AND (? - last_heartbeat) > 90000"
+    "SELECT slot_id FROM runners WHERE status = 'online' AND (? - last_heartbeat) > 90000"
   ).bind(now).all();
 
   for (const r of (deadRunners.results || [])) {
-    await env.DB.prepare("UPDATE runners SET status = offline WHERE slot_id = ?").bind(r.slot_id).run();
+    await env.DB.prepare("UPDATE runners SET status = 'offline' WHERE slot_id = ?").bind(r.slot_id).run();
     await dispatchGitHubRunner(env, r.slot_id);
   }
 
   const activeRunners = await env.DB.prepare(
-    "SELECT slot_id FROM runners WHERE status = online AND (? - last_heartbeat) <= 90000"
+    "SELECT slot_id FROM runners WHERE status = 'online' AND (? - last_heartbeat) <= 90000"
   ).bind(now).all();
 
   const occupiedSlots = new Set((activeRunners.results || []).map(r => r.slot_id));
@@ -773,7 +773,7 @@ async function handleBatchSpawn(request, env) {
   const now = Date.now();
 
   const active = await env.DB.prepare(
-    "SELECT slot_id FROM runners WHERE status = online AND (? - last_heartbeat) <= 90000"
+    "SELECT slot_id FROM runners WHERE status = 'online' AND (? - last_heartbeat) <= 90000"
   ).bind(now).all();
 
   const occupied = new Set((active.results || []).map(r => r.slot_id));
