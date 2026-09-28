@@ -349,7 +349,7 @@ async function handleAcquireVm(request, env) {
     const taskId = crypto.randomUUID();
     await env.DB.prepare(
       `INSERT INTO runner_tasks (id, slot_id, type, payload, status, created_at)
-       VALUES (?, ?, claim, ?, pending, ?)`
+       VALUES (?, ?, 'claim', ?, 'pending', ?)`
     ).bind(
       taskId,
       standbyVm.slot_id,
@@ -380,13 +380,13 @@ async function handleAcquireVm(request, env) {
         const newVmName = `vm-${standbyVm.slot_id}-standby-${Date.now().toString(36)}`;
         await env.DB.prepare(
           `INSERT INTO vms (id, name, runner_id, slot_id, ip, status, vcpus, memory_mb, disk_gb, image, ssh_keys, claimed_at, key_synced, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, standby, 1, 1024, 10, debian-12, [], NULL, 1, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, 'standby', 1, 1024, 10, 'debian-12', '[]', NULL, 1, ?, ?)`
         ).bind(newVmId, newVmName, standbyVm.runner_id, standbyVm.slot_id, nextIp, now, now).run();
 
         const spawnTaskId = crypto.randomUUID();
         await env.DB.prepare(
           `INSERT INTO runner_tasks (id, slot_id, type, payload, status, created_at)
-           VALUES (?, ?, spawn_standby, ?, pending, ?)`
+           VALUES (?, ?, 'spawn_standby', ?, 'pending', ?)`
         ).bind(
           spawnTaskId,
           standbyVm.slot_id,
@@ -459,7 +459,7 @@ async function handleAcquireVm(request, env) {
 
   await env.DB.prepare(
     `INSERT INTO vms (id, name, runner_id, slot_id, ip, status, vcpus, memory_mb, disk_gb, image, ssh_keys, claimed_at, key_synced, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, claimed, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?, ?, 0, ?, ?)`
   ).bind(
     vmId,
     vmName,
@@ -479,7 +479,7 @@ async function handleAcquireVm(request, env) {
   const spawnTaskId = crypto.randomUUID();
   await env.DB.prepare(
     `INSERT INTO runner_tasks (id, slot_id, type, payload, status, created_at)
-     VALUES (?, ?, spawn_standby, ?, pending, ?)`
+     VALUES (?, ?, 'spawn_standby', ?, 'pending', ?)`
   ).bind(
     spawnTaskId,
     slotId,
@@ -490,7 +490,7 @@ async function handleAcquireVm(request, env) {
   const claimTaskId = crypto.randomUUID();
   await env.DB.prepare(
     `INSERT INTO runner_tasks (id, slot_id, type, payload, status, created_at)
-     VALUES (?, ?, claim, ?, pending, ?)`
+     VALUES (?, ?, 'claim', ?, 'pending', ?)`
   ).bind(
     claimTaskId,
     slotId,
@@ -527,7 +527,7 @@ async function handleDeleteVm(request, env, id) {
   const taskId = crypto.randomUUID();
   await env.DB.prepare(
     `INSERT INTO runner_tasks (id, slot_id, type, payload, status, created_at)
-     VALUES (?, ?, stop_vm, ?, pending, ?)`
+     VALUES (?, ?, 'stop_vm', ?, 'pending', ?)`
   ).bind(taskId, vm.slot_id, JSON.stringify({ vm_id: vm.id }), Date.now()).run();
 
   await env.DB.prepare("DELETE FROM vms WHERE id = ?").bind(vm.id).run();
@@ -586,12 +586,12 @@ async function handleRunnerBoot(request, env) {
 
     await env.DB.prepare(
       `INSERT INTO vms (id, name, runner_id, slot_id, ip, status, vcpus, memory_mb, disk_gb, image, ssh_keys, key_synced, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, standby, 1, 1024, 10, debian-12, [], 1, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, 'standby', 1, 1024, 10, 'debian-12', '[]', 1, ?, ?)`
     ).bind(vm1Id, `vm-${slotId}-standby-1`, runnerId, slotId, ip1, now, now).run();
 
     await env.DB.prepare(
       `INSERT INTO vms (id, name, runner_id, slot_id, ip, status, vcpus, memory_mb, disk_gb, image, ssh_keys, key_synced, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, standby, 1, 1024, 10, debian-12, [], 1, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, 'standby', 1, 1024, 10, 'debian-12', '[]', 1, ?, ?)`
     ).bind(vm2Id, `vm-${slotId}-standby-2`, runnerId, slotId, ip2, now, now).run();
 
     const refreshed = await env.DB.prepare(
