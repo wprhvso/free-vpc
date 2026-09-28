@@ -88,3 +88,10 @@ stop run_id:
 
 ssh ip:
     ssh -o StrictHostKeyChecking=no runner@{{ip}}
+
+vm-acquire name="" slot="" key="":
+    @curl -sS -X POST "{{API_URL}}/api/vm" \
+      -H "CF-Access-Client-Id: {{CF_ACCESS_CLIENT_ID}}" \
+      -H "CF-Access-Client-Secret: {{CF_ACCESS_CLIENT_SECRET}}" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"{{name}}\",\"slot_id\":\"{{slot}}\",\"ssh_key\":\"{{key}}\"}" | jq .
