@@ -5,19 +5,23 @@ pub const Cmd = enum(u8) {
     connect_ok = 2,
     data = 3,
     close = 4,
-    ping = 5,
-    pong = 6,
-    log = 7,
     _,
 };
 
 pub const Header = extern struct {
+    magic: u16 = 0xCF01,
+    payload_len: u16,
     stream_id: u32,
     seq_id: u32,
     cmd: Cmd,
     reserved: u8 = 0,
-    payload_len: u16,
+    pad: u16 = 0,
 };
+
+pub fn setNoDelay(fd: i32) void {
+    const one: c_int = 1;
+    _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, fd))), 6, 1, @intFromPtr(&one), @sizeOf(c_int));
+}
 
 pub const SocketStream = struct {
     handle: i32,
@@ -47,24 +51,3 @@ pub const SocketStream = struct {
         _ = std.os.linux.syscall2(.shutdown, @as(usize, @bitCast(@as(isize, self.handle))), 2);
     }
 };
-
-pub fn writeFrame(dest: []u8, stream_id: u32, seq_id: u32, cmd: Cmd, payload: []const u8) !usize {
-    const total = @sizeOf(Header) + payload.len;
-    if (dest.len < total) return error.BufferTooSmall;
-    if (payload.len > std.math.maxInt(u16)) return error.PayloadTooLarge;
-
-    const hdr: *Header = @ptrCast(@alignCast(dest.ptr));
-    hdr.* = .{
-        .stream_id = stream_id,
-        .seq_id = seq_id,
-        .cmd = cmd,
-        .reserved = 0,
-        .payload_len = @intCast(payload.len),
-    };
-
-    if (payload.len > 0) {
-        @memcpy(dest[@sizeOf(Header)..total], payload);
-    }
-
-    return total;
-}
