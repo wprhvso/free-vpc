@@ -492,7 +492,12 @@ pub const Client = struct {
 
         var octets: [4]u8 = .{ 127, 0, 0, 1 };
         if (!parseIp4(host_part, &octets)) {
-            _ = resolveDnsA(host_part, &octets);
+            std.debug.print("\x1b[36m[DNS]\x1b[0m Resolving {s}...\n", .{host_part});
+            if (!resolveDnsA(host_part, &octets)) {
+                std.debug.print("\x1b[31m[DNS ERROR]\x1b[0m Failed to resolve {s}, defaulting to 127.0.0.1\n", .{host_part});
+            } else {
+                std.debug.print("\x1b[32m[DNS]\x1b[0m Resolved {s} -> {d}.{d}.{d}.{d}\n", .{ host_part, octets[0], octets[1], octets[2], octets[3] });
+            }
         }
 
         const remote_addr = sockaddr_in{
@@ -609,6 +614,7 @@ pub const Client = struct {
     }
 
     pub fn start(self: *Client) !void {
+        std.debug.print("\x1b[32m[INIT]\x1b[0m Spawning {d} Keep-Alive pipeline workers...\n", .{self.opts.num_workers});
         for (0..self.opts.num_workers) |w_idx| {
             const th = try std.Thread.spawn(.{}, duplexWorkerThread, .{ self, w_idx });
             th.detach();
@@ -627,7 +633,6 @@ pub const Client = struct {
     }
 
     fn duplexWorkerThread(self: *Client, worker_id: usize) void {
-        _ = worker_id;
         const max_chunk = self.opts.chunk_kb * 1024;
         const send_buf = self.allocator.alloc(u8, max_chunk) catch return;
         defer self.allocator.free(send_buf);
@@ -637,13 +642,21 @@ pub const Client = struct {
 
         var header_buf: [4096]u8 = undefined;
         var conn: ?*RemoteConnection = null;
+        var first_connected = false;
 
         while (true) {
             if (conn == null) {
-                conn = self.connectRemote() catch {
-                    sleepMs(50);
+                conn = self.connectRemote() catch |err| {
+                    if (!first_connected and worker_id == 0) {
+                        std.debug.print("\x1b[31m[PIPE ERROR]\x1b[0m Connect failed ({s}), retrying in 200ms...\n", .{@errorName(err)});
+                    }
+                    sleepMs(200);
                     continue;
                 };
+                if (!first_connected) {
+                    first_connected = true;
+                    std.debug.print("\x1b[32m[PIPE OK]\x1b[0m Worker #{d} connected to {s}{s}\n", .{ worker_id, self.remote_host_hdr, self.opts.sync_path });
+                }
             }
 
             const to_send_len = self.ring.drainAtMost(send_buf);
@@ -832,6 +845,8 @@ pub const Client = struct {
         const listen_fd = try listenOn(host, port);
         defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, listen_fd))));
 
+        std.debug.print("\x1b[32m[SOCKS]\x1b[0m SOCKS5 listener ready on {s}:{d}\n", .{ host, port });
+
         while (true) {
             var client_addr: sockaddr = undefined;
             var client_len: u32 = @sizeOf(sockaddr);
@@ -934,7 +949,14 @@ pub const Client = struct {
             return;
         }
 
+        const target_port = std.mem.readInt(u16, &port_buf, .big);
         const stream_id = self.next_stream_id.fetchAdd(1, .monotonic);
+
+        if (atyp == 1) {
+            std.debug.print("\x1b[36m[SOCKS]\x1b[0m Stream #{d} -> {d}.{d}.{d}.{d}:{d}\n", .{ stream_id, addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3], target_port });
+        } else if (atyp == 3) {
+            std.debug.print("\x1b[36m[SOCKS]\x1b[0m Stream #{d} -> {s}:{d}\n", .{ stream_id, addr_buf[0..addr_len], target_port });
+        }
 
         var payload_buf: [300]u8 = undefined;
         @memcpy(payload_buf[0..2], &port_buf);

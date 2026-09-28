@@ -90,6 +90,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    std.debug.print("\x1b[32m[START]\x1b[0m cf-proxy-client [{s}] (remote: {s}{s}, workers: {d}, buffer: {d}MB, timeout: {d}ms)\n", .{
+        opts.name, opts.remote_url, opts.sync_path, opts.num_workers, opts.buf_mb, opts.timeout_req_ms,
+    });
+
     var client = Client.init(allocator, io, opts);
     defer client.deinit();
     try client.start();
