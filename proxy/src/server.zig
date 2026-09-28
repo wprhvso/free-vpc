@@ -177,11 +177,14 @@ pub const Server = struct {
             if (prev_leader) |old| {
                 old.retired.store(true, .release);
                 old.wake_event.set();
+            }
+            self.leader_mutex.unlock();
+
+            if (prev_leader) |old| {
                 var ret_log: [64]u8 = undefined;
                 const ret_slice = std.fmt.bufPrint(&ret_log, "{{\"old_gen\":{d},\"new_gen\":{d}}}", .{ old.gen, req_gen }) catch "{}";
                 self.emitRemoteLog("info", "baton", "preempt", 0, ret_slice);
             }
-            self.leader_mutex.unlock();
 
             const init_resp =
                 "HTTP/1.1 200 OK\r\n" ++
