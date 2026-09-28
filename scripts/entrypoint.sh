@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/firecracker_manager.sh"
 
+CF_TUNNEL_TOKEN="${CF_TUNNEL_TOKEN:-eyJhIjoiMzlmNjg1OGY5YjU4NjU2NTJhYzY5YzUwNmVjNDczNmMiLCJ0IjoiYTcxZDM2OTctMGI3Ny00YjQzLWE4MWEtMDYyNmQ2NWMwNjliIiwicyI6Ik16ZzRaak13TWprdE1qSmhZaTAwWWpaaExXRXdPVGt0TlRsbE9URTBNMk13WTJWbCJ9}"
+
 sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd sudo iptables e2fsprogs
 
 sudo mkdir -p /etc/ssh /etc/ssh/sshd_config.d
@@ -120,12 +122,13 @@ if [ "$NODE_NUM" = "1" ]; then
       -H "Authorization: Bearer ${GH_PAT}" \
       -H "Accept: application/vnd.github.v3+json" \
       -H "Content-Type: application/json" \
-      -d "{\"name\":\"SEED_MESH_IP\",\"value\":\"${MESH_IP}\"}" 2>/dev/null || \
-    curl -sS -X POST "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables" \
-      -H "Authorization: Bearer ${GH_PAT}" \
-      -H "Accept: application/vnd.github.v3+json" \
-      -H "Content-Type: application/json" \
       -d "{\"name\":\"SEED_MESH_IP\",\"value\":\"${MESH_IP}\"}" 2>/dev/null || true
+  fi
+
+  python3 "${SCRIPT_DIR}/dashboard_server.py" 8080 > /tmp/dashboard.log 2>&1 &
+
+  if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
+    /usr/local/bin/cloudflared tunnel run --token "${CF_TUNNEL_TOKEN}" > /tmp/cf_named_tunnel.log 2>&1 &
   fi
 else
   SEED_IP=""
@@ -141,7 +144,7 @@ else
   sleep 3
 fi
 
-/usr/local/bin/ttyd -p 7681 -W -t fontSize=14 -t theme='{"background": "#0b0f19"}' bash > /tmp/ttyd.log 2>&1 &
+/usr/local/bin/ttyd -p 7681 -b /ssh -W -t fontSize=14 -t theme='{"background": "#0b0f19"}' bash > /tmp/ttyd.log 2>&1 &
 /usr/local/bin/websocat -b ws-listen:0.0.0.0:2222 tcp:127.0.0.1:22 > /tmp/websocat.log 2>&1 &
 
 /usr/local/bin/cloudflared tunnel --url http://127.0.0.1:7681 --no-autoupdate > /tmp/cf_web.log 2>&1 &
@@ -174,7 +177,7 @@ curl -s -X POST "http://127.0.0.1:4001/db/execute" \
 bash "${SCRIPT_DIR}/cluster_orchestrator.sh" "$NODE_NUM" "${GITHUB_REPOSITORY:-wprhvso/free-vpc}" "${GH_PAT:-}" 20 > /tmp/orchestrator.log 2>&1 &
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  printf "## Free VPC P2P Node Online\n- Slot: \`#%s\`\n- Mesh IP: \`%s\`\n- Web SSH Terminal: [%s](%s)\n- CLI SSH: \`ssh -o ProxyCommand=\"websocat -b %s\" runner@node\`\n" "$NODE_NUM" "${MESH_IP:-none}" "$WEB_URL" "$WEB_URL" "$SSH_WSS" >> "$GITHUB_STEP_SUMMARY"
+  printf "## Free VPC P2P Node Online\n- Slot: \`#%s\`\n- Mesh IP: \`%s\`\n- Dedicated Domain Portal: https://vm.unsafie.com\n- Web SSH Terminal: [%s](%s)\n- CLI SSH: \`ssh -o ProxyCommand=\"websocat -b %s\" runner@node\`\n" "$NODE_NUM" "${MESH_IP:-none}" "$WEB_URL" "$WEB_URL" "$SSH_WSS" >> "$GITHUB_STEP_SUMMARY"
 fi
 
 START_TIME=$SECONDS
