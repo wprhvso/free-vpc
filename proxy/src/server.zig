@@ -75,15 +75,24 @@ pub const Server = struct {
         const drain_buf = self.allocator.alloc(u8, Config.common.http_chunk_size) catch { stream.close(); return; };
         defer self.allocator.free(drain_buf);
 
+        std.debug.print("\x1b[33m[SERVER]\x1b[0m Incoming connection accepted\n", .{});
+
         while (true) {
             var leftover: []const u8 = undefined;
-            const hdrs = readHeadersFast(stream, &header_buf, &leftover) catch { stream.close(); return; };
+            const hdrs = readHeadersFast(stream, &header_buf, &leftover) catch |err| {
+                std.debug.print("\x1b[33m[SERVER]\x1b[0m Connection closed / error: {s}\n", .{@errorName(err)});
+                stream.close();
+                return;
+            };
 
             const first_line = hdrs[0 .. std.mem.indexOf(u8, hdrs, "\r\n") orelse hdrs.len];
+            std.debug.print("\x1b[33m[SERVER]\x1b[0m Got HTTP request: {s}\n", .{first_line});
+
             const is_push = std.mem.indexOf(u8, first_line, Config.common.push_path) != null;
             const is_pull = std.mem.indexOf(u8, first_line, Config.common.pull_path) != null;
 
             if (!is_push and !is_pull) {
+                std.debug.print("\x1b[33m[SERVER]\x1b[0m Unknown path, returning 200 OK\n", .{});
                 _ = stream.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK") catch {};
                 continue;
             }
@@ -126,18 +135,22 @@ pub const Server = struct {
                     } else {
                         if (!protocol.readExactStream(stream, body)) { stream.close(); return; }
                     }
+
+                    std.debug.print("\x1b[35m[SERVER PUSH]\x1b[0m Processing {d} bytes\n", .{body.len});
                     self.processFrames(body);
                 }
                 _ = stream.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n") catch { stream.close(); return; };
             } else if (is_pull) {
                 var batch_len = self.downstream_queue.drainBatch(drain_buf);
                 if (batch_len == 0) {
+                    std.debug.print("\x1b[34m[SERVER PULL]\x1b[0m Waiting for data (hold 10s)...\n", .{});
                     if (self.downstream_queue.waitData(Config.server.hold_timeout_ms)) {
                         batch_len = self.downstream_queue.drainBatch(drain_buf);
                     }
                 }
 
                 if (batch_len > 0) {
+                    std.debug.print("\x1b[34m[SERVER PULL]\x1b[0m Returning {d} bytes\n", .{batch_len});
                     var resp_hdr: [256]u8 = undefined;
                     const hdr_text = std.fmt.bufPrint(&resp_hdr,
                         "HTTP/1.1 200 OK\r\n" ++
@@ -152,6 +165,7 @@ pub const Server = struct {
                     stream.writeAll(hdr_text) catch { stream.close(); return; };
                     stream.writeAll(drain_buf[0..batch_len]) catch { stream.close(); return; };
                 } else {
+                    std.debug.print("\x1b[34m[SERVER PULL]\x1b[0m Hold timeout, returning 204 No Content\n", .{});
                     const no_content = if (is_keep_alive)
                         "HTTP/1.1 204 No Content\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n"
                     else
@@ -177,6 +191,8 @@ pub const Server = struct {
             if (offset + hdr.payload_len > body.len) break;
             const payload = body[offset .. offset + hdr.payload_len];
             offset += hdr.payload_len;
+
+            std.debug.print("\x1b[35m[SERVER FRAME]\x1b[0m Stream #{d} cmd={any} len={d}\n", .{ hdr.stream_id, hdr.cmd, hdr.payload_len });
 
             switch (hdr.cmd) {
                 .connect => self.handleConnect(hdr.stream_id, payload),
@@ -226,10 +242,10 @@ pub const Server = struct {
 
         var octets: [4]u8 = .{ 0, 0, 0, 0 };
 
-        if (target_type == 1) { // IPv4
+        if (target_type == 1) {
             if (addr_len != 4) { self.sendClose(stream_id); return; }
             @memcpy(&octets, raw_addr);
-        } else if (target_type == 2) { // Domain Name
+        } else if (target_type == 2) {
             std.debug.print("\x1b[36m[SERVER DNS]\x1b[0m Resolving {s}...\n", .{raw_addr});
             if (!protocol.resolveDnsA(raw_addr, &octets)) {
                 std.debug.print("\x1b[31m[SERVER ERROR]\x1b[0m Failed to resolve DNS for {s}\n", .{raw_addr});
@@ -280,6 +296,7 @@ pub const Server = struct {
         self.streams_mutex.unlock();
 
         _ = self.downstream_queue.push(stream_id, 0, .connect_ok, "");
+        std.debug.print("\x1b[32m[SERVER]\x1b[0m Sent connect_ok for Stream #{d}\n", .{stream_id});
 
         const th = std.Thread.spawn(.{}, targetReaderWorker, .{ self, stream_id, target_conn, state }) catch {
             self.closeStream(stream_id);
@@ -293,6 +310,7 @@ pub const Server = struct {
         while (true) {
             const n = target_stream.read(&buf) catch 0;
             if (n == 0) {
+                std.debug.print("\x1b[33m[SERVER]\x1b[0m Stream #{d} target socket closed (EOF)\n", .{stream_id});
                 self.closeStream(stream_id);
                 return;
             }

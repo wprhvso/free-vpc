@@ -269,6 +269,8 @@ pub const Client = struct {
             const batch_len = self.upstream_queue.drainBatch(send_buf);
             if (batch_len == 0) continue;
 
+            std.debug.print("\x1b[35m[PUSH #{d}]\x1b[0m Sending {d} bytes to Cloudflare ({s})...\n", .{ id, batch_len, Config.common.push_path });
+
             const req_hdrs = std.fmt.bufPrint(&header_scratch,
                 "POST {s} HTTP/1.1\r\n" ++
                 "Host: {s}\r\n" ++
@@ -287,6 +289,7 @@ pub const Client = struct {
             };
 
             if (!send_ok) {
+                std.debug.print("\x1b[31m[PUSH #{d}]\x1b[0m Socket write failed!\n", .{id});
                 conn.?.close();
                 conn = null;
                 continue;
@@ -294,10 +297,15 @@ pub const Client = struct {
 
             var resp_hdr_buf: [2048]u8 = undefined;
             var leftover: []const u8 = undefined;
-            _ = conn.?.readHeadersFast(&resp_hdr_buf, &leftover) catch {
+            const hdrs = conn.?.readHeadersFast(&resp_hdr_buf, &leftover) catch |err| {
+                std.debug.print("\x1b[31m[PUSH #{d}]\x1b[0m Read response error: {s}\n", .{ id, @errorName(err) });
                 conn.?.close();
                 conn = null;
+                continue;
             };
+
+            const first_line = hdrs[0 .. std.mem.indexOf(u8, hdrs, "\r\n") orelse hdrs.len];
+            std.debug.print("\x1b[35m[PUSH #{d}]\x1b[0m Cloudflare response: {s}\n", .{ id, first_line });
         }
     }
 
@@ -334,12 +342,14 @@ pub const Client = struct {
             }
 
             var leftover: []const u8 = undefined;
-            const hdrs = conn.?.readHeadersFast(&header_buf, &leftover) catch {
+            const hdrs = conn.?.readHeadersFast(&header_buf, &leftover) catch |err| {
+                std.debug.print("\x1b[31m[PULL #{d}]\x1b[0m Read response error: {s}\n", .{ id, @errorName(err) });
                 conn.?.close();
                 conn = null;
                 continue;
             };
 
+            const first_line = hdrs[0 .. std.mem.indexOf(u8, hdrs, "\r\n") orelse hdrs.len];
             var content_len: usize = 0;
             var is_close = false;
             const status_200 = std.mem.indexOf(u8, hdrs, "200 OK") != null;
@@ -353,6 +363,8 @@ pub const Client = struct {
                     if (std.mem.indexOf(u8, line, "close") != null) is_close = true;
                 }
             }
+
+            std.debug.print("\x1b[34m[PULL #{d}]\x1b[0m Cloudflare response: {s} (len={d})\n", .{ id, first_line, content_len });
 
             if (status_200 and content_len > 0) {
                 const body_slice = resp_body_buf[0..content_len];
@@ -496,7 +508,6 @@ pub const Client = struct {
     }
 
     fn handleSocks(self: *Client, stream: protocol.SocketStream) void {
-        // 1. Хендшейк версий
         var greeting_hdr: [2]u8 = undefined;
         if (!protocol.readExactStream(stream, &greeting_hdr)) {
             stream.close();
@@ -518,7 +529,6 @@ pub const Client = struct {
 
         stream.writeAll(&[_]u8{ 5, 0 }) catch { stream.close(); return; };
 
-        // 2. Запрос CONNECT
         var req_hdr: [4]u8 = undefined;
         if (!protocol.readExactStream(stream, &req_hdr)) {
             stream.close();
@@ -535,16 +545,16 @@ pub const Client = struct {
         const atyp = req_hdr[3];
         var addr_buf: [256]u8 = undefined;
         var addr_len: u8 = 0;
-        var target_type: u8 = 0; // 1 = IPv4, 2 = Domain
+        var target_type: u8 = 0;
 
-        if (atyp == 1) { // IPv4
+        if (atyp == 1) {
             target_type = 1;
             addr_len = 4;
             if (!protocol.readExactStream(stream, addr_buf[0..4])) {
                 stream.close();
                 return;
             }
-        } else if (atyp == 3) { // Domain name (socks5h)
+        } else if (atyp == 3) {
             target_type = 2;
             var dlen: [1]u8 = undefined;
             if (!protocol.readExactStream(stream, &dlen)) {
