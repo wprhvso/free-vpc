@@ -5,6 +5,7 @@ FC_VERSION="v1.17.0"
 FC_URL="https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz"
 KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin"
 ROOTFS_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/rootfs/bionic.rootfs.ext4"
+TS_BIN_URL="https://pkgs.tailscale.com/stable/tailscale_1.74.2_amd64.tgz"
 
 setup_kvm() {
   if [ -e /dev/kvm ]; then
@@ -78,12 +79,19 @@ download_assets() {
   if [ ! -f /tmp/fc-assets/base-rootfs.ext4 ]; then
     curl -fsSL -o /tmp/fc-assets/base-rootfs.ext4 "$ROOTFS_URL"
   fi
+  if [ ! -f /tmp/fc-assets/tailscale_bin/tailscale ]; then
+    mkdir -p /tmp/fc-assets/tailscale_extract
+    curl -fsSL "$TS_BIN_URL" | tar -xz -C /tmp/fc-assets/tailscale_extract
+    mkdir -p /tmp/fc-assets/tailscale_bin
+    cp /tmp/fc-assets/tailscale_extract/*/tailscale /tmp/fc-assets/tailscale_extract/*/tailscaled /tmp/fc-assets/tailscale_bin/ 2>/dev/null || true
+    rm -rf /tmp/fc-assets/tailscale_extract
+  fi
 }
 
 spawn_microvm() {
   local vm_id="$1"
-  local vm_ip="$2"
-  local gateway_ip="$3"
+  local vm_ip="${2:-10.200.0.2}"
+  local gateway_ip="${3:-10.200.0.1}"
   local vcpus="${4:-1}"
   local mem_mb="${5:-1024}"
   local tap_name="tap-${vm_id:0:8}"
@@ -106,24 +114,40 @@ spawn_microvm() {
     fi
   fi
 
+  if [ -d /tmp/mnt-"$vm_id"/usr/local/bin ] && [ -d /tmp/fc-assets/tailscale_bin ]; then
+    sudo cp /tmp/fc-assets/tailscale_bin/* /tmp/mnt-"$vm_id"/usr/local/bin/ 2>/dev/null || true
+    sudo chmod +x /tmp/mnt-"$vm_id"/usr/local/bin/tailscale /tmp/mnt-"$vm_id"/usr/local/bin/tailscaled 2>/dev/null || true
+  fi
+
   if [ -d /tmp/mnt-"$vm_id"/etc ]; then
+    local ts_key="${TAILSCALE_AUTH_KEY:-${TAILSCALE_AUTHKEY:-}}"
     cat << AGENTEOF | sudo tee /tmp/mnt-"$vm_id"/etc/rc.local > /dev/null
 #!/bin/sh -e
-(
-  while true; do
-    GUEST_IP=\$(hostname -I 2>/dev/null | awk '{print \$1}')
-    if [ -n "\$GUEST_IP" ]; then
-      FETCHED_KEYS=\$(curl -sf "http://${gateway_ip}:18080/keys?ip=\${GUEST_IP}" 2>/dev/null || true)
-      if [ -n "\$FETCHED_KEYS" ]; then
-        mkdir -p /root/.ssh
-        echo "\$FETCHED_KEYS" >> /root/.ssh/authorized_keys
-        chmod 600 /root/.ssh/authorized_keys
-        break
-      fi
-    fi
-    sleep 1
-  done
-) &
+mkdir -p /var/lib/tailscale /run/tailscale /root/.ssh
+if [ -x /usr/local/bin/tailscaled ]; then
+  /usr/local/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock > /var/log/tailscaled.log 2>&1 &
+  sleep 2
+  /usr/local/bin/tailscale up --authkey="${ts_key}" --hostname="free-vpc-vm-${vm_id:0:8}" --ssh 2>/dev/null || true
+fi
+VM_TS_IP=""
+for i in \$(seq 1 30); do
+  VM_TS_IP=\$(/usr/local/bin/tailscale ip -4 2>/dev/null || hostname -I 2>/dev/null | awk '{print \$1}')
+  if [ -n "\$VM_TS_IP" ]; then
+    break
+  fi
+  sleep 1
+done
+curl -sf "http://${gateway_ip}:18080/report_ip?ip=\${VM_TS_IP}&vm_id=${vm_id}" 2>/dev/null || true
+
+while true; do
+  FETCHED_KEYS=\$(curl -sf "http://${gateway_ip}:18080/keys?ip=\${VM_TS_IP}" 2>/dev/null || true)
+  if [ -n "\$FETCHED_KEYS" ]; then
+    echo "\$FETCHED_KEYS" >> /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    break
+  fi
+  sleep 1
+done &
 exit 0
 AGENTEOF
     sudo chmod +x /tmp/mnt-"$vm_id"/etc/rc.local

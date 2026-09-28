@@ -54,13 +54,11 @@ setup_zswap
 setup_ksm
 
 NODE_NUM="${NODE_ID:-1}"
-X1=$(( 2 + (NODE_NUM - 1) / 256 ))
-X2=$(( (NODE_NUM - 1) % 256 ))
-SUBNET="10.${X1}.${X2}.0/24"
-GATEWAY_IP="10.${X1}.${X2}.1"
+INTERNAL_GATEWAY="10.200.${NODE_NUM}.1"
+INTERNAL_SUBNET="10.200.${NODE_NUM}.0/24"
 
-setup_bridge "$GATEWAY_IP" "$SUBNET"
-start_metadata_server "$GATEWAY_IP" 18080
+setup_bridge "$INTERNAL_GATEWAY" "$INTERNAL_SUBNET"
+start_metadata_server "$INTERNAL_GATEWAY" 18080
 
 curl -fsSL https://tailscale.com/install.sh | sh
 sudo systemctl start tailscaled || sudo tailscaled --state=/var/lib/tailscale/tailscaled.state &
@@ -117,19 +115,16 @@ if [ "$VMS_COUNT" -gt 0 ]; then
       echo "${row}" | base64 --decode | jq -r "${1}"
     }
     VM_ID=$(_jq '.id')
-    VM_IP=$(_jq '.ip')
     VM_VCPUS=$(_jq '.vcpus // 1')
     VM_RAM=$(_jq '.memory_mb // 1024')
     VM_KEYS=$(_jq '.ssh_keys // empty')
     if [ -n "$VM_KEYS" ] && [ "$VM_KEYS" != "null" ]; then
-      echo "$VM_KEYS" | jq -r '.[]' 2>/dev/null > "/tmp/keys_${VM_IP}" || true
+      echo "$VM_KEYS" | jq -r '.[]' 2>/dev/null > "/tmp/keys_${VM_ID}" || true
     fi
-    spawn_microvm "$VM_ID" "$VM_IP" "$GATEWAY_IP" "$VM_VCPUS" "$VM_RAM"
+    spawn_microvm "$VM_ID" "10.200.${NODE_NUM}.2" "$INTERNAL_GATEWAY" "$VM_VCPUS" "$VM_RAM"
   done
 else
-  DEFAULT_VM_IP="10.${X1}.${X2}.2"
-  spawn_microvm "vm-${NODE_NUM}-standby-1" "$DEFAULT_VM_IP" "$GATEWAY_IP" 1 1024 || true
-  spawn_microvm "vm-${NODE_NUM}-standby-2" "10.${X1}.${X2}.3" "$GATEWAY_IP" 1 1024 || true
+  spawn_microvm "vm-${NODE_NUM}-standby" "10.200.${NODE_NUM}.2" "$INTERNAL_GATEWAY" 1 1024 || true
 fi
 
 if [ -n "${GH_PAT:-}" ] && [ -n "${TAILSCALE_IP}" ]; then
@@ -141,7 +136,7 @@ if [ -n "${GH_PAT:-}" ] && [ -n "${TAILSCALE_IP}" ]; then
 fi
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  printf "## Free VPC Online\n- Tailscale IP: \`%s\`\n- Slot: \`#%s\`\n- MicroVM Subnet: \`%s\`\n" "$TAILSCALE_IP" "$NODE_NUM" "$SUBNET" >> "$GITHUB_STEP_SUMMARY"
+  printf "## Free VPC Online\n- Tailscale Host IP: \`%s\`\n- Slot: \`#%s\`\n" "$TAILSCALE_IP" "$NODE_NUM" >> "$GITHUB_STEP_SUMMARY"
 fi
 
 cleanup() {
@@ -158,11 +153,22 @@ while [ $((SECONDS - START_TIME)) -lt 21120 ]; do
     break
   fi
 
+  REPORTED_JSON="[]"
+  for f in /tmp/vm_ip_*; do
+    if [ -f "$f" ]; then
+      F_VM_ID="${f#/tmp/vm_ip_}"
+      F_VM_IP=$(cat "$f" 2>/dev/null || true)
+      if [ -n "$F_VM_IP" ]; then
+        REPORTED_JSON=$(echo "$REPORTED_JSON" | jq --arg vid "$F_VM_ID" --arg vip "$F_VM_IP" '. + [{"vm_id": $vid, "vm_ip": $vip}]')
+      fi
+    fi
+  done
+
   HB_DATA=$(curl -sS -X POST "${WORKER_URL}/api/runner/heartbeat" \
     -H "Content-Type: application/json" \
     -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID:-5a06f20e534be12f4e259e932af57b57.access}" \
     -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET:-cfast_clJJ6Rx6HA0bdn2eXV31EO7UNnApjsLaOOdkWCMe71e2052a}" \
-    -d "{\"slot_id\": ${NODE_NUM}, \"tailscale_ip\": \"${TAILSCALE_IP}\"}" 2>/dev/null || true)
+    -d "{\"slot_id\": ${NODE_NUM}, \"tailscale_ip\": \"${TAILSCALE_IP}\", \"reported_vms\": ${REPORTED_JSON}}" 2>/dev/null || true)
 
   LATEST_KEYS=$(echo "$HB_DATA" | jq '.ssh_keys // []' 2>/dev/null || true)
   if [ -n "$LATEST_KEYS" ] && [ "$LATEST_KEYS" != "null" ]; then
@@ -180,8 +186,10 @@ while [ $((SECONDS - START_TIME)) -lt 21120 ]; do
       TASK_PAYLOAD=$(_tjq '.payload')
 
       if [ "$TASK_TYPE" = "claim" ] || [ "$TASK_TYPE" = "activate_vm" ]; then
+        TASK_VM_ID=$(echo "$TASK_PAYLOAD" | jq -r '.vm_id // empty')
         TASK_IP=$(echo "$TASK_PAYLOAD" | jq -r '.ip // empty')
         echo "$TASK_PAYLOAD" | jq -r '.ssh_keys[]?' 2>/dev/null > "/tmp/keys_${TASK_IP}" || true
+        echo "$TASK_PAYLOAD" | jq -r '.ssh_keys[]?' 2>/dev/null > "/tmp/keys_${TASK_VM_ID}" || true
         curl -sS -X POST "${WORKER_URL}/api/runner/ack" \
           -H "Content-Type: application/json" \
           -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID:-5a06f20e534be12f4e259e932af57b57.access}" \
@@ -189,10 +197,9 @@ while [ $((SECONDS - START_TIME)) -lt 21120 ]; do
           -d "{\"task_id\": \"${TASK_ID}\", \"slot_id\": ${NODE_NUM}}" >/dev/null 2>&1 || true
       elif [ "$TASK_TYPE" = "spawn_standby" ]; then
         SVM_ID=$(echo "$TASK_PAYLOAD" | jq -r '.vm_id')
-        SVM_IP=$(echo "$TASK_PAYLOAD" | jq -r '.ip')
         SVM_VCPUS=$(echo "$TASK_PAYLOAD" | jq -r '.vcpus // 1')
         SVM_RAM=$(echo "$TASK_PAYLOAD" | jq -r '.memory_mb // 1024')
-        spawn_microvm "$SVM_ID" "$SVM_IP" "$GATEWAY_IP" "$SVM_VCPUS" "$SVM_RAM" || true
+        spawn_microvm "$SVM_ID" "10.200.${NODE_NUM}.2" "$INTERNAL_GATEWAY" "$SVM_VCPUS" "$SVM_RAM" || true
         curl -sS -X POST "${WORKER_URL}/api/runner/ack" \
           -H "Content-Type: application/json" \
           -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID:-5a06f20e534be12f4e259e932af57b57.access}" \
