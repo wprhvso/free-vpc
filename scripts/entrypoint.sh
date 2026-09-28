@@ -58,35 +58,12 @@ NODE_NAME="free-vpc-${GITHUB_RUN_ID:-manual}-${NODE_NUM}"
 
 download_assets
 
-cat << 'SBEOF' | sudo tee /tmp/sing-box-server.json > /dev/null
-{
-  "inbounds": [
-    {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "127.0.0.1",
-      "listen_port": 8022,
-      "users": [
-        {"uuid": "00000000-0000-0000-0000-000000000001"}
-      ],
-      "transport": {
-        "type": "grpc",
-        "service_name": "free-vpc"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct",
-      "override_address": "127.0.0.1",
-      "override_port": 22
-    }
-  ]
-}
-SBEOF
+if [ -f "${SCRIPT_DIR}/../bin/cf-proxy" ]; then
+  sudo cp "${SCRIPT_DIR}/../bin/cf-proxy" /usr/local/bin/cf-proxy
+  sudo chmod +x /usr/local/bin/cf-proxy
+fi
 
-/usr/local/bin/sing-box run -c /tmp/sing-box-server.json > /tmp/sing-box.log 2>&1 &
+/usr/local/bin/cf-proxy server --port 8022 > /tmp/cf-proxy.log 2>&1 &
 
 CREATE_RESP=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector" \
   -H "Authorization: Bearer ${CF_API_TOKEN}" \
