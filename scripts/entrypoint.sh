@@ -67,7 +67,6 @@ server {
     grpc_socket_keepalive on;
 
     location / {
-        grpc_buffering off;
         grpc_pass grpc://127.0.0.1:8023;
     }
 }
