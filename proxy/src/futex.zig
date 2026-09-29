@@ -43,6 +43,10 @@ pub const Mutex = struct {
         }
     }
 
+    pub fn tryLock(self: *Mutex) bool {
+        return self.state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null;
+    }
+
     pub fn unlock(self: *Mutex) void {
         if (self.state.swap(0, .release) == 2) {
             Futex.wake(&self.state, 1);

@@ -38,13 +38,13 @@ fn sleepMs(ms: u64) void {
     _ = std.os.linux.syscall2(.nanosleep, @intFromPtr(&ts), 0);
 }
 
-fn setSocketTimeout(fd: i32, seconds: i64) void {
+fn setSocketTimeout(fd: i32, ms: i64) void {
     const tv = extern struct {
         sec: i64,
         usec: i64,
     }{
-        .sec = seconds,
-        .usec = 0,
+        .sec = @divTrunc(ms, 1000),
+        .usec = @rem(ms, 1000) * 1000,
     };
     _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, fd))), 1, 20, @intFromPtr(&tv), @sizeOf(@TypeOf(tv)));
     _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, fd))), 1, 21, @intFromPtr(&tv), @sizeOf(@TypeOf(tv)));
@@ -340,6 +340,7 @@ const PoolSocket = struct {
     id: usize,
     conn: ?*RemoteConnection = null,
     created_at: u64 = 0,
+    last_active_at: u64 = 0,
     in_use: bool = false,
     mutex: futex.Mutex = .{},
 };
@@ -356,7 +357,7 @@ pub const Client = struct {
     next_stream_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     pool: [Config.client.pool_size]PoolSocket = undefined,
     gen_counter: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
-    baton_mutex: futex.Mutex = .{},
+    baton_in_flight: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Client {
         const uq = FrameQueue.init(allocator, Config.common.queue_capacity) catch unreachable;
@@ -401,7 +402,7 @@ pub const Client = struct {
         errdefer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, fd))));
 
         protocol.setNoDelay(fd);
-        setSocketTimeout(fd, 5);
+        setSocketTimeout(fd, 2500);
 
         const conn_rc = std.os.linux.syscall3(.connect, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&self.remote_addr), @sizeOf(sockaddr_in));
         if (@as(isize, @bitCast(conn_rc)) < 0) return error.ConnectFailed;
@@ -452,26 +453,30 @@ pub const Client = struct {
         while (true) {
             _ = self.upstream_queue.waitData(Config.client.idle_interval_ms);
             self.executeBatonRound();
-            sleepMs(50);
+            sleepMs(20);
         }
     }
 
     fn acquireAvailableSocket(self: *Client) ?*PoolSocket {
+        const now = getMilliTimestamp();
         for (0..Config.client.pool_size) |i| {
             const s = &self.pool[i];
             s.mutex.lock();
             if (!s.in_use) {
+                if (s.conn != null and s.last_active_at > 0 and now >= s.last_active_at + 3500) {
+                    s.conn.?.close();
+                    s.conn = null;
+                }
+
                 s.in_use = true;
                 if (s.conn == null) {
                     s.conn = self.connectRemote() catch {
                         s.in_use = false;
                         s.mutex.unlock();
-                        var err_data: [64]u8 = undefined;
-                        const err_slice = std.fmt.bufPrint(&err_data, "{{\"idx\":{d},\"error\":\"on_demand_connect_failed\"}}", .{i}) catch "{}";
-                        clientLog("error", "pool", "socket_connect_failed", 0, err_slice);
                         continue;
                     };
-                    s.created_at = getMilliTimestamp();
+                    s.created_at = now;
+                    s.last_active_at = now;
                     var conn_data: [64]u8 = undefined;
                     const conn_slice = std.fmt.bufPrint(&conn_data, "{{\"idx\":{d},\"on_demand\":true}}", .{i}) catch "{}";
                     clientLog("debug", "pool", "socket_connected", 0, conn_slice);
@@ -485,15 +490,29 @@ pub const Client = struct {
     }
 
     fn executeBatonRound(self: *Client) void {
-        self.baton_mutex.lock();
-        defer self.baton_mutex.unlock();
+        if (self.baton_in_flight.swap(true, .acquire)) return;
 
-        const target_sock = self.acquireAvailableSocket() orelse return;
+        const target_sock = self.acquireAvailableSocket() orelse {
+            self.baton_in_flight.store(false, .release);
+            return;
+        };
 
+        const th = std.Thread.spawn(.{}, executeBatonRoundWorker, .{ self, target_sock }) catch {
+            target_sock.mutex.lock();
+            target_sock.in_use = false;
+            target_sock.mutex.unlock();
+            self.baton_in_flight.store(false, .release);
+            return;
+        };
+        th.detach();
+    }
+
+    fn executeBatonRoundWorker(self: *Client, target_sock: *PoolSocket) void {
         const send_buf = self.allocator.alloc(u8, Config.common.http_chunk_size) catch {
             target_sock.mutex.lock();
             target_sock.in_use = false;
             target_sock.mutex.unlock();
+            self.baton_in_flight.store(false, .release);
             return;
         };
         defer self.allocator.free(send_buf);
@@ -521,6 +540,8 @@ pub const Client = struct {
 
         const start_time = getMilliTimestamp();
         var conn = target_sock.conn.?;
+        setSocketTimeout(conn.fd, 1500);
+
         const send_ok = blk: {
             conn.writeAll(hdrs) catch break :blk false;
             if (batch_len > 0) {
@@ -536,6 +557,7 @@ pub const Client = struct {
             target_sock.mutex.lock();
             target_sock.in_use = false;
             target_sock.mutex.unlock();
+            self.baton_in_flight.store(false, .release);
             return;
         }
 
@@ -547,10 +569,15 @@ pub const Client = struct {
             target_sock.mutex.lock();
             target_sock.in_use = false;
             target_sock.mutex.unlock();
+            self.baton_in_flight.store(false, .release);
             return;
         };
 
         self.upstream_queue.commitBatch(batch_len);
+        self.baton_in_flight.store(false, .release);
+
+        target_sock.last_active_at = getMilliTimestamp();
+        setSocketTimeout(conn.fd, 4000);
 
         const rtt = getMilliTimestamp() - start_time;
         const first_line = resp_hdrs[0 .. std.mem.indexOf(u8, resp_hdrs, "\r\n") orelse resp_hdrs.len];
@@ -558,19 +585,14 @@ pub const Client = struct {
         const resp_slice = std.fmt.bufPrint(&resp_log, "{{\"idx\":{d},\"gen\":{d},\"status\":\"{s}\",\"rtt_ms\":{d}}}", .{ target_sock.id, gen, first_line, rtt }) catch "{}";
         clientLog("info", "baton", "response_headers", 0, resp_slice);
 
-        const th = std.Thread.spawn(.{}, streamReaderWorker, .{ self, target_sock, gen }) catch {
-            target_sock.mutex.lock();
-            target_sock.in_use = false;
-            target_sock.mutex.unlock();
-            return;
-        };
-        th.detach();
+        self.streamReaderWorker(target_sock, gen);
     }
 
     fn streamReaderWorker(self: *Client, ps: *PoolSocket, gen: u32) void {
         defer {
             ps.mutex.lock();
             ps.in_use = false;
+            ps.last_active_at = getMilliTimestamp();
             ps.mutex.unlock();
         }
 
@@ -619,6 +641,7 @@ pub const Client = struct {
                 break;
             };
 
+            ps.last_active_at = getMilliTimestamp();
             self.dispatchFrames(read_chunk[0..chunk_len]);
         }
     }
@@ -635,6 +658,7 @@ pub const Client = struct {
             s.conn = self.connectRemote() catch null;
             if (s.conn != null) {
                 s.created_at = getMilliTimestamp();
+                s.last_active_at = s.created_at;
                 var conn_data: [64]u8 = undefined;
                 const conn_slice = std.fmt.bufPrint(&conn_data, "{{\"idx\":{d}}}", .{id}) catch "{}";
                 clientLog("debug", "pool", "socket_connected", 0, conn_slice);

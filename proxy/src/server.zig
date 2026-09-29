@@ -38,6 +38,50 @@ fn setSocketTimeout(fd: i32, seconds: i64) void {
     _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, fd))), 1, 21, @intFromPtr(&tv), @sizeOf(@TypeOf(tv)));
 }
 
+const DnsCacheEntry = struct {
+    domain: [128]u8,
+    domain_len: usize,
+    ip: [4]u8,
+    expires_at: u64,
+};
+
+var dns_cache: [64]DnsCacheEntry = undefined;
+var dns_cache_len: usize = 0;
+var dns_cache_mutex: futex.Mutex = .{};
+
+fn resolveDnsCached(domain: []const u8, out_ip: *[4]u8) bool {
+    const now = getMilliTimestamp();
+    dns_cache_mutex.lock();
+    for (dns_cache[0..dns_cache_len]) |entry| {
+        if (entry.domain_len == domain.len and std.mem.eql(u8, entry.domain[0..entry.domain_len], domain)) {
+            if (now < entry.expires_at) {
+                out_ip.* = entry.ip;
+                dns_cache_mutex.unlock();
+                return true;
+            }
+        }
+    }
+    dns_cache_mutex.unlock();
+
+    if (!protocol.resolveDnsA(domain, out_ip)) return false;
+
+    dns_cache_mutex.lock();
+    defer dns_cache_mutex.unlock();
+    if (domain.len <= 128) {
+        var target_idx = dns_cache_len;
+        if (target_idx >= dns_cache.len) {
+            target_idx = 0;
+        } else {
+            dns_cache_len += 1;
+        }
+        @memcpy(dns_cache[target_idx].domain[0..domain.len], domain);
+        dns_cache[target_idx].domain_len = domain.len;
+        dns_cache[target_idx].ip = out_ip.*;
+        dns_cache[target_idx].expires_at = now + 60_000;
+    }
+    return true;
+}
+
 const StreamState = struct {
     stream: protocol.SocketStream,
     expected_seq: u32 = 1,
@@ -373,7 +417,7 @@ pub const Server = struct {
             self.emitRemoteLog("info", "dns", "start", stream_id, dns_start_slice);
 
             const start_dns = getMilliTimestamp();
-            if (!protocol.resolveDnsA(raw_addr, &octets)) {
+            if (!resolveDnsCached(raw_addr, &octets)) {
                 self.emitRemoteLog("error", "dns", "failed", stream_id, "{\"error\":\"resolve_timeout\"}");
                 self.sendClose(stream_id);
                 return;
