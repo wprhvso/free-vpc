@@ -72,7 +72,19 @@ server {
     }
 }
 NGINXEOF
-sudo systemctl restart nginx || sudo service nginx restart || true
+
+if ! sudo nginx -t; then
+    echo "ERROR: nginx configuration test failed!" >&2
+    exit 1
+fi
+
+if ! sudo systemctl restart nginx; then
+    echo "ERROR: failed to start nginx! Showing status and journal logs:" >&2
+    sudo systemctl status nginx.service --no-pager -l >&2 || true
+    sudo journalctl -xeu nginx.service --no-pager -n 100 >&2 || true
+    sudo cat /var/log/nginx/error.log >&2 || true
+    exit 1
+fi
 
 setup_kvm
 setup_zswap
