@@ -19,6 +19,35 @@ pub const Flags = struct {
     pub const END_HEADERS: u8 = 0x04;
 };
 
+pub fn encodeClientWsHeaders(dest: []u8, host: []const u8, path: []const u8) usize {
+    var idx: usize = 0;
+    // :method: CONNECT (Indexed 2)
+    dest[idx] = 0x82; idx += 1;
+    // :protocol: websocket (Literal without indexing, new name)
+    dest[idx] = 0x00; idx += 1;
+    dest[idx] = 9; idx += 1;
+    @memcpy(dest[idx .. idx + 9], ":protocol"); idx += 9;
+    dest[idx] = 9; idx += 1;
+    @memcpy(dest[idx .. idx + 9], "websocket"); idx += 9;
+    // :scheme: https (Indexed 7)
+    dest[idx] = 0x87; idx += 1;
+    // :path
+    dest[idx] = 0x04; idx += 1;
+    dest[idx] = @intCast(path.len); idx += 1;
+    @memcpy(dest[idx .. idx + path.len], path); idx += path.len;
+    // :authority
+    dest[idx] = 0x01; idx += 1;
+    dest[idx] = @intCast(host.len); idx += 1;
+    @memcpy(dest[idx .. idx + host.len], host); idx += host.len;
+    // sec-websocket-version: 13
+    dest[idx] = 0x00; idx += 1;
+    dest[idx] = 21; idx += 1;
+    @memcpy(dest[idx .. idx + 21], "sec-websocket-version"); idx += 21;
+    dest[idx] = 2; idx += 1;
+    @memcpy(dest[idx .. idx + 2], "13"); idx += 2;
+    return idx;
+}
+
 pub const FrameHeader = struct {
     length: u24,
     frame_type: u8,

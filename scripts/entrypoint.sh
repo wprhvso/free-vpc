@@ -6,7 +6,7 @@ source "${SCRIPT_DIR}/firecracker_manager.sh"
 
 CF_TUNNEL_TOKEN="${CF_TUNNEL_TOKEN:-eyJhIjoiMzlmNjg1OGY5YjU4NjU2NTJhYzY5YzUwNmVjNDczNmMiLCJ0IjoiYTcxZDM2OTctMGI3Ny00YjQzLWE4MWEtMDYyNmQ2NWMwNjliIiwicyI6Ik16ZzRaak13TWprdE1qSmhZaTAwWWpaaExXRXdPVGt0TlRsbE9URTBNMk13WTJWbCJ9}"
 
-sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd sudo iptables e2fsprogs nginx
+sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd sudo iptables e2fsprogs
 
 sudo mkdir -p /etc/ssh /etc/ssh/sshd_config.d
 if [ -n "${SSH_HOST_ED25519_KEY:-}" ]; then
@@ -49,42 +49,6 @@ echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner-nopasswd
 sudo chmod 440 /etc/sudoers.d/runner-nopasswd
 sudo systemctl restart ssh || sudo service ssh restart || true
 
-sudo mkdir -p /etc/nginx/ssl
-sudo openssl req -x509 -newkey rsa:2048 -nodes -keyout /etc/nginx/ssl/server.key -out /etc/nginx/ssl/server.crt -days 3650 -subj "/CN=localhost"
-sudo rm -f /etc/nginx/sites-enabled/default
-cat <<'NGINXEOF' | sudo tee /etc/nginx/conf.d/grpc_proxy.conf >/dev/null
-server {
-    listen 8022 ssl http2;
-    listen 8443 ssl http2;
-    server_name _;
-
-    ssl_certificate /etc/nginx/ssl/server.crt;
-    ssl_certificate_key /etc/nginx/ssl/server.key;
-
-    client_max_body_size 0;
-    grpc_read_timeout 1d;
-    grpc_send_timeout 1d;
-    grpc_socket_keepalive on;
-
-    location / {
-        grpc_pass grpc://127.0.0.1:8023;
-    }
-}
-NGINXEOF
-
-if ! sudo nginx -t; then
-    echo "ERROR: nginx configuration test failed!" >&2
-    exit 1
-fi
-
-if ! sudo systemctl restart nginx; then
-    echo "ERROR: failed to start nginx! Showing status and journal logs:" >&2
-    sudo systemctl status nginx.service --no-pager -l >&2 || true
-    sudo journalctl -xeu nginx.service --no-pager -n 100 >&2 || true
-    sudo cat /var/log/nginx/error.log >&2 || true
-    exit 1
-fi
-
 setup_kvm
 setup_zswap
 setup_ksm
@@ -124,14 +88,10 @@ if ! nc -z 127.0.0.1 8023; then
     echo "ERROR: cf-proxy-server port 8023 is not reachable!" >&2
     exit 1
 fi
-if ! nc -z 127.0.0.1 8022; then
-    echo "ERROR: nginx port 8022 is not reachable!" >&2
-    exit 1
-fi
 
 if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
-    echo "Starting cloudflared named tunnel with no-tls-verify and http2-origin..."
-    TUNNEL_ORIGIN_ENABLE_HTTP2=true NO_TLS_VERIFY=true /usr/local/bin/cloudflared tunnel --no-tls-verify --http2-origin run --token "${CF_TUNNEL_TOKEN}" >/tmp/cf_named_tunnel.log 2>&1 &
+    echo "Starting cloudflared named tunnel..."
+    /usr/local/bin/cloudflared tunnel run --token "${CF_TUNNEL_TOKEN}" >/tmp/cf_named_tunnel.log 2>&1 &
     sleep 3
 fi
 
