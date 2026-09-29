@@ -2,6 +2,7 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const futex = @import("futex.zig");
 const Config = @import("config.zig").Config;
+const logger = @import("logger.zig");
 
 const sockaddr_in = extern struct {
     family: u16 = 2,
@@ -20,6 +21,14 @@ const ServerStream = struct {
     target_stream: protocol.SocketStream,
     active: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 };
+
+var global_server_instance: ?*Server = null;
+
+fn serverLogHook(line: []const u8) void {
+    if (global_server_instance) |s| {
+        s.sendTunnelPacket(.log, 0, line) catch {};
+    }
+}
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -42,12 +51,24 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        global_server_instance = null;
+        logger.setHook(null);
         self.streams.deinit();
     }
 
     pub fn start(self: *Server) !void {
+        global_server_instance = self;
+        logger.setHook(serverLogHook);
+
+        logger.json(.info, "lifecycle", "starting", "{{\"bind_host\":\"{s}\",\"bind_port\":{d}}}", .{
+            Config.server_bind_host, Config.server_bind_port,
+        });
+
         const rc = std.os.linux.syscall3(.socket, 2, 1, 0);
-        if (@as(isize, @bitCast(rc)) < 0) return error.SocketFailed;
+        if (@as(isize, @bitCast(rc)) < 0) {
+            logger.json(.err, "tcp", "socket_failed", "{{\"rc\":{d}}}", .{@as(isize, @bitCast(rc))});
+            return error.SocketFailed;
+        }
         const listen_fd: i32 = @intCast(rc);
         defer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, listen_fd))));
 
@@ -62,10 +83,21 @@ pub const Server = struct {
             .port = std.mem.nativeToBig(u16, Config.server_bind_port),
             .addr = @as(u32, @bitCast(octets)),
         };
-        _ = std.os.linux.syscall3(.bind, @as(usize, @bitCast(@as(isize, listen_fd))), @intFromPtr(&addr), @sizeOf(sockaddr_in));
-        _ = std.os.linux.syscall2(.listen, @as(usize, @bitCast(@as(isize, listen_fd))), 128);
+        const bind_rc = std.os.linux.syscall3(.bind, @as(usize, @bitCast(@as(isize, listen_fd))), @intFromPtr(&addr), @sizeOf(sockaddr_in));
+        if (@as(isize, @bitCast(bind_rc)) < 0) {
+            logger.json(.err, "tcp", "bind_failed", "{{\"rc\":{d}}}", .{@as(isize, @bitCast(bind_rc))});
+            return error.BindFailed;
+        }
 
-        _ = std.os.linux.syscall3(.write, 1, @intFromPtr("[SERVER] Listening for Nginx H2C on 127.0.0.1:8023...\n"), 55);
+        const listen_rc = std.os.linux.syscall2(.listen, @as(usize, @bitCast(@as(isize, listen_fd))), 128);
+        if (@as(isize, @bitCast(listen_rc)) < 0) {
+            logger.json(.err, "tcp", "listen_failed", "{{\"rc\":{d}}}", .{@as(isize, @bitCast(listen_rc))});
+            return error.ListenFailed;
+        }
+
+        logger.json(.info, "tcp", "listen_ok", "{{\"host\":\"{s}\",\"port\":{d}}}", .{
+            Config.server_bind_host, Config.server_bind_port,
+        });
 
         while (self.running.load(.acquire)) {
             var client_addr: sockaddr = undefined;
@@ -74,11 +106,13 @@ pub const Server = struct {
             if (@as(isize, @bitCast(accept_rc)) < 0) continue;
             const client_fd: i32 = @intCast(accept_rc);
 
+            logger.json(.info, "tcp", "accepted", "{{\"fd\":{d}}}", .{client_fd});
             protocol.setNoDelay(client_fd);
             const stream = protocol.SocketStream{ .handle = client_fd };
 
             var preface_buf: [24]u8 = undefined;
             if (!protocol.readExactStream(stream, &preface_buf)) {
+                logger.json(.warn, "h2_rx", "read_preface_failed", "{{\"fd\":{d}}}", .{client_fd});
                 stream.close();
                 continue;
             }
@@ -141,7 +175,13 @@ pub const Server = struct {
     }
 
     fn h2ServerLoop(self: *Server, stream: protocol.SocketStream) void {
-        defer stream.close();
+        defer {
+            self.write_mutex.lock();
+            self.h2_stream = null;
+            self.write_mutex.unlock();
+            stream.close();
+            logger.json(.warn, "h2_session", "server_loop_terminated", "{{}}", .{});
+        }
         var hdr_buf: [9]u8 = undefined;
 
         while (self.running.load(.acquire)) {
@@ -154,7 +194,12 @@ pub const Server = struct {
 
             switch (frame.frame_type) {
                 protocol.FrameType.HEADERS => {
-                    self.h2_stream_id = frame.stream_id;
+                    if (frame.stream_id != 0) {
+                        self.h2_stream_id = frame.stream_id;
+                    }
+                    logger.json(.info, "h2_rx", "headers_received", "{{\"stream_id\":{d},\"len\":{d}}}", .{
+                        frame.stream_id, frame.length,
+                    });
                     var resp_buf: [64]u8 = undefined;
                     const r_len = protocol.encodeServerGrpcHeaders(&resp_buf);
                     self.sendH2Frame(.{
@@ -165,7 +210,9 @@ pub const Server = struct {
                     }, resp_buf[0..r_len]) catch break;
                 },
                 protocol.FrameType.DATA => {
-                    self.h2_stream_id = frame.stream_id;
+                    if (frame.stream_id != 0) {
+                        self.h2_stream_id = frame.stream_id;
+                    }
                     self.handleIncomingData(payload);
 
                     self.accumulated_window += frame.length;
@@ -195,6 +242,14 @@ pub const Server = struct {
                         }, payload) catch {};
                     }
                 },
+                protocol.FrameType.RST_STREAM => {
+                    logger.json(.warn, "h2_rx", "rst_stream", "{{\"stream_id\":{d}}}", .{frame.stream_id});
+                    break;
+                },
+                protocol.FrameType.GOAWAY => {
+                    logger.json(.warn, "h2_rx", "goaway", "{{\"stream_id\":{d}}}", .{frame.stream_id});
+                    break;
+                },
                 else => {},
             }
         }
@@ -213,6 +268,7 @@ pub const Server = struct {
 
     fn handleIncomingData(self: *Server, data: []const u8) void {
         if (self.rx_len + data.len > self.rx_buf.len) {
+            logger.json(.err, "tunnel_rx", "rx_buffer_overflow", "{{\"rx_len\":{d},\"incoming\":{d}}}", .{ self.rx_len, data.len });
             self.rx_len = 0;
             return;
         }
@@ -254,9 +310,14 @@ pub const Server = struct {
                         s.target_stream.writeAll(payload) catch {
                             self.closeStream(th.stream_id);
                         };
+                    } else {
+                        logger.json(.warn, "tunnel_rx", "orphan_stream", "{{\"stream_id\":{d},\"cmd\":4}}", .{th.stream_id});
                     }
                 },
-                .close => self.closeStream(th.stream_id),
+                .close => {
+                    logger.json(.info, "stream", "remote_close", "{{\"stream_id\":{d}}}", .{th.stream_id});
+                    self.closeStream(th.stream_id);
+                },
                 else => {},
             }
         }
@@ -271,15 +332,24 @@ pub const Server = struct {
     }
 
     fn handleConnect(self: *Server, stream_id: u32, payload: []const u8) void {
-        const th = std.Thread.spawn(.{}, connectWorker, .{ self, stream_id, payload }) catch {
+        const payload_copy = self.allocator.dupe(u8, payload) catch {
+            self.sendTunnelPacket(.connect_fail, stream_id, "") catch {};
+            return;
+        };
+
+        const th = std.Thread.spawn(.{}, connectWorker, .{ self, stream_id, payload_copy }) catch {
+            self.allocator.free(payload_copy);
             self.sendTunnelPacket(.connect_fail, stream_id, "") catch {};
             return;
         };
         th.detach();
     }
 
-    fn connectWorker(self: *Server, stream_id: u32, payload: []const u8) void {
+    fn connectWorker(self: *Server, stream_id: u32, payload: []u8) void {
+        defer self.allocator.free(payload);
+
         if (payload.len < 5) {
+            logger.json(.err, "stream", "connect_fail", "{{\"stream_id\":{d},\"reason\":\"payload_too_short\"}}", .{stream_id});
             self.sendTunnelPacket(.connect_fail, stream_id, "") catch {};
             return;
         }
@@ -304,10 +374,15 @@ pub const Server = struct {
             const domain = payload[2 .. 2 + dlen];
             port = std.mem.readInt(u16, payload[2 + dlen ..][0..2], .big);
 
+            logger.json(.debug, "dns", "resolve_start", "{{\"stream_id\":{d},\"domain\":\"{s}\"}}", .{ stream_id, domain });
             if (!protocol.resolveDnsA(domain, &octets)) {
+                logger.json(.err, "dns", "resolve_failed", "{{\"stream_id\":{d},\"domain\":\"{s}\"}}", .{ stream_id, domain });
                 self.sendTunnelPacket(.connect_fail, stream_id, "") catch {};
                 return;
             }
+            logger.json(.info, "dns", "resolve_ok", "{{\"stream_id\":{d},\"domain\":\"{s}\",\"ip\":\"{d}.{d}.{d}.{d}\"}}", .{
+                stream_id, domain, octets[0], octets[1], octets[2], octets[3],
+            });
         } else {
             self.sendTunnelPacket(.connect_fail, stream_id, "") catch {};
             return;
@@ -315,11 +390,18 @@ pub const Server = struct {
 
         const rc = std.os.linux.syscall3(.socket, 2, 1, 0);
         if (@as(isize, @bitCast(rc)) < 0) {
+            logger.json(.err, "tcp", "socket_failed", "{{\"stream_id\":{d},\"rc\":{d}}}", .{ stream_id, @as(isize, @bitCast(rc)) });
             self.sendTunnelPacket(.connect_fail, stream_id, "") catch {};
             return;
         }
         const target_fd: i32 = @intCast(rc);
         protocol.setNoDelay(target_fd);
+
+        // Set socket timeout 5s for connect / recv
+        const timeval = extern struct { sec: i64, usec: i64 };
+        const tv = timeval{ .sec = 5, .usec = 0 };
+        _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, target_fd))), 1, 20, @intFromPtr(&tv), @sizeOf(timeval)); // SO_RCVTIMEO
+        _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, target_fd))), 1, 21, @intFromPtr(&tv), @sizeOf(timeval)); // SO_SNDTIMEO
 
         const target_addr = sockaddr_in{
             .family = 2,
@@ -327,12 +409,16 @@ pub const Server = struct {
             .addr = @as(u32, @bitCast(octets)),
         };
 
+        logger.json(.debug, "tcp", "connect_start", "{{\"stream_id\":{d},\"fd\":{d},\"port\":{d}}}", .{ stream_id, target_fd, port });
         const conn_rc = std.os.linux.syscall3(.connect, @as(usize, @bitCast(@as(isize, target_fd))), @intFromPtr(&target_addr), @sizeOf(sockaddr_in));
         if (@as(isize, @bitCast(conn_rc)) < 0) {
+            logger.json(.err, "tcp", "connect_failed", "{{\"stream_id\":{d},\"rc\":{d}}}", .{ stream_id, @as(isize, @bitCast(conn_rc)) });
             _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, target_fd))));
             self.sendTunnelPacket(.connect_fail, stream_id, "") catch {};
             return;
         }
+
+        logger.json(.info, "stream", "connect_ok", "{{\"stream_id\":{d},\"fd\":{d}}}", .{ stream_id, target_fd });
 
         const target_stream = protocol.SocketStream{ .handle = target_fd };
         const s = self.allocator.create(ServerStream) catch return;
@@ -369,9 +455,11 @@ pub const Server = struct {
         if (removed) |entry| {
             const s = entry.value;
             if (s.active.swap(false, .acq_rel)) {
+                logger.json(.info, "stream", "closing", "{{\"stream_id\":{d}}}", .{stream_id});
                 s.target_stream.shutdown();
                 s.target_stream.close();
                 self.sendTunnelPacket(.close, stream_id, "") catch {};
+                self.allocator.destroy(s);
             }
         }
     }

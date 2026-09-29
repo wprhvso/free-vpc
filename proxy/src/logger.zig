@@ -1,6 +1,18 @@
 const std = @import("std");
 const futex = @import("futex.zig");
 
+pub const Role = enum {
+    client,
+    server,
+
+    pub fn asStr(self: Role) []const u8 {
+        return switch (self) {
+            .client => "client",
+            .server => "server",
+        };
+    }
+};
+
 pub const Level = enum {
     debug,
     info,
@@ -17,7 +29,19 @@ pub const Level = enum {
     }
 };
 
+pub const LogHook = *const fn (line: []const u8) void;
+
 var log_mutex: futex.Mutex = .{};
+var global_role: Role = .client;
+var global_hook: ?LogHook = null;
+
+pub fn setRole(role: Role) void {
+    global_role = role;
+}
+
+pub fn setHook(hook: ?LogHook) void {
+    global_hook = hook;
+}
 
 fn getMilliTimestamp() u64 {
     const timespec = extern struct {
@@ -46,9 +70,10 @@ pub fn json(
 
     const line = std.fmt.bufPrint(
         &raw_buf,
-        "{{\"ts\":{d},\"level\":\"{s}\",\"subsys\":\"{s}\",\"event\":\"{s}\",\"data\":{s}}}\n",
+        "{{\"ts\":{d},\"role\":\"{s}\",\"level\":\"{s}\",\"subsys\":\"{s}\",\"event\":\"{s}\",\"data\":{s}}}\n",
         .{
             getMilliTimestamp(),
+            global_role.asStr(),
             level.asStr(),
             subsys,
             event,
@@ -62,4 +87,10 @@ pub fn json(
         @intFromPtr(line.ptr),
         line.len,
     );
+
+    if (global_hook) |hook| {
+        // Drop trailing newline when transmitting over tunnel
+        const payload = if (line.len > 0 and line[line.len - 1] == '\n') line[0 .. line.len - 1] else line;
+        hook(payload);
+    }
 }

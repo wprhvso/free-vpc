@@ -359,6 +359,10 @@ pub const Client = struct {
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
 
+        if (!self.running.load(.acquire) or self.remote_conn == null) {
+            return error.NotConnected;
+        }
+
         var h_buf: [9]u8 = undefined;
         hdr.serialize(&h_buf);
 
@@ -366,12 +370,17 @@ pub const Client = struct {
             hdr.frame_type, hdr.flags, hdr.stream_id, hdr.length,
         });
 
-        try self.remote_conn.?.tls_client.?.writer.writeAll(&h_buf);
-        if (payload.len > 0) {
-            try self.remote_conn.?.tls_client.?.writer.writeAll(payload);
+        const conn = self.remote_conn orelse return error.NotConnected;
+        if (conn.tls_client) |*tls_cl| {
+            try tls_cl.writer.writeAll(&h_buf);
+            if (payload.len > 0) {
+                try tls_cl.writer.writeAll(payload);
+            }
+            try tls_cl.writer.flush();
+            try conn.direct_writer.writer.flush();
+        } else {
+            return error.NotConnected;
         }
-        try self.remote_conn.?.tls_client.?.writer.flush();
-        try self.remote_conn.?.direct_writer.writer.flush();
     }
 
     pub fn sendTunnelPacket(self: *Client, cmd: protocol.TunnelCmd, stream_id: u32, payload: []const u8) !void {
@@ -478,6 +487,10 @@ pub const Client = struct {
                         }, payload) catch {};
                     }
                 },
+                protocol.FrameType.WINDOW_UPDATE => {
+                    const inc = if (payload.len >= 4) std.mem.readInt(u32, payload[0..4], .big) & 0x7FFFFFFF else 0;
+                                        logger.json(.debug, "h2_rx", "window_update_received", "{{\"stream_id\":{d},\"increment\":{d}}}", .{ frame.stream_id, inc });
+                },
                 protocol.FrameType.RST_STREAM => {
                     const error_code = if (payload.len >= 4) std.mem.readInt(u32, payload[0..4], .big) else 0;
                     logger.json(.err, "h2_rx", "rst_stream", "{{\"stream_id\":{d},\"error_code\":{d}}}", .{ frame.stream_id, error_code });
@@ -499,6 +512,17 @@ pub const Client = struct {
 
         logger.json(.err, "h2_session", "reader_loop_terminated", "{{}}", .{});
         self.running.store(false, .release);
+
+        self.streams_mutex.lock();
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            const s = entry.value_ptr.*;
+            if (s.active.swap(false, .acq_rel)) {
+                s.stream.close();
+                s.connected_event.set();
+            }
+        }
+        self.streams_mutex.unlock();
     }
 
     fn sendWindowUpdate(self: *Client, stream_id: u31, increment: u32) !void {
@@ -557,7 +581,11 @@ pub const Client = struct {
             const s_opt = self.streams.get(th.stream_id);
             self.streams_mutex.unlock();
 
-            if (s_opt) |s| {
+            if (th.cmd == .log) {
+                _ = std.os.linux.syscall3(.write, 2, @intFromPtr(payload.ptr), payload.len);
+                const nl: [1]u8 = .{10};
+                _ = std.os.linux.syscall3(.write, 2, @intFromPtr(&nl), 1);
+            } else if (s_opt) |s| {
                 switch (th.cmd) {
                     .connect_ok => {
                         logger.json(.info, "stream", "connect_ok", "{{\"stream_id\":{d}}}", .{th.stream_id});

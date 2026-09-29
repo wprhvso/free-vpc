@@ -89,6 +89,7 @@ pub const TunnelCmd = enum(u8) {
     connect_fail = 3,
     data = 4,
     close = 5,
+    log = 6,
     _,
 };
 
