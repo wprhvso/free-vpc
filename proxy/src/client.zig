@@ -252,7 +252,9 @@ pub const Client = struct {
         const uq = FrameQueue.init(allocator, Config.common.queue_capacity) catch unreachable;
 
         var octets: [4]u8 = .{ 127, 0, 0, 1 };
-        _ = protocol.resolveDnsA(Config.client.remote_host, &octets);
+        if (!protocol.resolveDnsA(Config.client.remote_host, &octets)) {
+            @panic("DNS resolution failed! Check /etc/resolv.conf");
+        }
 
         const r_addr = sockaddr_in{
             .family = 2,

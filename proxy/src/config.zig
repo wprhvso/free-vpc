@@ -23,7 +23,7 @@ pub const Config = struct {
         pub const socket_ttl_ms: u64 = 10_000;
         pub const idle_interval_ms: u64 = 1_000;
 
-        pub const user_agent: []const u8 = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+        pub const user_agent: []const u8 = "curl/8.21.0";
         pub const connect_timeout_ms: u64 = 8_000;
         pub const reorder_limit: usize = 512;
     };
