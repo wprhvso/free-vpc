@@ -49,32 +49,21 @@ pub const FrameHeader = struct {
     }
 };
 
-/// Генерация статического HPACK блока для запроса gRPC клиента (RFC 7541)
 pub fn encodeClientGrpcHeaders(dest: []u8, host: []const u8, path: []const u8) usize {
     var idx: usize = 0;
-    // :method: POST (Indexed 3)
     dest[idx] = 0x83; idx += 1;
-    // :scheme: https (Indexed 7)
     dest[idx] = 0x87; idx += 1;
-    // :path
-    dest[idx] = 0x00; idx += 1;
-    dest[idx] = 5; idx += 1;
-    @memcpy(dest[idx .. idx + 5], ":path"); idx += 5;
+    dest[idx] = 0x04; idx += 1;
     dest[idx] = @intCast(path.len); idx += 1;
     @memcpy(dest[idx .. idx + path.len], path); idx += path.len;
-    // :authority
-    dest[idx] = 0x00; idx += 1;
-    dest[idx] = 10; idx += 1;
-    @memcpy(dest[idx .. idx + 10], ":authority"); idx += 10;
+    dest[idx] = 0x01; idx += 1;
     dest[idx] = @intCast(host.len); idx += 1;
     @memcpy(dest[idx .. idx + host.len], host); idx += host.len;
-    // content-type: application/grpc
     dest[idx] = 0x00; idx += 1;
     dest[idx] = 12; idx += 1;
     @memcpy(dest[idx .. idx + 12], "content-type"); idx += 12;
     dest[idx] = 16; idx += 1;
     @memcpy(dest[idx .. idx + 16], "application/grpc"); idx += 16;
-    // te: trailers
     dest[idx] = 0x00; idx += 1;
     dest[idx] = 2; idx += 1;
     @memcpy(dest[idx .. idx + 2], "te"); idx += 2;
@@ -83,12 +72,9 @@ pub fn encodeClientGrpcHeaders(dest: []u8, host: []const u8, path: []const u8) u
     return idx;
 }
 
-/// Генерация ответа сервера gRPC 200 OK
 pub fn encodeServerGrpcHeaders(dest: []u8) usize {
     var idx: usize = 0;
-    // :status: 200 (Indexed 8)
     dest[idx] = 0x88; idx += 1;
-    // content-type: application/grpc
     dest[idx] = 0x00; idx += 1;
     dest[idx] = 12; idx += 1;
     @memcpy(dest[idx .. idx + 12], "content-type"); idx += 12;
@@ -97,7 +83,6 @@ pub fn encodeServerGrpcHeaders(dest: []u8) usize {
     return idx;
 }
 
-// Внутренний протокол туннелирования (12 байт заголовок)
 pub const TunnelCmd = enum(u8) {
     connect = 1,
     connect_ok = 2,
@@ -108,7 +93,7 @@ pub const TunnelCmd = enum(u8) {
 };
 
 pub const TunnelHeader = extern struct {
-    magic: u16 = 0x5650, // "VP"
+    magic: u16 = 0x5650,
     cmd: TunnelCmd,
     reserved: u8 = 0,
     stream_id: u32,

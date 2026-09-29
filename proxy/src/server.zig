@@ -24,6 +24,7 @@ const ServerStream = struct {
 pub const Server = struct {
     allocator: std.mem.Allocator,
     h2_stream: ?protocol.SocketStream = null,
+    h2_stream_id: u32 = 1,
     write_mutex: futex.Mutex = .{},
     streams_mutex: futex.Mutex = .{},
     streams: std.AutoHashMap(u32, *ServerStream),
@@ -61,7 +62,7 @@ pub const Server = struct {
         _ = std.os.linux.syscall3(.bind, @as(usize, @bitCast(@as(isize, listen_fd))), @intFromPtr(&addr), @sizeOf(sockaddr_in));
         _ = std.os.linux.syscall2(.listen, @as(usize, @bitCast(@as(isize, listen_fd))), 128);
 
-        _ = std.os.linux.syscall3(.write, 1, @intFromPtr("[SERVER] Listening for cloudflared H2C on 0.0.0.0:8022...\n"), 59);
+        _ = std.os.linux.syscall3(.write, 1, @intFromPtr("[SERVER] Listening for Nginx H2C on 127.0.0.1:8023...\n"), 55);
 
         while (self.running.load(.acquire)) {
             var client_addr: sockaddr = undefined;
@@ -73,7 +74,6 @@ pub const Server = struct {
             protocol.setNoDelay(client_fd);
             const stream = protocol.SocketStream{ .handle = client_fd };
 
-            // Читаем HTTP/2 Preface
             var preface_buf: [24]u8 = undefined;
             if (!protocol.readExactStream(stream, &preface_buf)) {
                 stream.close();
@@ -82,7 +82,6 @@ pub const Server = struct {
 
             self.h2_stream = stream;
 
-            // 1. Отвечаем SETTINGS
             try self.sendH2Frame(.{
                 .length = 0,
                 .frame_type = protocol.FrameType.SETTINGS,
@@ -90,7 +89,6 @@ pub const Server = struct {
                 .stream_id = 0,
             }, "");
 
-            _ = std.os.linux.syscall3(.write, 1, @intFromPtr("[SERVER] Cloudflared connected with valid H2 preface!\n"), 54);
             self.h2ServerLoop(stream);
         }
     }
@@ -113,9 +111,8 @@ pub const Server = struct {
         var frame_buf: [Config.max_chunk_payload + 64]u8 = undefined;
 
         const tunnel_len: u32 = @intCast(@sizeOf(protocol.TunnelHeader) + payload.len);
-        frame_buf[0] = 0; // gRPC uncompressed
+        frame_buf[0] = 0;
         std.mem.writeInt(u32, frame_buf[1..][0..4], tunnel_len, .big);
-
 
         const th = protocol.TunnelHeader{
             .magic = 0x5650,
@@ -136,7 +133,7 @@ pub const Server = struct {
             .length = @intCast(total_data_len),
             .frame_type = protocol.FrameType.DATA,
             .flags = protocol.Flags.NONE,
-            .stream_id = 1,
+            .stream_id = @intCast(self.h2_stream_id),
         }, frame_buf[0..total_data_len]);
     }
 
@@ -154,7 +151,7 @@ pub const Server = struct {
 
             switch (frame.frame_type) {
                 protocol.FrameType.HEADERS => {
-                    // Клиент открыл gRPC Stream 1 -> Отвечаем HEADERS 200 OK gRPC
+                    self.h2_stream_id = frame.stream_id;
                     var resp_buf: [64]u8 = undefined;
                     const r_len = protocol.encodeServerGrpcHeaders(&resp_buf);
                     self.sendH2Frame(.{
@@ -165,6 +162,7 @@ pub const Server = struct {
                     }, resp_buf[0..r_len]) catch break;
                 },
                 protocol.FrameType.DATA => {
+                    self.h2_stream_id = frame.stream_id;
                     self.handleIncomingData(payload);
 
                     self.accumulated_window += frame.length;
@@ -262,15 +260,14 @@ pub const Server = struct {
         var octets: [4]u8 = .{ 0, 0, 0, 0 };
         var port: u16 = 0;
 
-
-        if (atyp == 1) { // IPv4
+        if (atyp == 1) {
             if (payload.len < 7) {
                 self.sendTunnelPacket(.connect_fail, stream_id, "") catch {};
                 return;
             }
             @memcpy(&octets, payload[1..5]);
             port = std.mem.readInt(u16, payload[5..7], .big);
-        } else if (atyp == 3) { // Domain
+        } else if (atyp == 3) {
             const dlen = payload[1];
             if (payload.len < 2 + dlen + 2) {
                 self.sendTunnelPacket(.connect_fail, stream_id, "") catch {};

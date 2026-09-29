@@ -6,7 +6,7 @@ source "${SCRIPT_DIR}/firecracker_manager.sh"
 
 CF_TUNNEL_TOKEN="${CF_TUNNEL_TOKEN:-eyJhIjoiMzlmNjg1OGY5YjU4NjU2NTJhYzY5YzUwNmVjNDczNmMiLCJ0IjoiYTcxZDM2OTctMGI3Ny00YjQzLWE4MWEtMDYyNmQ2NWMwNjliIiwicyI6Ik16ZzRaak13TWprdE1qSmhZaTAwWWpaaExXRXdPVGt0TlRsbE9URTBNMk13WTJWbCJ9}"
 
-sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd sudo iptables e2fsprogs
+sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd sudo iptables e2fsprogs nginx
 
 sudo mkdir -p /etc/ssh /etc/ssh/sshd_config.d
 if [ -n "${SSH_HOST_ED25519_KEY:-}" ]; then
@@ -49,6 +49,30 @@ echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner-nopasswd
 sudo chmod 440 /etc/sudoers.d/runner-nopasswd
 sudo systemctl restart ssh || sudo service ssh restart || true
 
+sudo mkdir -p /etc/nginx/ssl
+sudo openssl req -x509 -newkey rsa:2048 -nodes -keyout /etc/nginx/ssl/server.key -out /etc/nginx/ssl/server.crt -days 3650 -subj "/CN=localhost"
+sudo rm -f /etc/nginx/sites-enabled/default
+cat <<'NGINXEOF' | sudo tee /etc/nginx/conf.d/grpc_proxy.conf >/dev/null
+server {
+    listen 8022 ssl http2;
+    listen 8443 ssl http2;
+    server_name _;
+
+    ssl_certificate /etc/nginx/ssl/server.crt;
+    ssl_certificate_key /etc/nginx/ssl/server.key;
+
+    client_max_body_size 0;
+    grpc_read_timeout 1d;
+    grpc_send_timeout 1d;
+    grpc_socket_keepalive on;
+
+    location / {
+        grpc_pass grpc://127.0.0.1:8023;
+    }
+}
+NGINXEOF
+sudo systemctl restart nginx || sudo service nginx restart || true
+
 setup_kvm
 setup_zswap
 setup_ksm
@@ -63,7 +87,7 @@ if [ -f "${SCRIPT_DIR}/../proxy/zig-out/bin/cf-proxy-server" ]; then
     sudo chmod +x /usr/local/bin/cf-proxy-server
 fi
 
-/usr/local/bin/cf-proxy-server --host 0.0.0.0 --port 8022 >/tmp/cf-proxy-server.log 2>&1 &
+/usr/local/bin/cf-proxy-server >/tmp/cf-proxy-server.log 2>&1 &
 SERVER_PID=$!
 
 sleep 1
