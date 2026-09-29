@@ -38,6 +38,18 @@ fn sleepMs(ms: u64) void {
     _ = std.os.linux.syscall2(.nanosleep, @intFromPtr(&ts), 0);
 }
 
+fn setSocketTimeout(fd: i32, seconds: i64) void {
+    const tv = extern struct {
+        sec: i64,
+        usec: i64,
+    }{
+        .sec = seconds,
+        .usec = 0,
+    };
+    _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, fd))), 1, 20, @intFromPtr(&tv), @sizeOf(@TypeOf(tv)));
+    _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, fd))), 1, 21, @intFromPtr(&tv), @sizeOf(@TypeOf(tv)));
+}
+
 fn clientLog(level: []const u8, component: []const u8, event: []const u8, stream_id: u32, data_json: []const u8) void {
     var scratch: [1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&scratch,
@@ -344,6 +356,7 @@ pub const Client = struct {
     next_stream_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     pool: [Config.client.pool_size]PoolSocket = undefined,
     gen_counter: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+    baton_mutex: futex.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Client {
         const uq = FrameQueue.init(allocator, Config.common.queue_capacity) catch unreachable;
@@ -388,6 +401,7 @@ pub const Client = struct {
         errdefer _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, fd))));
 
         protocol.setNoDelay(fd);
+        setSocketTimeout(fd, 5);
 
         const conn_rc = std.os.linux.syscall3(.connect, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&self.remote_addr), @sizeOf(sockaddr_in));
         if (@as(isize, @bitCast(conn_rc)) < 0) return error.ConnectFailed;
@@ -438,6 +452,7 @@ pub const Client = struct {
         while (true) {
             _ = self.upstream_queue.waitData(Config.client.idle_interval_ms);
             self.executeBatonRound();
+            sleepMs(50);
         }
     }
 
@@ -466,33 +481,24 @@ pub const Client = struct {
             }
             s.mutex.unlock();
         }
-        clientLog("warn", "pool", "pool_exhausted", 0, "{}");
         return null;
     }
 
     fn executeBatonRound(self: *Client) void {
+        self.baton_mutex.lock();
+        defer self.baton_mutex.unlock();
+
         const target_sock = self.acquireAvailableSocket() orelse return;
 
-        const th = std.Thread.spawn(.{}, executeBatonRequest, .{ self, target_sock }) catch {
+        const send_buf = self.allocator.alloc(u8, Config.common.http_chunk_size) catch {
             target_sock.mutex.lock();
             target_sock.in_use = false;
             target_sock.mutex.unlock();
             return;
         };
-        th.detach();
-    }
-
-    fn executeBatonRequest(self: *Client, ps: *PoolSocket) void {
-        defer {
-            ps.mutex.lock();
-            ps.in_use = false;
-            ps.mutex.unlock();
-        }
-
-        const send_buf = self.allocator.alloc(u8, Config.common.http_chunk_size) catch return;
         defer self.allocator.free(send_buf);
 
-        const batch_len = self.upstream_queue.drainBatch(send_buf);
+        const batch_len = self.upstream_queue.peekBatch(send_buf);
         const gen = self.gen_counter.fetchAdd(1, .monotonic);
 
         var req_hdr: [1024]u8 = undefined;
@@ -510,11 +516,11 @@ pub const Client = struct {
         ) catch unreachable;
 
         var req_log: [128]u8 = undefined;
-        const req_slice = std.fmt.bufPrint(&req_log, "{{\"idx\":{d},\"gen\":{d},\"bytes\":{d}}}", .{ ps.id, gen, batch_len }) catch "{}";
+        const req_slice = std.fmt.bufPrint(&req_log, "{{\"idx\":{d},\"gen\":{d},\"bytes\":{d}}}", .{ target_sock.id, gen, batch_len }) catch "{}";
         clientLog("info", "baton", "request_sent", 0, req_slice);
 
         const start_time = getMilliTimestamp();
-        var conn = ps.conn.?;
+        var conn = target_sock.conn.?;
         const send_ok = blk: {
             conn.writeAll(hdrs) catch break :blk false;
             if (batch_len > 0) {
@@ -526,7 +532,10 @@ pub const Client = struct {
         if (!send_ok) {
             clientLog("error", "baton", "write_failed", 0, req_slice);
             conn.close();
-            ps.conn = null;
+            target_sock.conn = null;
+            target_sock.mutex.lock();
+            target_sock.in_use = false;
+            target_sock.mutex.unlock();
             return;
         }
 
@@ -534,18 +543,41 @@ pub const Client = struct {
         const resp_hdrs = conn.readHeadersFast(&resp_hdr_buf) catch {
             clientLog("error", "baton", "headers_read_failed", 0, req_slice);
             conn.close();
-            ps.conn = null;
+            target_sock.conn = null;
+            target_sock.mutex.lock();
+            target_sock.in_use = false;
+            target_sock.mutex.unlock();
             return;
         };
+
+        self.upstream_queue.commitBatch(batch_len);
 
         const rtt = getMilliTimestamp() - start_time;
         const first_line = resp_hdrs[0 .. std.mem.indexOf(u8, resp_hdrs, "\r\n") orelse resp_hdrs.len];
         var resp_log: [256]u8 = undefined;
-        const resp_slice = std.fmt.bufPrint(&resp_log, "{{\"idx\":{d},\"gen\":{d},\"status\":\"{s}\",\"rtt_ms\":{d}}}", .{ ps.id, gen, first_line, rtt }) catch "{}";
+        const resp_slice = std.fmt.bufPrint(&resp_log, "{{\"idx\":{d},\"gen\":{d},\"status\":\"{s}\",\"rtt_ms\":{d}}}", .{ target_sock.id, gen, first_line, rtt }) catch "{}";
         clientLog("info", "baton", "response_headers", 0, resp_slice);
+
+        const th = std.Thread.spawn(.{}, streamReaderWorker, .{ self, target_sock, gen }) catch {
+            target_sock.mutex.lock();
+            target_sock.in_use = false;
+            target_sock.mutex.unlock();
+            return;
+        };
+        th.detach();
+    }
+
+    fn streamReaderWorker(self: *Client, ps: *PoolSocket, gen: u32) void {
+        defer {
+            ps.mutex.lock();
+            ps.in_use = false;
+            ps.mutex.unlock();
+        }
 
         const chunk_buf = self.allocator.alloc(u8, Config.common.http_chunk_size) catch return;
         defer self.allocator.free(chunk_buf);
+
+        var conn = ps.conn.?;
 
         while (true) {
             const chunk_len = conn.readChunkHeader() catch {

@@ -26,6 +26,18 @@ fn getMilliTimestamp() u64 {
     return @intCast((ts.sec * 1000) + @divTrunc(ts.nsec, 1_000_000));
 }
 
+fn setSocketTimeout(fd: i32, seconds: i64) void {
+    const tv = extern struct {
+        sec: i64,
+        usec: i64,
+    }{
+        .sec = seconds,
+        .usec = 0,
+    };
+    _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, fd))), 1, 20, @intFromPtr(&tv), @sizeOf(@TypeOf(tv)));
+    _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, fd))), 1, 21, @intFromPtr(&tv), @sizeOf(@TypeOf(tv)));
+}
+
 const StreamState = struct {
     stream: protocol.SocketStream,
     expected_seq: u32 = 1,
@@ -108,6 +120,7 @@ pub const Server = struct {
             const client_fd: i32 = @intCast(accept_rc);
 
             protocol.setNoDelay(client_fd);
+            setSocketTimeout(client_fd, 10);
 
             const stream = protocol.SocketStream{ .handle = client_fd };
             const th = std.Thread.spawn(.{}, handleHttp, .{ self, stream }) catch {
@@ -120,10 +133,19 @@ pub const Server = struct {
 
     fn handleHttp(self: *Server, stream: protocol.SocketStream) void {
         var header_buf: [4096]u8 = undefined;
+        var leftover_buf: [4096]u8 = undefined;
+        var leftover_len: usize = 0;
 
         while (true) {
-            var leftover: []const u8 = undefined;
-            const hdrs = readHeadersFast(stream, &header_buf, &leftover) catch { stream.close(); return; };
+            var current_leftover: []const u8 = undefined;
+            const hdrs = readHeadersFast(stream, &header_buf, leftover_buf[0..leftover_len], &current_leftover) catch {
+                stream.close();
+                return;
+            };
+            leftover_len = current_leftover.len;
+            if (leftover_len > 0) {
+                @memcpy(leftover_buf[0..leftover_len], current_leftover);
+            }
 
             const first_line = hdrs[0 .. std.mem.indexOf(u8, hdrs, "\r\n") orelse hdrs.len];
             const is_pipe = std.mem.indexOf(u8, first_line, Config.common.pipe_path) != null;
@@ -164,9 +186,15 @@ pub const Server = struct {
                 const body = self.allocator.alloc(u8, content_len) catch { stream.close(); return; };
                 defer self.allocator.free(body);
 
-                if (leftover.len > 0) {
-                    const from_lo = @min(leftover.len, content_len);
-                    @memcpy(body[0..from_lo], leftover[0..from_lo]);
+                if (leftover_len > 0) {
+                    const from_lo = @min(leftover_len, content_len);
+                    @memcpy(body[0..from_lo], leftover_buf[0..from_lo]);
+                    const remaining_lo = leftover_len - from_lo;
+                    if (remaining_lo > 0) {
+                        @memmove(leftover_buf[0..remaining_lo], leftover_buf[from_lo..leftover_len]);
+                    }
+                    leftover_len = remaining_lo;
+
                     if (content_len > from_lo) {
                         if (!protocol.readExactStream(stream, body[from_lo..content_len])) { stream.close(); return; }
                     }
@@ -364,6 +392,7 @@ pub const Server = struct {
         const sock: i32 = @intCast(rc);
 
         protocol.setNoDelay(sock);
+        setSocketTimeout(sock, 10);
 
         const target_addr = sockaddr_in{
             .family = 2,
@@ -453,8 +482,14 @@ pub const Server = struct {
     }
 };
 
-fn readHeadersFast(stream: protocol.SocketStream, out_buf: []u8, leftover: *[]const u8) ![]const u8 {
+fn readHeadersFast(stream: protocol.SocketStream, out_buf: []u8, initial_leftover: []const u8, leftover: *[]const u8) ![]const u8 {
     var total: usize = 0;
+    if (initial_leftover.len > 0) {
+        const to_copy = @min(initial_leftover.len, out_buf.len);
+        @memcpy(out_buf[0..to_copy], initial_leftover[0..to_copy]);
+        total = to_copy;
+    }
+
     while (total < out_buf.len) {
         if (std.mem.indexOf(u8, out_buf[0..total], "\r\n\r\n")) |idx| {
             const hdr_end = idx + 4;
