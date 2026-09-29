@@ -1,5 +1,5 @@
 const std = @import("std");
-const futex = @import("futex.zig");
+const sync = @import("sync.zig");
 
 pub const Role = enum {
     client,
@@ -18,6 +18,7 @@ pub const Level = enum {
     info,
     warn,
     err,
+    fatal,
 
     pub fn asStr(self: Level) []const u8 {
         return switch (self) {
@@ -25,13 +26,14 @@ pub const Level = enum {
             .info => "INFO",
             .warn => "WARN",
             .err => "ERROR",
+            .fatal => "FATAL",
         };
     }
 };
 
 pub const LogHook = *const fn (line: []const u8) void;
 
-var log_mutex: futex.Mutex = .{};
+var log_mutex: sync.Mutex = .{};
 var global_role: Role = .client;
 var global_hook: ?LogHook = null;
 
@@ -43,54 +45,56 @@ pub fn setHook(hook: ?LogHook) void {
     global_hook = hook;
 }
 
-fn getMilliTimestamp() u64 {
-    const timespec = extern struct {
-        sec: i64,
-        nsec: i64,
-    };
-    var ts: timespec = undefined;
-    _ = std.os.linux.syscall2(.clock_gettime, 0, @intFromPtr(&ts));
-    return @intCast((ts.sec * 1000) + @divTrunc(ts.nsec, 1_000_000));
-}
-
 pub fn json(
     level: Level,
     subsys: []const u8,
     event: []const u8,
+    ctx_stream_id: ?u32,
+    ctx_seq: ?u32,
     comptime data_fmt: []const u8,
     args: anytype,
 ) void {
     var raw_buf: [2048]u8 = undefined;
     var data_buf: [1536]u8 = undefined;
+    var ctx_buf: [256]u8 = undefined;
 
     const data_str = std.fmt.bufPrint(&data_buf, data_fmt, args) catch "{}";
+
+    const s_id_str = if (ctx_stream_id) |s| std.fmt.bufPrint(&raw_buf, "{d}", .{s}) catch "null" else "null";
+    _ = s_id_str;
+    const ctx_str = if (ctx_stream_id) |s| blk: {
+        if (ctx_seq) |seq| {
+            break :blk std.fmt.bufPrint(&ctx_buf, "{{\"stream_id\":{d},\"seq\":{d}}}", .{ s, seq }) catch "{}";
+        } else {
+            break :blk std.fmt.bufPrint(&ctx_buf, "{{\"stream_id\":{d},\"seq\":null}}", .{s}) catch "{}";
+        }
+    } else "{\"stream_id\":null,\"seq\":null}";
 
     log_mutex.lock();
     defer log_mutex.unlock();
 
     const line = std.fmt.bufPrint(
         &raw_buf,
-        "{{\"ts\":{d},\"role\":\"{s}\",\"level\":\"{s}\",\"subsys\":\"{s}\",\"event\":\"{s}\",\"data\":{s}}}\n",
+        "{{\"ts\":{d},\"role\":\"{s}\",\"lvl\":\"{s}\",\"subsys\":\"{s}\",\"event\":\"{s}\",\"ctx\":{s},\"data\":{s}}}\n",
         .{
-            getMilliTimestamp(),
+            sync.getMilliTimestamp(),
             global_role.asStr(),
             level.asStr(),
             subsys,
             event,
+            ctx_str,
             data_str,
         },
     ) catch return;
 
-    _ = std.os.linux.syscall3(
-        .write,
-        2,
-        @intFromPtr(line.ptr),
-        line.len,
-    );
-
     if (global_hook) |hook| {
-        // Drop trailing newline when transmitting over tunnel
-        const payload = if (line.len > 0 and line[line.len - 1] == '\n') line[0 .. line.len - 1] else line;
-        hook(payload);
+        hook(line);
+    } else {
+        _ = std.os.linux.syscall3(
+            .write,
+            2,
+            @intFromPtr(line.ptr),
+            line.len,
+        );
     }
 }

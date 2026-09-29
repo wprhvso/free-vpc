@@ -1,21 +1,31 @@
 const std = @import("std");
 
-fn getMilliTimestamp() u64 {
-    const timespec = extern struct {
-        sec: i64,
-        nsec: i64,
-    };
+pub fn getMonotonicNs() i64 {
+    const timespec = extern struct { sec: i64, nsec: i64 };
     var ts: timespec = undefined;
-    _ = std.os.linux.syscall2(.clock_gettime, 0, @intFromPtr(&ts));
+    _ = std.os.linux.syscall2(.clock_gettime, 1, @intFromPtr(&ts)); // CLOCK_MONOTONIC = 1
+    return (ts.sec * std.time.ns_per_s) + ts.nsec;
+}
+
+pub fn getMilliTimestamp() u64 {
+    const timespec = extern struct { sec: i64, nsec: i64 };
+    var ts: timespec = undefined;
+    _ = std.os.linux.syscall2(.clock_gettime, 0, @intFromPtr(&ts)); // CLOCK_REALTIME = 0
     return @intCast((ts.sec * 1000) + @divTrunc(ts.nsec, 1_000_000));
+}
+
+pub fn sleepMs(ms: u64) void {
+    const timespec = extern struct { sec: i64, nsec: i64 };
+    const ts = timespec{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * 1_000_000),
+    };
+    _ = std.os.linux.syscall2(.nanosleep, @intFromPtr(&ts), 0);
 }
 
 pub const Futex = struct {
     pub fn wait(val: *const std.atomic.Value(u32), expected: u32, timeout_ms: ?u64) void {
-        const timespec = extern struct {
-            sec: i64,
-            nsec: i64,
-        };
+        const timespec = extern struct { sec: i64, nsec: i64 };
         var ts: timespec = undefined;
         const ts_ptr: usize = if (timeout_ms) |ms| blk: {
             ts = .{
@@ -25,11 +35,11 @@ pub const Futex = struct {
             break :blk @intFromPtr(&ts);
         } else 0;
 
-        _ = std.os.linux.syscall4(.futex, @intFromPtr(&val.raw), 0, expected, ts_ptr);
+        _ = std.os.linux.syscall4(.futex, @intFromPtr(&val.raw), 0, expected, ts_ptr); // FUTEX_WAIT = 0
     }
 
     pub fn wake(val: *const std.atomic.Value(u32), count: u32) void {
-        _ = std.os.linux.syscall3(.futex, @intFromPtr(&val.raw), 1, count);
+        _ = std.os.linux.syscall3(.futex, @intFromPtr(&val.raw), 1, count); // FUTEX_WAKE = 1
     }
 };
 
@@ -41,10 +51,6 @@ pub const Mutex = struct {
         while (self.state.swap(2, .acquire) != 0) {
             Futex.wait(&self.state, 2, null);
         }
-    }
-
-    pub fn tryLock(self: *Mutex) bool {
-        return self.state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null;
     }
 
     pub fn unlock(self: *Mutex) void {
