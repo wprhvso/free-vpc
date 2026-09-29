@@ -47,35 +47,138 @@ fn clientLog(level: []const u8, component: []const u8, event: []const u8, stream
     _ = std.os.linux.syscall3(.write, 1, @intFromPtr(msg.ptr), msg.len);
 }
 
+const DirectSocketWriter = struct {
+    fd: i32,
+    raw_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    writer: std.Io.Writer = undefined,
+
+    pub fn setup(self: *DirectSocketWriter, fd: i32) void {
+        self.fd = fd;
+        self.writer = .{
+            .buffer = &self.raw_buf,
+            .vtable = &.{
+                .drain = drain,
+                .flush = flush,
+            },
+            .end = 0,
+        };
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        try flush(w);
+        var total: usize = 0;
+        for (data[0 .. data.len - 1]) |buf| {
+            try writeSyscall(w, buf);
+            total += buf.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| {
+            try writeSyscall(w, last);
+            total += last.len;
+        }
+        return total;
+    }
+
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *DirectSocketWriter = @alignCast(@fieldParentPtr("writer", w));
+        if (w.end > 0) {
+            var index: usize = 0;
+            while (index < w.end) {
+                const rc = std.os.linux.syscall3(.write, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(w.buffer.ptr + index), w.end - index);
+                const signed: isize = @bitCast(rc);
+                if (signed <= 0) return error.WriteFailed;
+                index += @intCast(signed);
+            }
+            w.end = 0;
+        }
+    }
+
+    fn writeSyscall(w: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
+        const self: *DirectSocketWriter = @alignCast(@fieldParentPtr("writer", w));
+        var index: usize = 0;
+        while (index < bytes.len) {
+            const rc = std.os.linux.syscall3(.write, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(bytes.ptr + index), bytes.len - index);
+            const signed: isize = @bitCast(rc);
+            if (signed <= 0) return error.WriteFailed;
+            index += @intCast(signed);
+        }
+    }
+};
+
+const DirectSocketReader = struct {
+    fd: i32,
+    raw_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    reader: std.Io.Reader = undefined,
+
+    pub fn setup(self: *DirectSocketReader, fd: i32) void {
+        self.fd = fd;
+        self.reader = .{
+            .buffer = &self.raw_buf,
+            .vtable = &.{
+                .stream = stream,
+                .readVec = readVec,
+            },
+            .seek = 0,
+            .end = 0,
+        };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        _ = w;
+        _ = limit;
+        var bufs: [1][]u8 = .{""};
+        return readVec(r, &bufs);
+    }
+
+    fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        const self: *DirectSocketReader = @alignCast(@fieldParentPtr("reader", r));
+
+        if (data.len > 0 and data[0].len > 0) {
+            const dest = data[0];
+            const rc = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(dest.ptr), dest.len);
+            const signed: isize = @bitCast(rc);
+            if (signed < 0) return error.ReadFailed;
+            if (signed == 0) return error.EndOfStream;
+            return @intCast(signed);
+        }
+
+        if (r.seek == r.end) {
+            r.seek = 0;
+            r.end = 0;
+        }
+
+        const avail = r.buffer.len - r.end;
+        if (avail == 0) return 0;
+
+        const rc = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(r.buffer.ptr + r.end), avail);
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) return error.ReadFailed;
+        if (signed == 0) return error.EndOfStream;
+
+        r.end += @intCast(signed);
+        return 0;
+    }
+};
+
 const RemoteConnection = struct {
     fd: i32,
-    io: std.Io,
     allocator: std.mem.Allocator,
-    file: std.Io.File = undefined,
-    file_reader: std.Io.File.Reader = undefined,
-    file_writer: std.Io.File.Writer = undefined,
+    direct_reader: DirectSocketReader = undefined,
+    direct_writer: DirectSocketWriter = undefined,
     tls_client: ?std.crypto.tls.Client = null,
-    tls_raw_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
-    tls_raw_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
     tls_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
     tls_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
 
-    read_buf: [16384]u8 = undefined,
-    read_pos: usize = 0,
-    read_len: usize = 0,
-
-    pub fn init(fd: i32, host: []const u8, io: std.Io, allocator: std.mem.Allocator) !*RemoteConnection {
+    pub fn init(fd: i32, host: []const u8, allocator: std.mem.Allocator) !*RemoteConnection {
         const conn = try allocator.create(RemoteConnection);
         conn.* = .{
             .fd = fd,
-            .io = io,
             .allocator = allocator,
         };
 
         if (Config.client.is_tls) {
-            conn.file = .{ .handle = fd, .flags = .{ .nonblocking = false } };
-            conn.file_reader = conn.file.readerStreaming(io, &conn.tls_raw_read_buf);
-            conn.file_writer = conn.file.writerStreaming(io, &conn.tls_raw_write_buf);
+            conn.direct_reader.setup(fd);
+            conn.direct_writer.setup(fd);
 
             var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
             _ = std.os.linux.syscall3(.getrandom, @intFromPtr(&entropy), entropy.len, 0);
@@ -85,8 +188,8 @@ const RemoteConnection = struct {
             const now = std.Io.Timestamp{ .nanoseconds = (@as(i96, ts.sec) * std.time.ns_per_s) + ts.nsec };
 
             conn.tls_client = std.crypto.tls.Client.init(
-                &conn.file_reader.interface,
-                &conn.file_writer.interface,
+                &conn.direct_reader.reader,
+                &conn.direct_writer.writer,
                 .{
                     .host = .{ .explicit = host },
                     .ca = .no_verification,
@@ -104,49 +207,43 @@ const RemoteConnection = struct {
         return conn;
     }
 
-    pub fn readRaw(self: *RemoteConnection, buffer: []u8) !usize {
+    pub fn readByte(self: *RemoteConnection) !u8 {
         if (Config.client.is_tls) {
-            return self.tls_client.?.reader.readSliceShort(buffer);
+            const slice = try self.tls_client.?.reader.peekGreedy(1);
+            if (slice.len == 0) return error.ConnectionClosed;
+            const b = slice[0];
+            self.tls_client.?.reader.toss(1);
+            return b;
         } else {
-            const rc = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(buffer.ptr), buffer.len);
+            var b: [1]u8 = undefined;
+            const rc = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(&b), 1);
             const signed: isize = @bitCast(rc);
             if (signed <= 0) return error.ConnectionClosed;
-            return @intCast(signed);
-        }
-    }
-
-    pub fn readByte(self: *RemoteConnection) !u8 {
-        while (true) {
-            if (self.read_pos < self.read_len) {
-                const res = self.read_buf[self.read_pos];
-                self.read_pos += 1;
-                return res;
-            }
-            self.read_pos = 0;
-            self.read_len = try self.readRaw(&self.read_buf);
-            if (self.read_len == 0) return error.ConnectionClosed;
+            return b[0];
         }
     }
 
     pub fn readExact(self: *RemoteConnection, dest: []u8) !void {
         var total: usize = 0;
         while (total < dest.len) {
-            if (self.read_pos < self.read_len) {
-                const avail = @min(dest.len - total, self.read_len - self.read_pos);
-                @memcpy(dest[total .. total + avail], self.read_buf[self.read_pos .. self.read_pos + avail]);
-                self.read_pos += avail;
-                total += avail;
-                continue;
+            if (Config.client.is_tls) {
+                const avail = self.tls_client.?.reader.buffered();
+                if (avail.len > 0) {
+                    const copy_len = @min(dest.len - total, avail.len);
+                    @memcpy(dest[total .. total + copy_len], avail[0..copy_len]);
+                    self.tls_client.?.reader.toss(copy_len);
+                    total += copy_len;
+                    continue;
+                }
+                const b = try self.readByte();
+                dest[total] = b;
+                total += 1;
+            } else {
+                const rc = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(dest.ptr + total), dest.len - total);
+                const signed: isize = @bitCast(rc);
+                if (signed <= 0) return error.ConnectionClosed;
+                total += @intCast(signed);
             }
-            if (dest.len - total >= self.read_buf.len) {
-                const n = try self.readRaw(dest[total..]);
-                if (n == 0) return error.ConnectionClosed;
-                total += n;
-                continue;
-            }
-            self.read_pos = 0;
-            self.read_len = try self.readRaw(&self.read_buf);
-            if (self.read_len == 0) return error.ConnectionClosed;
         }
     }
 
@@ -190,7 +287,7 @@ const RemoteConnection = struct {
         if (Config.client.is_tls) {
             try self.tls_client.?.writer.writeAll(bytes);
             try self.tls_client.?.writer.flush();
-            try self.file_writer.interface.flush();
+            try self.direct_writer.writer.flush();
         } else {
             var index: usize = 0;
             while (index < bytes.len) {
@@ -252,9 +349,7 @@ pub const Client = struct {
         const uq = FrameQueue.init(allocator, Config.common.queue_capacity) catch unreachable;
 
         var octets: [4]u8 = .{ 127, 0, 0, 1 };
-        if (!protocol.resolveDnsA(Config.client.remote_host, &octets)) {
-            @panic("DNS resolution failed! Check /etc/resolv.conf");
-        }
+        _ = protocol.resolveDnsA(Config.client.remote_host, &octets);
 
         const r_addr = sockaddr_in{
             .family = 2,
@@ -297,7 +392,7 @@ pub const Client = struct {
         const conn_rc = std.os.linux.syscall3(.connect, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&self.remote_addr), @sizeOf(sockaddr_in));
         if (@as(isize, @bitCast(conn_rc)) < 0) return error.ConnectFailed;
 
-        return RemoteConnection.init(fd, Config.client.remote_host, self.io, self.allocator);
+        return RemoteConnection.init(fd, Config.client.remote_host, self.allocator);
     }
 
     pub fn start(self: *Client) !void {
@@ -504,16 +599,18 @@ pub const Client = struct {
         }
 
         s.mutex.lock();
-        s.conn = self.connectRemote() catch null;
-        if (s.conn != null) {
-            s.created_at = getMilliTimestamp();
-            var conn_data: [64]u8 = undefined;
-            const conn_slice = std.fmt.bufPrint(&conn_data, "{{\"idx\":{d}}}", .{id}) catch "{}";
-            clientLog("debug", "pool", "socket_connected", 0, conn_slice);
-        } else {
-            var err_data: [64]u8 = undefined;
-            const err_slice = std.fmt.bufPrint(&err_data, "{{\"idx\":{d},\"error\":\"connect_failed\"}}", .{id}) catch "{}";
-            clientLog("error", "pool", "socket_connect_failed", 0, err_slice);
+        if (s.conn == null and !s.in_use) {
+            s.conn = self.connectRemote() catch null;
+            if (s.conn != null) {
+                s.created_at = getMilliTimestamp();
+                var conn_data: [64]u8 = undefined;
+                const conn_slice = std.fmt.bufPrint(&conn_data, "{{\"idx\":{d}}}", .{id}) catch "{}";
+                clientLog("debug", "pool", "socket_connected", 0, conn_slice);
+            } else {
+                var err_data: [64]u8 = undefined;
+                const err_slice = std.fmt.bufPrint(&err_data, "{{\"idx\":{d},\"error\":\"connect_failed\"}}", .{id}) catch "{}";
+                clientLog("error", "pool", "socket_connect_failed", 0, err_slice);
+            }
         }
         s.mutex.unlock();
     }

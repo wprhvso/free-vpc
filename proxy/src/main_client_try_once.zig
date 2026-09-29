@@ -30,10 +30,8 @@ const DirectSocketWriter = struct {
     raw_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
     writer: std.Io.Writer = undefined,
 
-    pub fn init(fd: i32) DirectSocketWriter {
-        var self = DirectSocketWriter{
-            .fd = fd,
-        };
+    pub fn setup(self: *DirectSocketWriter, fd: i32) void {
+        self.fd = fd;
         self.writer = .{
             .buffer = &self.raw_buf,
             .vtable = &.{
@@ -42,7 +40,6 @@ const DirectSocketWriter = struct {
             },
             .end = 0,
         };
-        return self;
     }
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
@@ -94,10 +91,8 @@ const DirectSocketReader = struct {
     raw_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
     reader: std.Io.Reader = undefined,
 
-    pub fn init(fd: i32) DirectSocketReader {
-        var self = DirectSocketReader{
-            .fd = fd,
-        };
+    pub fn setup(self: *DirectSocketReader, fd: i32) void {
+        self.fd = fd;
         self.reader = .{
             .buffer = &self.raw_buf,
             .vtable = &.{
@@ -107,65 +102,53 @@ const DirectSocketReader = struct {
             .seek = 0,
             .end = 0,
         };
-        return self;
     }
 
     fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         _ = w;
         _ = limit;
-        return readFromSocket(r);
+        var bufs: [1][]u8 = .{""};
+        return readVec(r, &bufs);
     }
 
     fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
-        _ = data;
-        return readFromSocket(r);
-    }
-
-    fn readFromSocket(r: *std.Io.Reader) std.Io.Reader.Error!usize {
         const self: *DirectSocketReader = @alignCast(@fieldParentPtr("reader", r));
+
+        if (data.len > 0 and data[0].len > 0) {
+            const dest = data[0];
+            const rc = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(dest.ptr), dest.len);
+            const signed: isize = @bitCast(rc);
+            if (signed < 0) return error.ReadFailed;
+            if (signed == 0) return error.EndOfStream;
+            return @intCast(signed);
+        }
+
         if (r.seek == r.end) {
             r.seek = 0;
             r.end = 0;
         }
-        if (r.buffer.len - r.end == 0) return 0;
 
-        printLog("SYSCALL READ >> waiting on kernel read(fd={d}, avail_cap={d})...\n", .{ self.fd, r.buffer.len - r.end });
-        const rc = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(r.buffer.ptr + r.end), r.buffer.len - r.end);
+        const avail = r.buffer.len - r.end;
+        if (avail == 0) return 0;
+
+        printLog("SYSCALL READ >> reading into r.buffer (avail_cap={d})...\n", .{avail});
+        const rc = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(r.buffer.ptr + r.end), avail);
         const signed: isize = @bitCast(rc);
-        printLog("SYSCALL READ << syscall returned {d} bytes!\n", .{signed});
+        printLog("SYSCALL READ << returned {d} bytes!\n", .{signed});
         if (signed < 0) return error.ReadFailed;
         if (signed == 0) return error.EndOfStream;
+
         r.end += @intCast(signed);
         return 0;
     }
 };
 
-fn readByteDiagnostic(
-    tls_client: *std.crypto.tls.Client,
-    raw_buf: []u8,
-    pos: *usize,
-    len: *usize,
-) !u8 {
-    while (true) {
-        if (pos.* < len.*) {
-            const res = raw_buf[pos.*];
-            pos.* += 1;
-            return res;
-        }
-        pos.* = 0;
-        printLog("TLS DECRYPT >> calling tls_client.reader.readSliceShort...\n", .{});
-        const n = try tls_client.reader.readSliceShort(raw_buf);
-        printLog("TLS DECRYPT << decrypted {d} application bytes (eof={})\n", .{ n, tls_client.eof() });
-        if (n == 0) {
-            if (tls_client.eof()) {
-                printLog("TLS DECRYPT << EOF signaled by TLS layer\n", .{});
-                return error.ConnectionClosed;
-            }
-            printLog("TLS DECRYPT << Handshake control frame consumed without application data, reading next...\n", .{});
-            continue;
-        }
-        len.* = n;
-    }
+fn readByteDiagnostic(tls_client: *std.crypto.tls.Client) !u8 {
+    const slice = try tls_client.reader.peekGreedy(1);
+    if (slice.len == 0) return error.ConnectionClosed;
+    const b = slice[0];
+    tls_client.reader.toss(1);
+    return b;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -210,8 +193,11 @@ pub fn main(init: std.process.Init) !void {
     printLog("STEP 2: TCP connected in {d}ms!\n", .{tcp_dur});
 
     printLog("STEP 3: Preparing direct syscall-backed TLS structures...\n", .{});
-    var direct_reader = DirectSocketReader.init(fd);
-    var direct_writer = DirectSocketWriter.init(fd);
+    var direct_reader: DirectSocketReader = undefined;
+    direct_reader.setup(fd);
+
+    var direct_writer: DirectSocketWriter = undefined;
+    direct_writer.setup(fd);
 
     var tls_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
     var tls_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
@@ -270,15 +256,11 @@ pub fn main(init: std.process.Init) !void {
     printLog("STEP 5: Reading HTTP response headers...\n", .{});
     const start_http = getMilliTimestamp();
 
-    var raw_recv_buf: [16384]u8 = undefined;
-    var raw_recv_pos: usize = 0;
-    var raw_recv_len: usize = 0;
-
     var header_buf: [4096]u8 = undefined;
     var header_idx: usize = 0;
 
     while (header_idx < header_buf.len) {
-        const b = try readByteDiagnostic(&tls_client, &raw_recv_buf, &raw_recv_pos, &raw_recv_len);
+        const b = try readByteDiagnostic(&tls_client);
         header_buf[header_idx] = b;
         header_idx += 1;
         if (header_idx >= 4 and std.mem.eql(u8, header_buf[header_idx - 4 .. header_idx], "\r\n\r\n")) {
@@ -296,7 +278,7 @@ pub fn main(init: std.process.Init) !void {
     var chunk_size: usize = 0;
 
     while (chunk_hdr_idx < chunk_hdr_buf.len) {
-        const b = try readByteDiagnostic(&tls_client, &raw_recv_buf, &raw_recv_pos, &raw_recv_len);
+        const b = try readByteDiagnostic(&tls_client);
         if (b == '\n' and chunk_hdr_idx > 0 and chunk_hdr_buf[chunk_hdr_idx - 1] == '\r') {
             var hex_part = std.mem.trim(u8, chunk_hdr_buf[0 .. chunk_hdr_idx - 1], " \t");
             if (std.mem.indexOfScalar(u8, hex_part, ';')) |semi| {
@@ -321,15 +303,15 @@ pub fn main(init: std.process.Init) !void {
     var first_32: [32]u8 = undefined;
 
     while (bytes_read < chunk_size) {
-        const b = try readByteDiagnostic(&tls_client, &raw_recv_buf, &raw_recv_pos, &raw_recv_len);
+        const b = try readByteDiagnostic(&tls_client);
         if (bytes_read < 32) {
             first_32[bytes_read] = b;
         }
         bytes_read += 1;
     }
 
-    _ = try readByteDiagnostic(&tls_client, &raw_recv_buf, &raw_recv_pos, &raw_recv_len);
-    _ = try readByteDiagnostic(&tls_client, &raw_recv_buf, &raw_recv_pos, &raw_recv_len);
+    _ = try readByteDiagnostic(&tls_client);
+    _ = try readByteDiagnostic(&tls_client);
 
     printLog("STEP 7: Chunk body fully received ({d} bytes)!\n", .{bytes_read});
 

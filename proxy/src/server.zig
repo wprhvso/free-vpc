@@ -38,8 +38,14 @@ const ServerPipeContext = struct {
     gen: u64,
     stream: protocol.SocketStream,
     retired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
     wake_event: futex.Event = .{},
-    done_event: futex.Event = .{},
+
+    pub fn release(self: *ServerPipeContext, allocator: std.mem.Allocator) void {
+        if (self.ref_count.fetchSub(1, .acq_rel) == 1) {
+            allocator.destroy(self);
+        }
+    }
 };
 
 pub const Server = struct {
@@ -64,6 +70,11 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.downstream_queue.deinit(self.allocator);
         self.streams.deinit();
+        self.leader_mutex.lock();
+        if (self.active_leader.swap(null, .acq_rel)) |ldr| {
+            ldr.release(self.allocator);
+        }
+        self.leader_mutex.unlock();
     }
 
     pub fn emitRemoteLog(self: *Server, level: []const u8, component: []const u8, event: []const u8, stream_id: u32, data_json: []const u8) void {
@@ -184,6 +195,7 @@ pub const Server = struct {
                 var ret_log: [64]u8 = undefined;
                 const ret_slice = std.fmt.bufPrint(&ret_log, "{{\"old_gen\":{d},\"new_gen\":{d}}}", .{ old.gen, req_gen }) catch "{}";
                 self.emitRemoteLog("info", "baton", "preempt", 0, ret_slice);
+                old.release(self.allocator);
             }
 
             const init_resp =
@@ -194,31 +206,45 @@ pub const Server = struct {
                 "X-Accel-Buffering: no\r\n" ++
                 "Connection: keep-alive\r\n\r\n";
 
-            stream.writeAll(init_resp) catch {
-                self.allocator.destroy(pipe_ctx);
+            const init_ok = blk: {
+                stream.writeAll(init_resp) catch break :blk false;
+
+                var init_ping_buf: [8192]u8 = @splat(0);
+                const init_ping_hdr = protocol.Header{
+                    .magic = 0xCF01,
+                    .payload_len = 8192 - @sizeOf(protocol.Header),
+                    .stream_id = 0,
+                    .seq_id = 0,
+                    .cmd = .ping,
+                };
+                const init_hdr_bytes: *const [@sizeOf(protocol.Header)]u8 = @ptrCast(&init_ping_hdr);
+                @memcpy(init_ping_buf[0..@sizeOf(protocol.Header)], init_hdr_bytes);
+
+                var init_ch_hdr: [32]u8 = undefined;
+                const init_ch_text = std.fmt.bufPrint(&init_ch_hdr, "{x}\r\n", .{init_ping_buf.len}) catch unreachable;
+                stream.writeAll(init_ch_text) catch break :blk false;
+                stream.writeAll(&init_ping_buf) catch break :blk false;
+                stream.writeAll("\r\n") catch break :blk false;
+
+                break :blk true;
+            };
+
+            if (!init_ok) {
+                self.leader_mutex.lock();
+                _ = self.active_leader.cmpxchgStrong(pipe_ctx, null, .acq_rel, .monotonic);
+                self.leader_mutex.unlock();
+                pipe_ctx.release(self.allocator);
+                pipe_ctx.release(self.allocator);
                 stream.close();
                 return;
-            };
-
-            var init_ping_buf: [8192]u8 = @splat(0);
-            const init_ping_hdr = protocol.Header{
-                .magic = 0xCF01,
-                .payload_len = 8192 - @sizeOf(protocol.Header),
-                .stream_id = 0,
-                .seq_id = 0,
-                .cmd = .ping,
-            };
-            const init_hdr_bytes: *const [@sizeOf(protocol.Header)]u8 = @ptrCast(&init_ping_hdr);
-            @memcpy(init_ping_buf[0..@sizeOf(protocol.Header)], init_hdr_bytes);
-
-            var init_ch_hdr: [32]u8 = undefined;
-            const init_ch_text = std.fmt.bufPrint(&init_ch_hdr, "{x}\r\n", .{init_ping_buf.len}) catch unreachable;
-            stream.writeAll(init_ch_text) catch { self.allocator.destroy(pipe_ctx); stream.close(); return; };
-            stream.writeAll(&init_ping_buf) catch { self.allocator.destroy(pipe_ctx); stream.close(); return; };
-            stream.writeAll("\r\n") catch { self.allocator.destroy(pipe_ctx); stream.close(); return; };
+            }
 
             const drain_buf = self.allocator.alloc(u8, Config.common.http_chunk_size) catch {
-                self.allocator.destroy(pipe_ctx);
+                self.leader_mutex.lock();
+                _ = self.active_leader.cmpxchgStrong(pipe_ctx, null, .acq_rel, .monotonic);
+                self.leader_mutex.unlock();
+                pipe_ctx.release(self.allocator);
+                pipe_ctx.release(self.allocator);
                 stream.close();
                 return;
             };
@@ -240,8 +266,12 @@ pub const Server = struct {
             }
 
             stream.writeAll("0\r\n\r\n") catch {};
-            pipe_ctx.done_event.set();
-            self.allocator.destroy(pipe_ctx);
+
+            self.leader_mutex.lock();
+            _ = self.active_leader.cmpxchgStrong(pipe_ctx, null, .acq_rel, .monotonic);
+            self.leader_mutex.unlock();
+
+            pipe_ctx.release(self.allocator);
         }
     }
 
