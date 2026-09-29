@@ -2,14 +2,14 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
 
     const client_exe = b.addExecutable(.{
         .name = "cf-proxy-client",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main_client.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .small,
+            .strip = true,
         }),
     });
 
@@ -18,20 +18,11 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main_server.zig"),
             .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    const try_once_exe = b.addExecutable(.{
-        .name = "cf-proxy-try-once",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main_client_try_once.zig"),
-            .target = target,
-            .optimize = optimize,
+            .optimize = .small,
+            .strip = true,
         }),
     });
 
     b.installArtifact(client_exe);
     b.installArtifact(server_exe);
-    b.installArtifact(try_once_exe);
 }
