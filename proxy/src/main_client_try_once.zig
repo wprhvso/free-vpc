@@ -25,6 +25,121 @@ fn printLog(comptime fmt: []const u8, args: anytype) void {
     _ = std.os.linux.syscall3(.write, 1, @intFromPtr(msg.ptr), msg.len);
 }
 
+const DirectSocketWriter = struct {
+    fd: i32,
+    raw_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    writer: std.Io.Writer = undefined,
+
+    pub fn init(fd: i32) DirectSocketWriter {
+        var self = DirectSocketWriter{
+            .fd = fd,
+        };
+        self.writer = .{
+            .buffer = &self.raw_buf,
+            .vtable = &.{
+                .drain = drain,
+                .flush = flush,
+            },
+            .end = 0,
+        };
+        return self;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        try flush(w);
+        var total: usize = 0;
+        for (data[0 .. data.len - 1]) |buf| {
+            try writeSyscall(w, buf);
+            total += buf.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| {
+            try writeSyscall(w, last);
+            total += last.len;
+        }
+        return total;
+    }
+
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *DirectSocketWriter = @alignCast(@fieldParentPtr("writer", w));
+        if (w.end > 0) {
+            printLog("SYSCALL WRITE >> sending {d} encrypted bytes to fd {d}...\n", .{ w.end, self.fd });
+            var index: usize = 0;
+            while (index < w.end) {
+                const rc = std.os.linux.syscall3(.write, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(w.buffer.ptr + index), w.end - index);
+                const signed: isize = @bitCast(rc);
+                if (signed <= 0) return error.WriteFailed;
+                index += @intCast(signed);
+            }
+            printLog("SYSCALL WRITE << {d} bytes written to Linux kernel successfully!\n", .{w.end});
+            w.end = 0;
+        }
+    }
+
+    fn writeSyscall(w: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
+        const self: *DirectSocketWriter = @alignCast(@fieldParentPtr("writer", w));
+        printLog("SYSCALL WRITE >> sending {d} direct bytes to fd {d}...\n", .{ bytes.len, self.fd });
+        var index: usize = 0;
+        while (index < bytes.len) {
+            const rc = std.os.linux.syscall3(.write, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(bytes.ptr + index), bytes.len - index);
+            const signed: isize = @bitCast(rc);
+            if (signed <= 0) return error.WriteFailed;
+            index += @intCast(signed);
+        }
+    }
+};
+
+const DirectSocketReader = struct {
+    fd: i32,
+    raw_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    reader: std.Io.Reader = undefined,
+
+    pub fn init(fd: i32) DirectSocketReader {
+        var self = DirectSocketReader{
+            .fd = fd,
+        };
+        self.reader = .{
+            .buffer = &self.raw_buf,
+            .vtable = &.{
+                .stream = stream,
+                .readVec = readVec,
+            },
+            .seek = 0,
+            .end = 0,
+        };
+        return self;
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        _ = w;
+        _ = limit;
+        return readFromSocket(r);
+    }
+
+    fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        _ = data;
+        return readFromSocket(r);
+    }
+
+    fn readFromSocket(r: *std.Io.Reader) std.Io.Reader.Error!usize {
+        const self: *DirectSocketReader = @alignCast(@fieldParentPtr("reader", r));
+        if (r.seek == r.end) {
+            r.seek = 0;
+            r.end = 0;
+        }
+        if (r.buffer.len - r.end == 0) return 0;
+
+        printLog("SYSCALL READ >> waiting on kernel read(fd={d}, avail_cap={d})...\n", .{ self.fd, r.buffer.len - r.end });
+        const rc = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(r.buffer.ptr + r.end), r.buffer.len - r.end);
+        const signed: isize = @bitCast(rc);
+        printLog("SYSCALL READ << syscall returned {d} bytes!\n", .{signed});
+        if (signed < 0) return error.ReadFailed;
+        if (signed == 0) return error.EndOfStream;
+        r.end += @intCast(signed);
+        return 0;
+    }
+};
+
 fn readByteDiagnostic(
     tls_client: *std.crypto.tls.Client,
     raw_buf: []u8,
@@ -38,15 +153,15 @@ fn readByteDiagnostic(
             return res;
         }
         pos.* = 0;
-        printLog("READ >> calling tls_client.reader.readSliceShort...\n", .{});
+        printLog("TLS DECRYPT >> calling tls_client.reader.readSliceShort...\n", .{});
         const n = try tls_client.reader.readSliceShort(raw_buf);
-        printLog("READ << readSliceShort returned {d} bytes (tls_client.eof = {})\n", .{ n, tls_client.eof() });
+        printLog("TLS DECRYPT << decrypted {d} application bytes (eof={})\n", .{ n, tls_client.eof() });
         if (n == 0) {
             if (tls_client.eof()) {
-                printLog("READ << EOF signaled by TLS stream\n", .{});
+                printLog("TLS DECRYPT << EOF signaled by TLS layer\n", .{});
                 return error.ConnectionClosed;
             }
-            printLog("READ << Non-application TLS record consumed (e.g. NewSessionTicket), continuing read...\n", .{});
+            printLog("TLS DECRYPT << Handshake control frame consumed without application data, reading next...\n", .{});
             continue;
         }
         len.* = n;
@@ -54,7 +169,7 @@ fn readByteDiagnostic(
 }
 
 pub fn main(init: std.process.Init) !void {
-    const io = init.io;
+    _ = init;
 
     printLog("STEP 1: Starting DNS resolution for '{s}'...\n", .{Config.client.remote_host});
     var octets: [4]u8 = .{ 0, 0, 0, 0 };
@@ -94,15 +209,12 @@ pub fn main(init: std.process.Init) !void {
     const tcp_dur = getMilliTimestamp() - start_tcp;
     printLog("STEP 2: TCP connected in {d}ms!\n", .{tcp_dur});
 
-    printLog("STEP 3: Preparing TLS structures...\n", .{});
-    var file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
-    var raw_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
-    var raw_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+    printLog("STEP 3: Preparing direct syscall-backed TLS structures...\n", .{});
+    var direct_reader = DirectSocketReader.init(fd);
+    var direct_writer = DirectSocketWriter.init(fd);
+
     var tls_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
     var tls_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
-
-    var file_reader = file.readerStreaming(io, &raw_read_buf);
-    var file_writer = file.writerStreaming(io, &raw_write_buf);
 
     var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
     _ = std.os.linux.syscall3(.getrandom, @intFromPtr(&entropy), entropy.len, 0);
@@ -114,8 +226,8 @@ pub fn main(init: std.process.Init) !void {
     printLog("STEP 3: Starting TLS handshake...\n", .{});
     const start_tls = getMilliTimestamp();
     var tls_client = std.crypto.tls.Client.init(
-        &file_reader.interface,
-        &file_writer.interface,
+        &direct_reader.reader,
+        &direct_writer.writer,
         .{
             .host = .{ .explicit = Config.client.remote_host },
             .ca = .no_verification,
@@ -149,9 +261,11 @@ pub fn main(init: std.process.Init) !void {
 
     printLog("STEP 4: Writing HTTP request ({d} bytes):\n---\n{s}---\n", .{ hdrs.len, hdrs });
     try tls_client.writer.writeAll(hdrs);
+    printLog("STEP 4: Flushing TLS records into raw socket writer...\n", .{});
     try tls_client.writer.flush();
-    try file_writer.interface.flush();
-    printLog("STEP 4: HTTP request flushed to network!\n", .{});
+    printLog("STEP 4: Flushing raw socket writer to kernel...\n", .{});
+    try direct_writer.writer.flush();
+    printLog("STEP 4: HTTP request confirmed sent to kernel!\n", .{});
 
     printLog("STEP 5: Reading HTTP response headers...\n", .{});
     const start_http = getMilliTimestamp();
