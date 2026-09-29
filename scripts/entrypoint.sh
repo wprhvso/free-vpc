@@ -62,7 +62,6 @@ server {
     ssl_certificate_key /etc/nginx/ssl/server.key;
 
     client_max_body_size 0;
-    grpc_buffering off;
     grpc_read_timeout 1d;
     grpc_send_timeout 1d;
     grpc_socket_keepalive on;
