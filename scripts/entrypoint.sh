@@ -120,54 +120,16 @@ fi
 
 echo "cf-proxy-server started successfully (PID $SERVER_PID)"
 
-CREATE_RESP=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector" \
-    -H "Authorization: Bearer ${CF_API_TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d "{\"name\": \"${NODE_NAME}\"}")
-NODE_ID_CF=$(echo "$CREATE_RESP" | jq -r '.result.id // empty')
-
-if [ -z "$NODE_ID_CF" ]; then
-    echo "Failed to create WARP connector: $CREATE_RESP" >&2
-    exit 1
-fi
-
-TOKEN_RESP=$(curl -sS "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector/${NODE_ID_CF}/token" \
-    -H "Authorization: Bearer ${CF_API_TOKEN}")
-CONNECTOR_TOKEN=$(echo "$TOKEN_RESP" | jq -r '.result // empty')
-
 cleanup() {
     if [ -x /usr/local/bin/rqlited ]; then
         curl -s -X POST "http://127.0.0.1:4001/db/execute" \
             -H "Content-Type: application/json" \
             -d "[[\"UPDATE runners SET status = 'offline' WHERE slot_id = ?\", $NODE_NUM]]" >/dev/null 2>&1 || true
     fi
-    sudo warp-cli --accept-tos disconnect 2>/dev/null || true
-    if [ -n "${NODE_ID_CF:-}" ]; then
-        curl -sS -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/warp_connector/${NODE_ID_CF}" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" >/dev/null 2>&1 || true
-    fi
 }
 trap cleanup EXIT INT TERM
 
-curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-sudo apt-get update -qq && sudo apt-get install -y -qq cloudflare-warp
-
-sudo warp-cli --accept-tos connector new "$CONNECTOR_TOKEN"
-sudo warp-cli --accept-tos connect
-
-sleep 3
-
-sudo ip route replace 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || sudo ip route add 100.96.0.0/12 dev CloudflareWARP 2>/dev/null || true
-
-MESH_IP=""
-for i in $(seq 1 15); do
-    MESH_IP=$(ip -4 addr show dev CloudflareWARP 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 || true)
-    if [ -n "$MESH_IP" ]; then
-        break
-    fi
-    sleep 1
-done
+MESH_IP="127.0.0.1"
 
 mkdir -p /tmp/rqlite-data
 
