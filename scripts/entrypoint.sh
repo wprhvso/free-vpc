@@ -120,6 +120,21 @@ fi
 
 echo "cf-proxy-server started successfully (PID $SERVER_PID)"
 
+if ! nc -z 127.0.0.1 8023; then
+    echo "ERROR: cf-proxy-server port 8023 is not reachable!" >&2
+    exit 1
+fi
+if ! nc -z 127.0.0.1 8022; then
+    echo "ERROR: nginx port 8022 is not reachable!" >&2
+    exit 1
+fi
+
+if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
+    echo "Starting cloudflared named tunnel..."
+    /usr/local/bin/cloudflared tunnel run --token "${CF_TUNNEL_TOKEN}" >/tmp/cf_named_tunnel.log 2>&1 &
+    sleep 3
+fi
+
 cleanup() {
     if [ -x /usr/local/bin/rqlited ]; then
         curl -s -X POST "http://127.0.0.1:4001/db/execute" \
@@ -152,9 +167,7 @@ if [ "$NODE_NUM" = "1" ]; then
     python3 "${SCRIPT_DIR}/dashboard_server.py" 8080 >/tmp/dashboard.log 2>&1 &
     /usr/local/bin/ttyd -p 7681 -b /ssh -W -t fontSize=14 -t theme='{"background": "#0b0f19"}' bash >/tmp/ttyd.log 2>&1 &
 
-    if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
-        /usr/local/bin/cloudflared tunnel run --token "${CF_TUNNEL_TOKEN}" >/tmp/cf_named_tunnel.log 2>&1 &
-    fi
+# cloudflared tunnel already started above
 else
     SEED_IP=""
     if [ -n "${GH_PAT:-}" ]; then

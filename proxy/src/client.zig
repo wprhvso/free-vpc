@@ -40,7 +40,6 @@ const DirectSocketWriter = struct {
                 .drain = drain,
                 .flush = flush,
             },
-            .end = 0,
         };
     }
 
@@ -62,8 +61,8 @@ const DirectSocketWriter = struct {
 
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
         const self: *DirectSocketWriter = @alignCast(@fieldParentPtr("writer", w));
+        var index: usize = 0;
         if (w.end > 0) {
-            var index: usize = 0;
             while (index < w.end) {
                 const rc = std.os.linux.syscall3(.write, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(w.buffer.ptr + index), w.end - index);
                 const signed: isize = @bitCast(rc);
@@ -111,15 +110,14 @@ const DirectSocketReader = struct {
     }
 
     fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        _ = r;
         _ = w;
         _ = limit;
-        var bufs: [1][]u8 = .{""};
-        return readVec(r, &bufs);
+        return 0;
     }
 
     fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
         const self: *DirectSocketReader = @alignCast(@fieldParentPtr("reader", r));
-
         if (data.len > 0 and data[0].len > 0) {
             const dest = data[0];
             const rc = std.os.linux.syscall3(.read, @as(usize, @bitCast(@as(isize, self.fd))), @intFromPtr(dest.ptr), dest.len);
@@ -131,7 +129,6 @@ const DirectSocketReader = struct {
             if (signed == 0) return error.EndOfStream;
             return @intCast(signed);
         }
-
         if (r.seek == r.end) {
             r.seek = 0;
             r.end = 0;
@@ -226,7 +223,6 @@ const RemoteConnection = struct {
     }
 
     pub fn close(self: *RemoteConnection) void {
-        if (self.tls_client) |*tc| tc.end() catch {};
         self.tls_client = null;
         if (self.fd >= 0) {
             _ = std.os.linux.syscall1(.close, @as(usize, @bitCast(@as(isize, self.fd))));
@@ -350,9 +346,13 @@ pub const Client = struct {
     fn writeTlsRaw(self: *Client, bytes: []const u8) !void {
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
-        try self.remote_conn.?.tls_client.?.writer.writeAll(bytes);
-        try self.remote_conn.?.tls_client.?.writer.flush();
-        try self.remote_conn.?.direct_writer.writer.flush();
+        if (self.remote_conn) |conn| {
+            if (conn.tls_client) |*tls_cl| {
+                try tls_cl.writer.writeAll(bytes);
+                try tls_cl.writer.flush();
+                try conn.direct_writer.writer.flush();
+            }
+        }
     }
 
     pub fn sendH2Frame(self: *Client, hdr: protocol.FrameHeader, payload: []const u8) !void {
@@ -450,6 +450,18 @@ pub const Client = struct {
                     logger.json(.warn, "h2_rx", "headers_received", "{{\"stream_id\":{d},\"len\":{d},\"flags\":{d},\"preview_hex\":\"{s}\"}}", .{
                         frame.stream_id, frame.length, frame.flags, hex_str,
                     });
+
+                    // Check for HTTP 200 OK (0x88 in indexed HPACK header table)
+                    var is_ok: bool = false;
+                    for (payload) |b| {
+                        if (b == 0x88) {
+                            is_ok = true;
+                            break;
+                        }
+                    }
+                    if (!is_ok and payload.len > 0) {
+                        logger.json(.err, "h2_rx", "http_non_200_response", "{{\"stream_id\":{d},\"payload_len\":{d}}}", .{ frame.stream_id, payload.len });
+                    }
                 },
                 protocol.FrameType.DATA => {
                     logger.json(.debug, "h2_rx", "data_received", "{{\"stream_id\":{d},\"len\":{d}}}", .{ frame.stream_id, frame.length });
@@ -489,7 +501,7 @@ pub const Client = struct {
                 },
                 protocol.FrameType.WINDOW_UPDATE => {
                     const inc = if (payload.len >= 4) std.mem.readInt(u32, payload[0..4], .big) & 0x7FFFFFFF else 0;
-                                        logger.json(.debug, "h2_rx", "window_update_received", "{{\"stream_id\":{d},\"increment\":{d}}}", .{ frame.stream_id, inc });
+                    logger.json(.debug, "h2_rx", "window_update_received", "{{\"stream_id\":{d},\"increment\":{d}}}", .{ frame.stream_id, inc });
                 },
                 protocol.FrameType.RST_STREAM => {
                     const error_code = if (payload.len >= 4) std.mem.readInt(u32, payload[0..4], .big) else 0;
@@ -549,6 +561,14 @@ pub const Client = struct {
         var offset: usize = 0;
         while (offset + 5 <= self.rx_len) {
             const grpc_len = std.mem.readInt(u32, self.rx_buf[offset + 1 ..][0..4], .big);
+
+            // Sanity check: grpc_len cannot exceed 64KB for our tunnel protocol
+            if (grpc_len > 64 * 1024) {
+                logger.json(.err, "tunnel_rx", "invalid_grpc_length", "{{\"grpc_len\":{d}}}", .{grpc_len});
+                self.rx_len = 0;
+                return;
+            }
+
             const total_msg_len = 5 + grpc_len;
             if (offset + total_msg_len > self.rx_len) {
                 logger.json(.debug, "tunnel_rx", "partial_grpc_buffered", "{{\"grpc_len\":{d},\"avail\":{d}}}", .{ grpc_len, self.rx_len - offset });
@@ -671,7 +691,7 @@ pub const Client = struct {
         const one: c_int = 1;
         _ = std.os.linux.syscall5(.setsockopt, @as(usize, @bitCast(@as(isize, listen_fd))), 1, 2, @intFromPtr(&one), @sizeOf(c_int));
 
-        var octets: [4]u8 = .{ 127, 0, 0, 1 };
+        var octets: [4]u8 = .{ 0, 0, 0, 0 };
         _ = protocol.parseIp4(Config.socks_host, &octets);
 
         const addr = sockaddr_in{
