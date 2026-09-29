@@ -130,8 +130,8 @@ if ! nc -z 127.0.0.1 8022; then
 fi
 
 if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
-    echo "Starting cloudflared named tunnel..."
-    /usr/local/bin/cloudflared tunnel run --token "${CF_TUNNEL_TOKEN}" >/tmp/cf_named_tunnel.log 2>&1 &
+    echo "Starting cloudflared named tunnel with no-tls-verify and http2-origin..."
+    TUNNEL_ORIGIN_ENABLE_HTTP2=true NO_TLS_VERIFY=true /usr/local/bin/cloudflared tunnel --no-tls-verify --http2-origin run --token "${CF_TUNNEL_TOKEN}" >/tmp/cf_named_tunnel.log 2>&1 &
     sleep 3
 fi
 

@@ -461,6 +461,8 @@ pub const Client = struct {
                     }
                     if (!is_ok and payload.len > 0) {
                         logger.json(.err, "h2_rx", "http_non_200_response", "{{\"stream_id\":{d},\"payload_len\":{d}}}", .{ frame.stream_id, payload.len });
+                        self.running.store(false, .release);
+                        break;
                     }
                 },
                 protocol.FrameType.DATA => {
