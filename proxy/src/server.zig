@@ -136,7 +136,7 @@ pub const Server = struct {
     }
 
     fn handleWsClient(self: *Server, stream: protocol.SocketStream) !void {
-        // 1. Read HTTP/1.1 Upgrade handshake
+        // 1. Читаем входящий HTTP-запрос от туннеля Cloudflare
         var hdr_buf: [4096]u8 = undefined;
         var hdr_len: usize = 0;
         var ws_key: ?[]const u8 = null;
@@ -158,23 +158,27 @@ pub const Server = struct {
             }
         }
 
-        const key = ws_key orelse {
-            logger.json(.err, "ws", "missing_ws_key", "{{}}", .{});
-            try stream.writeAll("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
-            return error.InvalidHandshake;
-        };
-
-        var accept_key: [28]u8 = undefined;
-        ws.computeAcceptKey(key, &accept_key);
-
+        // Если Cloudflare перевел H2 Extended CONNECT без Sec-WebSocket-Key, мы не валимся, а мягко подтверждаем сокет
         var resp_buf: [512]u8 = undefined;
-        const resp = try std.fmt.bufPrint(&resp_buf,
-            "HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: Upgrade\r\n" ++
-            "Sec-WebSocket-Accept: {s}\r\n\r\n",
-            .{accept_key},
-        );
+        var resp: []const u8 = undefined;
+
+        if (ws_key) |key| {
+            var accept_key: [28]u8 = undefined;
+            ws.computeAcceptKey(key, &accept_key);
+
+            resp = try std.fmt.bufPrint(&resp_buf,
+                "HTTP/1.1 101 Switching Protocols\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Accept: {s}\r\n\r\n",
+                .{accept_key},
+            );
+        } else {
+            logger.json(.info, "ws", "extended_connect_proxy_upgrade", "{{\"fd\":{d}}}", .{stream.handle});
+            resp = "HTTP/1.1 101 Switching Protocols\r\n" ++
+                   "Upgrade: websocket\r\n" ++
+                   "Connection: Upgrade\r\n\r\n";
+        }
 
         try stream.writeAll(resp);
         logger.json(.info, "ws", "handshake_ok", "{{\"fd\":{d}}}", .{stream.handle});
@@ -183,7 +187,7 @@ pub const Server = struct {
         try self.ws_clients.append(self.allocator, stream);
         self.ws_clients_mutex.unlock();
 
-        // 2. Read WebSocket frames
+        // 2. Читаем входящие WebSocket-фреймы
         while (self.running.load(.acquire)) {
             var hdr: [2]u8 = undefined;
             if (!protocol.readExactStream(stream, &hdr)) break;
@@ -226,7 +230,6 @@ pub const Server = struct {
                     self.handleIncomingPacket(stream, payload);
                 },
                 .ping => {
-                    // Send pong
                     var pong_writer = SocketStreamWriter{ .stream = stream };
                     try ws.writeFrame(&pong_writer, .pong, payload, null);
                 },
@@ -241,7 +244,6 @@ pub const Server = struct {
         defer self.ws_clients_mutex.unlock();
         if (self.ws_clients.items.len == 0) return;
 
-        // Broadcast to first client (or active client)
         const client = self.ws_clients.items[0];
         try self.sendTunnelPacket(client, cmd, stream_id, payload);
     }

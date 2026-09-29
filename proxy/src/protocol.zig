@@ -19,33 +19,113 @@ pub const Flags = struct {
     pub const END_HEADERS: u8 = 0x04;
 };
 
+/// Генерация Extended CONNECT заголовков по RFC 8441 / RFC 7541 (HPACK)
 pub fn encodeClientWsHeaders(dest: []u8, host: []const u8, path: []const u8) usize {
     var idx: usize = 0;
-    // :method: CONNECT (Indexed 2)
-    dest[idx] = 0x82; idx += 1;
-    // :protocol: websocket (Literal without indexing, new name)
-    dest[idx] = 0x00; idx += 1;
+
+    // 1. :method: CONNECT (В таблице HPACK нет CONNECT, кодируем: имя из таблицы инд. 2, значение литералом)
+    dest[idx] = 0x02; idx += 1; // 0000 0010 (Literal without indexing, name index 2)
+    dest[idx] = 7; idx += 1;    // длина "CONNECT"
+    @memcpy(dest[idx .. idx + 7], "CONNECT"); idx += 7;
+
+    // 2. :protocol: websocket (RFC 8441 Extended CONNECT)
+    dest[idx] = 0x00; idx += 1; // Literal without indexing, new name
     dest[idx] = 9; idx += 1;
     @memcpy(dest[idx .. idx + 9], ":protocol"); idx += 9;
     dest[idx] = 9; idx += 1;
     @memcpy(dest[idx .. idx + 9], "websocket"); idx += 9;
-    // :scheme: https (Indexed 7)
+
+    // 3. :scheme: https (Indexed 7 в статической таблице)
     dest[idx] = 0x87; idx += 1;
-    // :path
+
+    // 4. :path (Indexed name 4)
     dest[idx] = 0x04; idx += 1;
     dest[idx] = @intCast(path.len); idx += 1;
     @memcpy(dest[idx .. idx + path.len], path); idx += path.len;
-    // :authority
+
+    // 5. :authority (Indexed name 1)
     dest[idx] = 0x01; idx += 1;
     dest[idx] = @intCast(host.len); idx += 1;
     @memcpy(dest[idx .. idx + host.len], host); idx += host.len;
-    // sec-websocket-version: 13
+
+    // 6. sec-websocket-version: 13
     dest[idx] = 0x00; idx += 1;
     dest[idx] = 21; idx += 1;
     @memcpy(dest[idx .. idx + 21], "sec-websocket-version"); idx += 21;
     dest[idx] = 2; idx += 1;
     @memcpy(dest[idx .. idx + 2], "13"); idx += 2;
+
     return idx;
+}
+
+/// Быстрый декодер статус-кода (:status) из входящего HPACK блока HEADERS
+pub fn decodeHpackStatus(data: []const u8) ?u16 {
+    var i: usize = 0;
+    while (i < data.len) {
+        const b = data[i];
+        if ((b & 0x80) != 0) {
+            // Indexed Header Field
+            const idx = b & 0x7F;
+            i += 1;
+            switch (idx) {
+                8 => return 200,
+                9 => return 204,
+                10 => return 206,
+                11 => return 304,
+                12 => return 400,
+                13 => return 404,
+                14 => return 500,
+                else => {},
+            }
+        } else if ((b & 0x40) != 0) {
+            // Literal with Incremental Indexing
+            const name_idx = b & 0x3F;
+            i += 1;
+            if (name_idx == 8) { // Name is :status
+                if (i >= data.len) return null;
+                const vlen = data[i] & 0x7F;
+                i += 1;
+                if (i + vlen <= data.len and vlen == 3) {
+                    return std.fmt.parseInt(u16, data[i .. i + 3], 10) catch null;
+                }
+            } else if (name_idx == 0) {
+                if (i >= data.len) return null;
+                const nlen = data[i] & 0x7F;
+                i += 1 + nlen;
+                if (i >= data.len) return null;
+                const vlen = data[i] & 0x7F;
+                i += 1 + vlen;
+            } else {
+                if (i >= data.len) return null;
+                const vlen = data[i] & 0x7F;
+                i += 1 + vlen;
+            }
+        } else {
+            // Literal without indexing
+            const name_idx = b & 0x0F;
+            i += 1;
+            if (name_idx == 8) { // Name is :status
+                if (i >= data.len) return null;
+                const vlen = data[i] & 0x7F;
+                i += 1;
+                if (i + vlen <= data.len and vlen == 3) {
+                    return std.fmt.parseInt(u16, data[i .. i + 3], 10) catch null;
+                }
+            } else if (name_idx == 0) {
+                if (i >= data.len) return null;
+                const nlen = data[i] & 0x7F;
+                i += 1 + nlen;
+                if (i >= data.len) return null;
+                const vlen = data[i] & 0x7F;
+                i += 1 + vlen;
+            } else {
+                if (i >= data.len) return null;
+                const vlen = data[i] & 0x7F;
+                i += 1 + vlen;
+            }
+        }
+    }
+    return null;
 }
 
 pub const FrameHeader = struct {
@@ -77,40 +157,6 @@ pub const FrameHeader = struct {
         };
     }
 };
-
-pub fn encodeClientGrpcHeaders(dest: []u8, host: []const u8, path: []const u8) usize {
-    var idx: usize = 0;
-    dest[idx] = 0x83; idx += 1;
-    dest[idx] = 0x87; idx += 1;
-    dest[idx] = 0x04; idx += 1;
-    dest[idx] = @intCast(path.len); idx += 1;
-    @memcpy(dest[idx .. idx + path.len], path); idx += path.len;
-    dest[idx] = 0x01; idx += 1;
-    dest[idx] = @intCast(host.len); idx += 1;
-    @memcpy(dest[idx .. idx + host.len], host); idx += host.len;
-    dest[idx] = 0x00; idx += 1;
-    dest[idx] = 12; idx += 1;
-    @memcpy(dest[idx .. idx + 12], "content-type"); idx += 12;
-    dest[idx] = 16; idx += 1;
-    @memcpy(dest[idx .. idx + 16], "application/grpc"); idx += 16;
-    dest[idx] = 0x00; idx += 1;
-    dest[idx] = 2; idx += 1;
-    @memcpy(dest[idx .. idx + 2], "te"); idx += 2;
-    dest[idx] = 8; idx += 1;
-    @memcpy(dest[idx .. idx + 8], "trailers"); idx += 8;
-    return idx;
-}
-
-pub fn encodeServerGrpcHeaders(dest: []u8) usize {
-    var idx: usize = 0;
-    dest[idx] = 0x88; idx += 1;
-    dest[idx] = 0x00; idx += 1;
-    dest[idx] = 12; idx += 1;
-    @memcpy(dest[idx .. idx + 12], "content-type"); idx += 12;
-    dest[idx] = 16; idx += 1;
-    @memcpy(dest[idx .. idx + 16], "application/grpc"); idx += 16;
-    return idx;
-}
 
 pub const TunnelCmd = enum(u8) {
     connect = 1,

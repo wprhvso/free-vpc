@@ -278,9 +278,9 @@ pub const Client = struct {
             th.detach();
         }
 
-        // Wait for at least one socket ready
+        // Ждем пока хотя бы один сокет реально подтвердит статус 200 от Cloudflare
         var ready = false;
-        for (0..50) |_| {
+        for (0..100) |_| {
             for (0..POOL_SIZE) |i| {
                 if (self.pool[i].is_ready.load(.acquire)) {
                     ready = true;
@@ -304,9 +304,7 @@ pub const Client = struct {
                 continue;
             };
 
-            p.is_ready.store(true, .release);
-            logger.json(.info, "pool", "socket_ready", "{{\"idx\":{d}}}", .{idx});
-
+            // Читаем поток HTTP/2 (is_ready выставится внутри h2ReaderLoop ТОЛЬКО после получения :status 200)
             self.h2ReaderLoop(p);
 
             p.is_ready.store(false, .release);
@@ -354,13 +352,14 @@ pub const Client = struct {
         // 1. Send Preface
         try self.writeTlsRaw(p, protocol.PREFACE);
 
-        // 2. Send SETTINGS
+        // 2. Send SETTINGS (enable_connect_protocol = 1)
+        const settings_payload = "\x00\x08\x00\x00\x00\x01"; // SETTINGS_ENABLE_CONNECT_PROTOCOL = 1
         try self.sendH2Frame(p, .{
-            .length = 0,
+            .length = settings_payload.len,
             .frame_type = protocol.FrameType.SETTINGS,
             .flags = protocol.Flags.NONE,
             .stream_id = 0,
-        }, "");
+        }, settings_payload);
 
         // 3. Send Extended CONNECT for WebSocket (RFC 8441)
         var hpack_buf: [256]u8 = undefined;
@@ -371,6 +370,8 @@ pub const Client = struct {
             .flags = protocol.Flags.END_HEADERS,
             .stream_id = 1,
         }, hpack_buf[0..hpack_len]);
+
+        logger.json(.info, "pool", "handshake_sent", "{{\"idx\":{d}}}", .{p.idx});
     }
 
     fn writeTlsRaw(self: *Client, p: *PoolConn, bytes: []const u8) !void {
@@ -454,6 +455,23 @@ pub const Client = struct {
             p.remote_conn.?.readExact(payload) catch break;
 
             switch (frame.frame_type) {
+                protocol.FrameType.HEADERS => {
+                    if (frame.stream_id == 1) {
+                        const status = protocol.decodeHpackStatus(payload);
+                        if (status) |st| {
+                            logger.json(.info, "h2", "handshake_status", "{{\"idx\":{d},\"status\":{d}}}", .{ p.idx, st });
+                            if (st == 200) {
+                                p.is_ready.store(true, .release);
+                                logger.json(.info, "pool", "socket_ready", "{{\"idx\":{d}}}", .{p.idx});
+                            } else {
+                                logger.json(.err, "pool", "handshake_failed", "{{\"idx\":{d},\"status\":{d}}}", .{ p.idx, st });
+                                break;
+                            }
+                        } else {
+                            logger.json(.warn, "h2", "headers_without_status", "{{\"idx\":{d}}}", .{p.idx});
+                        }
+                    }
+                },
                 protocol.FrameType.DATA => {
                     self.handleIncomingWsData(p, payload);
 
@@ -477,7 +495,14 @@ pub const Client = struct {
                     }
                 },
                 protocol.FrameType.WINDOW_UPDATE => {},
-                protocol.FrameType.RST_STREAM, protocol.FrameType.GOAWAY => break,
+                protocol.FrameType.RST_STREAM => {
+                    logger.json(.err, "h2", "rst_stream", "{{\"idx\":{d},\"stream_id\":{d}}}", .{ p.idx, frame.stream_id });
+                    break;
+                },
+                protocol.FrameType.GOAWAY => {
+                    logger.json(.err, "h2", "goaway", "{{\"idx\":{d}}}", .{p.idx});
+                    break;
+                },
                 else => {},
             }
         }
