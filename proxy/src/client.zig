@@ -253,11 +253,14 @@ pub const Client = struct {
     next_stream_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     accumulated_window: u32 = 0,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    rx_buf: [64 * 1024]u8 = undefined,
+    rx_len: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Client {
         return .{
             .allocator = allocator,
             .streams = std.AutoHashMap(u32, *ClientStream).init(allocator),
+            .rx_len = 0,
         };
     }
 
@@ -510,27 +513,41 @@ pub const Client = struct {
     }
 
     fn handleIncomingData(self: *Client, data: []const u8) void {
-        var offset: usize = 0;
-        while (offset + 5 + @sizeOf(protocol.TunnelHeader) <= data.len) {
-            const grpc_len = std.mem.readInt(u32, data[offset + 1 ..][0..4], .big);
-            offset += 5;
+        if (self.rx_len + data.len > self.rx_buf.len) {
+            logger.json(.err, "tunnel_rx", "rx_buffer_overflow", "{{\"rx_len\":{d},\"incoming\":{d}}}", .{ self.rx_len, data.len });
+            self.rx_len = 0;
+            return;
+        }
 
-            if (offset + grpc_len > data.len) {
-                logger.json(.err, "tunnel_rx", "truncated_grpc", "{{\"grpc_len\":{d},\"avail\":{d}}}", .{ grpc_len, data.len - offset });
+        @memcpy(self.rx_buf[self.rx_len .. self.rx_len + data.len], data);
+        self.rx_len += data.len;
+
+        var offset: usize = 0;
+        while (offset + 5 <= self.rx_len) {
+            const grpc_len = std.mem.readInt(u32, self.rx_buf[offset + 1 ..][0..4], .big);
+            const total_msg_len = 5 + grpc_len;
+            if (offset + total_msg_len > self.rx_len) {
+                logger.json(.debug, "tunnel_rx", "partial_grpc_buffered", "{{\"grpc_len\":{d},\"avail\":{d}}}", .{ grpc_len, self.rx_len - offset });
                 break;
+            }
+
+            if (grpc_len < @sizeOf(protocol.TunnelHeader)) {
+                logger.json(.err, "tunnel_rx", "malformed_grpc_len", "{{\"grpc_len\":{d}}}", .{grpc_len});
+                offset += total_msg_len;
+                continue;
             }
 
             var th: protocol.TunnelHeader = undefined;
-            @memcpy(std.mem.asBytes(&th), data[offset .. offset + @sizeOf(protocol.TunnelHeader)]);
-            offset += @sizeOf(protocol.TunnelHeader);
+            @memcpy(std.mem.asBytes(&th), self.rx_buf[offset + 5 .. offset + 5 + @sizeOf(protocol.TunnelHeader)]);
 
             if (th.magic != 0x5650) {
                 logger.json(.err, "tunnel_rx", "invalid_magic", "{{\"magic\":{d}}}", .{th.magic});
-                break;
+                offset += total_msg_len;
+                continue;
             }
 
-            const payload = data[offset .. offset + th.payload_len];
-            offset += th.payload_len;
+            const payload = self.rx_buf[offset + 5 + @sizeOf(protocol.TunnelHeader) .. offset + 5 + @sizeOf(protocol.TunnelHeader) + th.payload_len];
+            offset += total_msg_len;
 
             logger.json(.debug, "tunnel_rx", "packet", "{{\"cmd\":{d},\"stream_id\":{d},\"payload_len\":{d}}}", .{
                 @intFromEnum(th.cmd), th.stream_id, th.payload_len,
@@ -570,6 +587,14 @@ pub const Client = struct {
             } else {
                 logger.json(.warn, "tunnel_rx", "orphan_stream", "{{\"stream_id\":{d},\"cmd\":{d}}}", .{ th.stream_id, @intFromEnum(th.cmd) });
             }
+        }
+
+        if (offset > 0) {
+            const remaining = self.rx_len - offset;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, self.rx_buf[0..remaining], self.rx_buf[offset .. self.rx_len]);
+            }
+            self.rx_len = remaining;
         }
     }
 

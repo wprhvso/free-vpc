@@ -94,10 +94,18 @@ NODE_NAME="free-vpc-${GITHUB_RUN_ID:-manual}-${NODE_NUM}"
 
 download_assets
 
-if [ -f "${SCRIPT_DIR}/../proxy/zig-out/bin/cf-proxy-server" ]; then
-    sudo cp "${SCRIPT_DIR}/../proxy/zig-out/bin/cf-proxy-server" /usr/local/bin/cf-proxy-server
-    sudo chmod +x /usr/local/bin/cf-proxy-server
-fi
+echo "Installing latest Zig nightly..."
+ZIG_TARBALL_URL=$(curl -sS https://ziglang.org/download/index.json | jq -r '.master."x86_64-linux".tarball')
+curl -sSL "$ZIG_TARBALL_URL" | sudo tar -xJ -C /usr/local
+sudo ln -sf /usr/local/zig-x86_64-linux-*/zig /usr/local/bin/zig
+echo "Zig installed: $(zig version)"
+
+echo "Building cf-proxy-server using Zig nightly..."
+cd "${SCRIPT_DIR}/../proxy"
+zig build -Donly-server=true --prefix /tmp/zig-proxy-dist
+sudo cp /tmp/zig-proxy-dist/bin/cf-proxy-server /usr/local/bin/cf-proxy-server
+sudo chmod +x /usr/local/bin/cf-proxy-server
+cd "${SCRIPT_DIR}"
 
 /usr/local/bin/cf-proxy-server >/tmp/cf-proxy-server.log 2>&1 &
 SERVER_PID=$!

@@ -30,11 +30,14 @@ pub const Server = struct {
     streams: std.AutoHashMap(u32, *ServerStream),
     accumulated_window: u32 = 0,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    rx_buf: [64 * 1024]u8 = undefined,
+    rx_len: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Server {
         return .{
             .allocator = allocator,
             .streams = std.AutoHashMap(u32, *ServerStream).init(allocator),
+            .rx_len = 0,
         };
     }
 
@@ -209,20 +212,37 @@ pub const Server = struct {
     }
 
     fn handleIncomingData(self: *Server, data: []const u8) void {
-        var offset: usize = 0;
-        while (offset + 5 + @sizeOf(protocol.TunnelHeader) <= data.len) {
-            const grpc_len = std.mem.readInt(u32, data[offset + 1 ..][0..4], .big);
-            offset += 5;
+        if (self.rx_len + data.len > self.rx_buf.len) {
+            self.rx_len = 0;
+            return;
+        }
 
-            if (offset + grpc_len > data.len) break;
+        @memcpy(self.rx_buf[self.rx_len .. self.rx_len + data.len], data);
+        self.rx_len += data.len;
+
+        var offset: usize = 0;
+        while (offset + 5 <= self.rx_len) {
+            const grpc_len = std.mem.readInt(u32, self.rx_buf[offset + 1 ..][0..4], .big);
+            const total_msg_len = 5 + grpc_len;
+            if (offset + total_msg_len > self.rx_len) {
+                break;
+            }
+
+            if (grpc_len < @sizeOf(protocol.TunnelHeader)) {
+                offset += total_msg_len;
+                continue;
+            }
 
             var th: protocol.TunnelHeader = undefined;
-            @memcpy(std.mem.asBytes(&th), data[offset .. offset + @sizeOf(protocol.TunnelHeader)]);
-            offset += @sizeOf(protocol.TunnelHeader);
+            @memcpy(std.mem.asBytes(&th), self.rx_buf[offset + 5 .. offset + 5 + @sizeOf(protocol.TunnelHeader)]);
 
-            if (th.magic != 0x5650) break;
-            const payload = data[offset .. offset + th.payload_len];
-            offset += th.payload_len;
+            if (th.magic != 0x5650) {
+                offset += total_msg_len;
+                continue;
+            }
+
+            const payload = self.rx_buf[offset + 5 + @sizeOf(protocol.TunnelHeader) .. offset + 5 + @sizeOf(protocol.TunnelHeader) + th.payload_len];
+            offset += total_msg_len;
 
             switch (th.cmd) {
                 .connect => self.handleConnect(th.stream_id, payload),
@@ -239,6 +259,14 @@ pub const Server = struct {
                 .close => self.closeStream(th.stream_id),
                 else => {},
             }
+        }
+
+        if (offset > 0) {
+            const remaining = self.rx_len - offset;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, self.rx_buf[0..remaining], self.rx_buf[offset .. self.rx_len]);
+            }
+            self.rx_len = remaining;
         }
     }
 
