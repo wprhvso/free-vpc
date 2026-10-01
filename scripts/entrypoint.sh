@@ -183,7 +183,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-COMMON_K3S_FLAGS="--node-name free-vpc-${NODE_NUM} --token ${K3S_SECRET}"
+COMMON_K3S_FLAGS="--node-name free-vpc-${NODE_NUM} --token ${K3S_SECRET} --snapshotter=native"
 
 if [ "$NODE_NUM" -le 3 ]; then
     if [ "$NODE_NUM" = "1" ]; then
@@ -220,7 +220,7 @@ else
 
     sudo k3s agent --server "https://127.0.0.1:6443" \
         --node-name "free-vpc-${NODE_NUM}" \
-        --token "${K3S_SECRET}" >/tmp/k3s.log 2>&1 &
+        --token "${K3S_SECRET}" --snapshotter=native >/tmp/k3s.log 2>&1 &
 fi
 
 HEADLAMP_TOKEN=""
