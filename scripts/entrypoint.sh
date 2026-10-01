@@ -139,8 +139,6 @@ if ! command -v containerd-shim-kata-v2 >/dev/null 2>&1; then
     ) &
 fi
 
-sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 30080 2>/dev/null || true
-sudo iptables -t nat -A OUTPUT -p tcp -o lo --dport 80 -j REDIRECT --to-ports 30080 2>/dev/null || true
 sudo python3 "${SCRIPT_DIR}/gateway_proxy.py" 80 30080 >/tmp/gateway_proxy.log 2>&1 &
 
 if [ "$NODE_NUM" -le 3 ]; then

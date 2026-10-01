@@ -78,7 +78,7 @@ def handle_client(client_sock):
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", listen_port))
+    server.bind(("0.0.0.0", listen_port))
     server.listen(128)
     while True:
         try:
