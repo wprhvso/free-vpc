@@ -183,7 +183,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-COMMON_K3S_FLAGS="--node-name free-vpc-${NODE_NUM} --node-ip ${MY_IPV6} --flannel-iface ygg0 --cluster-cidr fd00:42:1::/56 --service-cidr fd00:42:2::/112 --token ${K3S_SECRET}"
+COMMON_K3S_FLAGS="--node-name free-vpc-${NODE_NUM} --node-ip ${MY_IPV6} --flannel-backend=host-gw --flannel-iface ygg0 --cluster-cidr fd00:42:1::/56 --service-cidr fd00:42:2::/112 --token ${K3S_SECRET}"
 
 if [ "$NODE_NUM" -le 3 ]; then
     ETCD_S3_FLAGS=""
@@ -237,11 +237,19 @@ HEADLAMP_TOKEN=""
 if [ "$NODE_NUM" = "1" ]; then
     echo "Waiting for k3s cluster to initialize..."
     for i in $(seq 1 60); do
-        if [ -f /etc/rancher/k3s/k3s.yaml ] && sudo k3s kubectl get nodes 2>/dev/null | grep -q "Ready"; then
-            break
+        if [ -f /etc/rancher/k3s/k3s.yaml ]; then
+            sudo chmod 644 /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
+            sudo sed -i "s|https://127.0.0.1:6443|https://master-1:6443|g" /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
+            sudo sed -i "s|https://\[::1\]:6443|https://master-1:6443|g" /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
+            if kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get nodes 2>/dev/null | grep -q "Ready"; then
+                echo "K3s node is Ready!"
+                break
+            fi
         fi
         sleep 2
     done
+
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get nodes -o wide || true
 
     if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
         echo "ERROR: k3s.yaml not created! Crash log:" >&2
@@ -311,6 +319,15 @@ if [ "$NODE_NUM" = "1" ]; then
         (
             while true; do
                 kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml port-forward svc/headlamp -n headlamp 4467:80 >/dev/null 2>&1 || true
+                sleep 2
+            done
+        ) &
+        (
+            while true; do
+                EG_SVC=$(kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get svc -n envoy-gateway-system -l gateway.envoyproxy.io/owning-gateway-name=eg -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || true)
+                if [ -n "$EG_SVC" ]; then
+                    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml port-forward "svc/${EG_SVC}" -n envoy-gateway-system 30080:80 >/dev/null 2>&1 || true
+                fi
                 sleep 2
             done
         ) &
