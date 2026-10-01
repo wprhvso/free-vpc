@@ -109,59 +109,9 @@ if ! command -v containerd-shim-kata-v2 >/dev/null 2>&1; then
     (
         KATA_VER="3.10.0"
         KATA_URL="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VER}/kata-static-${KATA_VER}-amd64.tar.xz"
-        curl -fsSL "$KATA_URL" -o /tmp/kata.tar.xz 2>/dev/null && sudo tar -xJf /tmp/kata.tar.xz -C / 2>/dev/null && rm -f /tmp/kata.tar.xz && sudo ln -sf /opt/kata/bin/* /usr/local/bin/ || true
+        curl -fsSL "$KATA_URL" -o /tmp/kata.tar.xz 2>/dev/null && sudo tar -xJf /tmp/kata.tar.xz -C / 2>/dev/null && rm -f /tmp/kata.tar.xz && sudo ln -sf /opt/kata/bin/* /usr/local/bin/ && sudo ln -sf /opt/kata/bin/* /usr/bin/ || true
     ) &
 fi
-
-sudo mkdir -p /var/lib/rancher/k3s/agent/etc/containerd
-cat <<KATAEOF | sudo tee /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl >/dev/null
-{{ template "base" . }}
-
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
-  runtime_type = "io.containerd.kata.v2"
-
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata-clh]
-  runtime_type = "io.containerd.kata-clh.v2"
-
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata-qemu]
-  runtime_type = "io.containerd.kata-qemu.v2"
-
-[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata]
-  runtime_type = "io.containerd.kata.v2"
-
-[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-clh]
-  runtime_type = "io.containerd.kata-clh.v2"
-
-[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu]
-  runtime_type = "io.containerd.kata-qemu.v2"
-KATAEOF
-
-sudo mkdir -p /etc/rancher/k3s
-cat <<PSAEOF | sudo tee /etc/rancher/k3s/psa.yaml >/dev/null
-apiVersion: apiserver.config.k8s.io/v1
-kind: AdmissionConfiguration
-plugins:
-- name: PodSecurity
-  configuration:
-    apiVersion: pod-security.admission.config.k8s.io/v1
-    kind: PodSecurityConfiguration
-    defaults:
-      enforce: "restricted"
-      enforce-version: "latest"
-      audit: "restricted"
-      audit-version: "latest"
-      warn: "restricted"
-      warn-version: "latest"
-    exemptions:
-      usernames: []
-      runtimeClasses: []
-      namespaces:
-        - kube-system
-        - flux-system
-        - envoy-gateway-system
-        - spegel
-        - headlamp
-PSAEOF
 
 sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 30080 2>/dev/null || true
 sudo iptables -t nat -A OUTPUT -p tcp -o lo --dport 80 -j REDIRECT --to-ports 30080 2>/dev/null || true
@@ -201,9 +151,9 @@ ingress:
     service: http://127.0.0.1:80
   - service: http_status:404
 CFEOF
-            /usr/local/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run >/tmp/cf_tunnel.log 2>&1 &
+            sudo /usr/local/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run >/tmp/cf_tunnel.log 2>&1 &
         else
-            /usr/local/bin/cloudflared tunnel run --token "$CURRENT_TUNNEL_TOKEN" >/tmp/cf_tunnel.log 2>&1 &
+            sudo /usr/local/bin/cloudflared tunnel run --token "$CURRENT_TUNNEL_TOKEN" >/tmp/cf_tunnel.log 2>&1 &
         fi
         sleep 2
     fi
@@ -250,8 +200,6 @@ if [ "$NODE_NUM" -le 3 ]; then
         ETCD_S3_FLAGS="--etcd-s3 --etcd-s3-endpoint 127.0.0.1:9000 --etcd-s3-bucket etcd-backups --etcd-s3-access-key admin --etcd-s3-secret-key ${S3_PASS} --etcd-s3-insecure --etcd-snapshot-schedule-cron 0 */1 * * *"
     fi
 
-    PSA_ARG="--kube-apiserver-arg admission-control-config-file=/etc/rancher/k3s/psa.yaml"
-
     if [ "$NODE_NUM" = "1" ]; then
         sudo k3s server --cluster-init \
             ${COMMON_K3S_FLAGS} \
@@ -259,7 +207,6 @@ if [ "$NODE_NUM" -le 3 ]; then
             --disable traefik --disable servicelb --disable local-storage --disable metrics-server \
             --kube-controller-manager-arg "node-monitor-grace-period=16s" \
             --kube-controller-manager-arg "pod-eviction-timeout=20s" \
-            ${PSA_ARG} \
             ${ETCD_S3_FLAGS} >/tmp/k3s.log 2>&1 &
     else
         for i in $(seq 1 45); do
@@ -275,7 +222,6 @@ if [ "$NODE_NUM" -le 3 ]; then
             --disable traefik --disable servicelb --disable local-storage --disable metrics-server \
             --kube-controller-manager-arg "node-monitor-grace-period=16s" \
             --kube-controller-manager-arg "pod-eviction-timeout=20s" \
-            ${PSA_ARG} \
             ${ETCD_S3_FLAGS} >/tmp/k3s.log 2>&1 &
     fi
 else
@@ -305,6 +251,12 @@ if [ "$NODE_NUM" = "1" ]; then
         fi
         sleep 2
     done
+
+    if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
+        echo "ERROR: k3s.yaml not created! Crash log:" >&2
+        cat /tmp/k3s.log >&2 || true
+        exit 1
+    fi
 
     sudo chmod 644 /etc/rancher/k3s/k3s.yaml
     sudo mkdir -p /root/.kube /home/runner/.kube
@@ -356,6 +308,8 @@ metadata:
     kubernetes.io/service-account.name: headlamp-admin
 type: kubernetes.io/service-account-token
 TOKEOF
+
+        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml label namespace default pod-security.kubernetes.io/enforce=restricted --overwrite 2>/dev/null || true
 
         flux --kubeconfig /etc/rancher/k3s/k3s.yaml create source git free-vpc \
             --url="https://github.com/${GITHUB_REPOSITORY:-wprhvso/free-vpc}.git" \
