@@ -53,7 +53,7 @@ fi
 
 sudo mkdir -p /etc/yggdrasil /var/run/yggdrasil /run/yggdrasil
 if [ "$NODE_NUM" -le 3 ]; then
-    LISTEN_CONF="[\"ws://127.0.0.1:9001?password=${YGG_PASS}\"]"
+    LISTEN_CONF="[\"ws://127.0.0.1:9002?password=${YGG_PASS}\"]"
 else
     LISTEN_CONF="[]"
 fi
@@ -85,6 +85,10 @@ if ! ip link show ygg0 >/dev/null 2>&1; then
     echo "ERROR: ygg0 not created! Yggdrasil crash log:" >&2
     cat /tmp/yggdrasil.log >&2 || true
     exit 1
+fi
+
+if [ "$NODE_NUM" -le 3 ]; then
+    python3 "${SCRIPT_DIR}/mesh_proxy.py" 9001 9002 "$NODE_NUM" >/tmp/mesh_proxy.log 2>&1 &
 fi
 
 sudo mkdir -p /etc/ssh /etc/ssh/sshd_config.d
@@ -137,7 +141,7 @@ fi
 
 sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 30080 2>/dev/null || true
 sudo iptables -t nat -A OUTPUT -p tcp -o lo --dport 80 -j REDIRECT --to-ports 30080 2>/dev/null || true
-sudo socat TCP-LISTEN:80,fork,reuseaddr TCP:127.0.0.1:30080 >/dev/null 2>&1 &
+sudo python3 "${SCRIPT_DIR}/gateway_proxy.py" 80 30080 >/tmp/gateway_proxy.log 2>&1 &
 
 if [ "$NODE_NUM" -le 3 ]; then
     TOKEN_VAR="CF_TUNNEL_TOKEN_${NODE_NUM}"
@@ -261,6 +265,14 @@ if [ "$NODE_NUM" = "1" ]; then
 
     if ! command -v helm >/dev/null 2>&1; then
         curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | sudo bash 2>/dev/null || true
+    fi
+
+    if command -v helm >/dev/null 2>&1; then
+        helm pull oci://docker.io/envoyproxy/gateway-helm --version 1.9.2 --untar --untardir /tmp/eg-chart 2>/dev/null || true
+        if [ -d /tmp/eg-chart/gateway-helm/charts/crds/crds ]; then
+            kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f /tmp/eg-chart/gateway-helm/charts/crds/crds/gatewayapi-crds.yaml 2>/dev/null || true
+            kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f /tmp/eg-chart/gateway-helm/charts/crds/crds/generated/ 2>/dev/null || true
+        fi
     fi
 
     if ! command -v sops >/dev/null 2>&1; then
