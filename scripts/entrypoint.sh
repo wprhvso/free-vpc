@@ -159,7 +159,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-COMMON_K3S_FLAGS="--node-name free-vpc-${NODE_NUM} --node-ip ${MY_IPV6} --flannel-iface ygg0 --cluster-cidr 10.42.0.0/16,fd00:42:1::/56 --service-cidr 10.43.0.0/16,fd00:42:2::/112 --token ${K3S_SECRET}"
+COMMON_K3S_FLAGS="--node-name free-vpc-${NODE_NUM} --node-ip ${MY_IPV6} --flannel-iface ygg0 --cluster-cidr fd00:42:1::/56 --service-cidr fd00:42:2::/112 --token ${K3S_SECRET}"
 
 if [ "$NODE_NUM" -le 3 ]; then
     ETCD_S3_FLAGS=""
@@ -177,7 +177,7 @@ if [ "$NODE_NUM" -le 3 ]; then
             ${ETCD_S3_FLAGS} >/tmp/k3s.log 2>&1 &
     else
         for i in $(seq 1 45); do
-            if nc -z -w 2 master-1 6443 2>/dev/null; then
+            if nc -z -w 2 master-1 6443 2>/dev/null || nc -6 -z -w 2 master-1 6443 2>/dev/null; then
                 break
             fi
             sleep 2
@@ -193,13 +193,13 @@ if [ "$NODE_NUM" -le 3 ]; then
     fi
 else
     for i in $(seq 1 60); do
-        if nc -z -w 2 master-1 6443 2>/dev/null || nc -z -w 2 master-2 6443 2>/dev/null || nc -z -w 2 master-3 6443 2>/dev/null; then
+        if nc -z -w 2 master-1 6443 2>/dev/null || nc -6 -z -w 2 master-1 6443 2>/dev/null || nc -z -w 2 master-2 6443 2>/dev/null || nc -6 -z -w 2 master-2 6443 2>/dev/null; then
             break
         fi
         sleep 2
     done
 
-    socat TCP-LISTEN:6443,fork,reuseaddr "TCP:master-1:6443" >/tmp/socat.log 2>&1 &
+    (socat TCP-LISTEN:6443,fork,reuseaddr "TCP6:master-1:6443" >/tmp/socat.log 2>&1 || socat TCP-LISTEN:6443,fork,reuseaddr "TCP:master-1:6443" >/tmp/socat.log 2>&1) &
 
     sudo k3s agent --server "https://127.0.0.1:6443" \
         --node-name "free-vpc-${NODE_NUM}" \
