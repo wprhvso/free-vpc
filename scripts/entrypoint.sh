@@ -250,11 +250,15 @@ if [ "$NODE_NUM" = "1" ]; then
     fi
 
     sudo chmod 644 /etc/rancher/k3s/k3s.yaml
+    sudo sed -i "s|https://127.0.0.1:6443|https://master-1:6443|g" /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
+    sudo sed -i "s|https://\[::1\]:6443|https://master-1:6443|g" /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
     sudo mkdir -p /root/.kube /home/runner/.kube
     sudo cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
     sudo cp /etc/rancher/k3s/k3s.yaml /home/runner/.kube/config
     sudo chown -R runner:runner /home/runner/.kube
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    (sudo socat TCP4-LISTEN:6443,fork,reuseaddr "TCP6:[${MY_IPV6}]:6443" >/dev/null 2>&1 || true) &
+    (sudo socat TCP6-LISTEN:6443,fork,reuseaddr "TCP6:[${MY_IPV6}]:6443" >/dev/null 2>&1 || true) &
 
     echo "Installing Flux v2 CLI and Helm CLI..."
     if ! command -v flux >/dev/null 2>&1; then
@@ -271,6 +275,45 @@ if [ "$NODE_NUM" = "1" ]; then
             kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f /tmp/eg-chart/gateway-helm/charts/crds/crds/gatewayapi-crds.yaml 2>/dev/null || true
             kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f /tmp/eg-chart/gateway-helm/charts/crds/crds/generated/ 2>/dev/null || true
         fi
+
+        helm upgrade --install envoy-gateway oci://docker.io/envoyproxy/gateway-helm --version 1.9.2 \
+            --namespace envoy-gateway-system --create-namespace \
+            --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
+
+        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f "${SCRIPT_DIR}/../gitops/infrastructure/envoy-gateway/gateway.yaml" 2>/dev/null || true
+
+        helm upgrade --install weave-gitops oci://ghcr.io/weaveworks/charts/weave-gitops --version 4.0.36 \
+            --namespace flux-system --create-namespace \
+            --set adminUser.create=true \
+            --set adminUser.createSecret=true \
+            --set adminUser.username="admin" \
+            --set adminUser.passwordHash="\$2a\$10\$ceOhGVam1gdh2ctMHentueYObHqvRySuweffs7xKXfN2.p4joA1WK" \
+            --set rbac.create=true \
+            --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
+
+        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f "${SCRIPT_DIR}/../gitops/infrastructure/weave-gitops/httproute.yaml" 2>/dev/null || true
+
+        helm repo add headlamp https://kubernetes-sigs.github.io/headlamp/ 2>/dev/null || true
+        helm repo update 2>/dev/null || true
+        helm upgrade --install headlamp headlamp/headlamp --version 0.45.0 \
+            --namespace headlamp --create-namespace \
+            --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
+
+        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f "${SCRIPT_DIR}/../gitops/infrastructure/headlamp/rbac.yaml" 2>/dev/null || true
+        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f "${SCRIPT_DIR}/../gitops/infrastructure/headlamp/httproute.yaml" 2>/dev/null || true
+
+        (
+            while true; do
+                kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml port-forward svc/weave-gitops -n flux-system 9003:9001 >/dev/null 2>&1 || true
+                sleep 2
+            done
+        ) &
+        (
+            while true; do
+                kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml port-forward svc/headlamp -n headlamp 4467:80 >/dev/null 2>&1 || true
+                sleep 2
+            done
+        ) &
     fi
 
     if ! command -v sops >/dev/null 2>&1; then

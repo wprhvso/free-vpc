@@ -4,7 +4,14 @@ import threading
 import sys
 
 listen_port = int(sys.argv[1]) if len(sys.argv) > 1 else 80
-target_port = int(sys.argv[2]) if len(sys.argv) > 2 else 30080
+
+def get_target_ports(host_header):
+    host = host_header.lower()
+    if b"gitops" in host:
+        return [30080, 9003]
+    elif b"headlamp" in host or b"ui." in host:
+        return [30080, 4467]
+    return [30080]
 
 def handle_client(client_sock):
     target_sock = None
@@ -22,19 +29,24 @@ def handle_client(client_sock):
             client_sock.close()
             return
 
-        for fam, addr in [(socket.AF_INET6, ("::1", target_port, 0, 0)), (socket.AF_INET, ("127.0.0.1", target_port))]:
-            try:
-                s = socket.socket(fam, socket.SOCK_STREAM)
-                s.settimeout(0.5)
-                s.connect(addr)
-                s.settimeout(None)
-                target_sock = s
-                break
-            except Exception:
+        target_ports = get_target_ports(header_buf)
+
+        for port in target_ports:
+            for fam, addr in [(socket.AF_INET, ("127.0.0.1", port)), (socket.AF_INET6, ("::1", port, 0, 0))]:
                 try:
-                    s.close()
-                except:
-                    pass
+                    s = socket.socket(fam, socket.SOCK_STREAM)
+                    s.settimeout(0.3)
+                    s.connect(addr)
+                    s.settimeout(None)
+                    target_sock = s
+                    break
+                except Exception:
+                    try:
+                        s.close()
+                    except:
+                        pass
+            if target_sock is not None:
+                break
 
         if target_sock is None:
             html = (
