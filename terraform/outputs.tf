@@ -1,20 +1,39 @@
-output "portal_url" {
-  value = "https://vm.unsafie.com"
+output "mesh_tunnel_tokens" {
+  value     = cloudflare_zero_trust_tunnel_cloudflared.mesh_tunnel[*].tunnel_token
+  sensitive = true
 }
 
-output "d1_database_id" {
-  value = cloudflare_d1_database.free_vpc_db.id
+output "cf_tunnel_token_1" {
+  value     = cloudflare_zero_trust_tunnel_cloudflared.mesh_tunnel[0].tunnel_token
+  sensitive = true
 }
 
-output "d1_database_name" {
-  value = cloudflare_d1_database.free_vpc_db.name
+output "cf_tunnel_token_2" {
+  value     = cloudflare_zero_trust_tunnel_cloudflared.mesh_tunnel[1].tunnel_token
+  sensitive = true
 }
 
-output "cf_access_client_id" {
-  value = cloudflare_zero_trust_access_service_token.orchestrator_token.client_id
+output "cf_tunnel_token_3" {
+  value     = cloudflare_zero_trust_tunnel_cloudflared.mesh_tunnel[2].tunnel_token
+  sensitive = true
 }
 
-output "cf_access_client_secret" {
-  value     = cloudflare_zero_trust_access_service_token.orchestrator_token.client_secret
+output "ygg_password" {
+  value     = random_password.ygg_password.result
+  sensitive = true
+}
+
+output "k3s_token" {
+  value     = random_password.k3s_token.result
+  sensitive = true
+}
+
+output "rclone_crypt_password" {
+  value     = random_password.rclone_crypt_password.result
+  sensitive = true
+}
+
+output "s3_secret_key" {
+  value     = random_password.s3_secret_key.result
   sensitive = true
 }

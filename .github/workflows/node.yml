@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       node_id:
-        description: 'Node slot identifier'
+        description: 'Node slot identifier (1-20)'
         required: false
         default: '1'
   repository_dispatch:
@@ -20,14 +20,22 @@ jobs:
 
       - name: Run Free VPC Node
         env:
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_TEAM_NAME: ${{ secrets.CF_TEAM_NAME }}
+          NODE_ID: ${{ github.event.inputs.node_id || github.event.client_payload.node_id || '1' }}
+          CF_TUNNEL_TOKEN_1: ${{ secrets.CF_TUNNEL_TOKEN_1 }}
+          CF_TUNNEL_TOKEN_2: ${{ secrets.CF_TUNNEL_TOKEN_2 }}
+          CF_TUNNEL_TOKEN_3: ${{ secrets.CF_TUNNEL_TOKEN_3 }}
+          YGG_PASSWORD: ${{ secrets.YGG_PASSWORD }}
+          K3S_TOKEN: ${{ secrets.K3S_TOKEN }}
+          CLUSTER_SALT: ${{ secrets.CLUSTER_SALT }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_NAMESPACE: ${{ secrets.HF_NAMESPACE }}
+          HF_BUCKET: ${{ secrets.HF_BUCKET }}
+          RCLONE_CRYPT_PASSWORD: ${{ secrets.RCLONE_CRYPT_PASSWORD }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
           SSH_HOST_ED25519_KEY: ${{ secrets.SSH_HOST_ED25519_KEY }}
           SSH_HOST_RSA_KEY: ${{ secrets.SSH_HOST_RSA_KEY }}
           SSH_AUTHORIZED_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
           GH_PAT: ${{ secrets.GH_PAT }}
-          NODE_ID: ${{ github.event.inputs.node_id || github.event.client_payload.node_id || '1' }}
         run: |
-          chmod +x scripts/entrypoint.sh scripts/firecracker_manager.sh scripts/cluster_orchestrator.sh
+          chmod +x scripts/entrypoint.sh scripts/cluster_orchestrator.sh
           ./scripts/entrypoint.sh

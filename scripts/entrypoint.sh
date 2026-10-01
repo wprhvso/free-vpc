@@ -2,11 +2,29 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/firecracker_manager.sh"
 
-CF_TUNNEL_TOKEN="${CF_TUNNEL_TOKEN:-eyJhIjoiMzlmNjg1OGY5YjU4NjU2NTJhYzY5YzUwNmVjNDczNmMiLCJ0IjoiYTcxZDM2OTctMGI3Ny00YjQzLWE4MWEtMDYyNmQ2NWMwNjliIiwicyI6Ik16ZzRaak13TWprdE1qSmhZaTAwWWpaaExXRXdPVGt0TlRsbE9URTBNMk13WTJWbCJ9}"
+sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost 2>/dev/null || true
 
-sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd sudo iptables e2fsprogs
+if [ -e /dev/kvm ]; then
+    sudo chmod 666 /dev/kvm
+fi
+
+sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd socat python3-cryptography rclone e2fsprogs iptables 2>/dev/null || true
+
+if ! command -v yggdrasil >/dev/null 2>&1; then
+    curl -fsSL https://github.com/yggdrasil-network/yggdrasil-go/releases/download/v0.5.14/yggdrasil-0.5.14-amd64.deb -o /tmp/ygg.deb
+    sudo dpkg -i /tmp/ygg.deb 2>/dev/null || true
+    rm -f /tmp/ygg.deb
+fi
+
+if ! command -v cloudflared >/dev/null 2>&1; then
+    sudo curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+    sudo chmod +x /usr/local/bin/cloudflared
+fi
+
+if ! command -v k3s >/dev/null 2>&1; then
+    curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true sh -
+fi
 
 sudo mkdir -p /etc/ssh /etc/ssh/sshd_config.d
 if [ -n "${SSH_HOST_ED25519_KEY:-}" ]; then
@@ -42,132 +60,156 @@ if [ -n "${SSH_AUTHORIZED_KEYS:-}" ]; then
 fi
 curl -sSL "https://github.com/wprhvso.keys" | sudo tee -a "$AUTH_FILE" >/dev/null
 sudo cp "$AUTH_FILE" /root/.ssh/authorized_keys
-sudo cp "$AUTH_FILE" /tmp/free-vpc-auth-keys
-sudo chmod 600 "$AUTH_FILE" /root/.ssh/authorized_keys /tmp/free-vpc-auth-keys
+sudo chmod 600 "$AUTH_FILE" /root/.ssh/authorized_keys
 sudo chown -R runner:runner /home/runner/.ssh
 echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner-nopasswd
 sudo chmod 440 /etc/sudoers.d/runner-nopasswd
 sudo systemctl restart ssh || sudo service ssh restart || true
 
-setup_kvm
-setup_zswap
-setup_ksm
-
 NODE_NUM="${NODE_ID:-1}"
-NODE_NAME="free-vpc-${GITHUB_RUN_ID:-manual}-${NODE_NUM}"
+TOTAL_SLOTS="${TOTAL_SLOTS:-20}"
+CLUSTER_SALT="${CLUSTER_SALT:-unsafie-cluster-v1}"
+YGG_PASS="${YGG_PASSWORD:-ClusterSecretPass123}"
+K3S_SECRET="${K3S_TOKEN:-ClusterK3sSecret456}"
+S3_PASS="${S3_SECRET_KEY:-SecretS3Pass789}"
 
-download_assets
+YGG_DATA=$(python3 "${SCRIPT_DIR}/ygg_gen.py" "$NODE_NUM" "$TOTAL_SLOTS" "$CLUSTER_SALT" "/usr/bin/yggdrasil")
+PRIV_KEY=$(echo "$YGG_DATA" | jq -r .private_key)
+MY_IPV6=$(echo "$YGG_DATA" | jq -r .my_address)
 
-echo "Installing latest Zig nightly..."
-ZIG_TARBALL_URL=$(curl -sS https://ziglang.org/download/index.json | jq -r '.master."x86_64-linux".tarball')
-curl -sSL "$ZIG_TARBALL_URL" | sudo tar -xJ -C /usr/local
-sudo ln -sf /usr/local/zig-x86_64-linux-*/zig /usr/local/bin/zig
-echo "Zig installed: $(zig version)"
+echo "$YGG_DATA" | jq -r '.hosts[]' | sudo tee -a /etc/hosts >/dev/null
 
-echo "Building cf-proxy-server using Zig nightly..."
-cd "${SCRIPT_DIR}/../proxy"
-zig build -Donly-server=true --prefix /tmp/zig-proxy-dist
-sudo cp /tmp/zig-proxy-dist/bin/cf-proxy-server /usr/local/bin/cf-proxy-server
-sudo chmod +x /usr/local/bin/cf-proxy-server
-cd "${SCRIPT_DIR}"
-
-/usr/local/bin/cf-proxy-server >/tmp/cf-proxy-server.log 2>&1 &
-SERVER_PID=$!
-
-sleep 1
-
-if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    echo "ERROR: cf-proxy-server failed to start! Crash log:" >&2
-    cat /tmp/cf-proxy-server.log >&2
-    exit 1
+sudo mkdir -p /etc/yggdrasil
+if [ "$NODE_NUM" -le 3 ]; then
+    LISTEN_CONF="[\"ws://127.0.0.1:9001?password=${YGG_PASS}\"]"
+else
+    LISTEN_CONF="[]"
 fi
 
-echo "cf-proxy-server started successfully (PID $SERVER_PID)"
+cat <<YGGEOF | sudo tee /etc/yggdrasil/yggdrasil.conf >/dev/null
+{
+  "PrivateKey": "${PRIV_KEY}",
+  "Peers": [
+    "wss://mesh1.unsafie.com:443?password=${YGG_PASS}",
+    "wss://mesh2.unsafie.com:443?password=${YGG_PASS}",
+    "wss://mesh3.unsafie.com:443?password=${YGG_PASS}"
+  ],
+  "Listen": ${LISTEN_CONF},
+  "IfName": "ygg0",
+  "IfMTU": 1280
+}
+YGGEOF
 
-if ! nc -z 127.0.0.1 8023; then
-    echo "ERROR: cf-proxy-server port 8023 is not reachable!" >&2
-    exit 1
+sudo yggdrasil -useconffile /etc/yggdrasil/yggdrasil.conf >/tmp/yggdrasil.log 2>&1 &
+sleep 2
+
+if [ "$NODE_NUM" -le 3 ]; then
+    TOKEN_VAR="CF_TUNNEL_TOKEN_${NODE_NUM}"
+    CURRENT_TUNNEL_TOKEN="${!TOKEN_VAR:-${CF_TUNNEL_TOKEN:-}}"
+    if [ -n "$CURRENT_TUNNEL_TOKEN" ]; then
+        /usr/local/bin/cloudflared tunnel run --token "$CURRENT_TUNNEL_TOKEN" >/tmp/cf_tunnel.log 2>&1 &
+        sleep 2
+    fi
 fi
 
-if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
-    echo "Starting cloudflared named tunnel..."
-    /usr/local/bin/cloudflared tunnel run --token "${CF_TUNNEL_TOKEN}" >/tmp/cf_named_tunnel.log 2>&1 &
-    sleep 3
+if [ -n "${HF_TOKEN:-}" ]; then
+    mkdir -p ~/.config/rclone
+    cat <<RCEOF > ~/.config/rclone/rclone.conf
+[hf-raw]
+type = s3
+provider = Other
+endpoint = https://s3.hf.co/${HF_NAMESPACE:-wprhvso}
+access_key_id = ${HF_ACCESS_KEY:-$HF_TOKEN}
+secret_access_key = ${HF_SECRET_KEY:-$HF_TOKEN}
+region = us-east-1
+force_path_style = true
+list_version = 2
+upload_cutoff = 2G
+chunk_size = 2G
+
+[hf-crypt]
+type = crypt
+remote = hf-raw:${HF_BUCKET:-cluster-backups}
+filename_encryption = standard
+directory_name_encryption = true
+password = ${RCLONE_CRYPT_PASSWORD:-ClusterCryptKey123}
+RCEOF
+    rclone serve s3 hf-crypt: --addr 127.0.0.1:9000 --auth-key "admin,${S3_PASS}" --vfs-cache-mode minimal >/tmp/rclone.log 2>&1 &
+    sleep 2
 fi
 
 cleanup() {
-    if [ -x /usr/local/bin/rqlited ]; then
-        curl -s -X POST "http://127.0.0.1:4001/db/execute" \
-            -H "Content-Type: application/json" \
-            -d "[[\"UPDATE runners SET status = 'offline' WHERE slot_id = ?\", $NODE_NUM]]" >/dev/null 2>&1 || true
+    if command -v kubectl >/dev/null 2>&1; then
+        kubectl drain "free-vpc-${NODE_NUM}" --ignore-daemonsets --delete-emptydir-data --force --grace-period=15 2>/dev/null || true
     fi
 }
 trap cleanup EXIT INT TERM
 
-MESH_IP="127.0.0.1"
+COMMON_K3S_FLAGS="--node-name free-vpc-${NODE_NUM} --node-ip ${MY_IPV6} --flannel-iface ygg0 --cluster-cidr 10.42.0.0/16,fd00:42:1::/56 --service-cidr 10.43.0.0/16,fd00:42:2::/112 --token ${K3S_SECRET}"
 
-mkdir -p /tmp/rqlite-data
-
-if [ "$NODE_NUM" = "1" ]; then
-    /usr/local/bin/rqlited -node-id "node-${NODE_NUM}" -http-addr "0.0.0.0:4001" -raft-addr "0.0.0.0:4002" /tmp/rqlite-data >/tmp/rqlited.log 2>&1 &
-    sleep 3
-
-    curl -s -X POST "http://127.0.0.1:4001/db/execute" \
-        -H "Content-Type: application/json" \
-        -d '[["CREATE TABLE IF NOT EXISTS runners (slot_id INTEGER PRIMARY KEY, node_name TEXT, mesh_ip TEXT, web_url TEXT, ssh_url TEXT, status TEXT, started_at INTEGER, last_heartbeat INTEGER, expires_at INTEGER)"], ["CREATE TABLE IF NOT EXISTS vms (id TEXT PRIMARY KEY, slot_id INTEGER, name TEXT, status TEXT, created_at INTEGER)"]]' >/dev/null 2>&1 || true
-
-    if [ -n "${GH_PAT:-}" ] && [ -n "${MESH_IP}" ]; then
-        curl -sS -X PATCH "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/SEED_MESH_IP" \
-            -H "Authorization: Bearer ${GH_PAT}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            -H "Content-Type: application/json" \
-            -d "{\"name\":\"SEED_MESH_IP\",\"value\":\"${MESH_IP}\"}" 2>/dev/null || true
+if [ "$NODE_NUM" -le 3 ]; then
+    ETCD_S3_FLAGS=""
+    if [ -n "${HF_TOKEN:-}" ]; then
+        ETCD_S3_FLAGS="--etcd-s3 --etcd-s3-endpoint 127.0.0.1:9000 --etcd-s3-bucket etcd-backups --etcd-s3-access-key admin --etcd-s3-secret-key ${S3_PASS} --etcd-s3-insecure --etcd-snapshot-schedule-cron 0 */1 * * *"
     fi
 
-    python3 "${SCRIPT_DIR}/dashboard_server.py" 8080 >/tmp/dashboard.log 2>&1 &
-    /usr/local/bin/ttyd -p 7681 -b /ssh -W -t fontSize=14 -t theme='{"background": "#0b0f19"}' bash >/tmp/ttyd.log 2>&1 &
-
-# cloudflared tunnel already started above
-else
-    SEED_IP=""
-    if [ -n "${GH_PAT:-}" ]; then
-        SEED_IP=$(curl -s -H "Authorization: Bearer ${GH_PAT}" "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/SEED_MESH_IP" | jq -r '.value // empty' 2>/dev/null || true)
-    fi
-
-    if [ -n "$SEED_IP" ] && ping -c 1 -W 2 "$SEED_IP" >/dev/null 2>&1; then
-        /usr/local/bin/rqlited -node-id "node-${NODE_NUM}" -http-addr "0.0.0.0:4001" -raft-addr "0.0.0.0:4002" -join "http://${SEED_IP}:4001" /tmp/rqlite-data >/tmp/rqlited.log 2>&1 &
+    if [ "$NODE_NUM" = "1" ]; then
+        sudo k3s server --cluster-init \
+            ${COMMON_K3S_FLAGS} \
+            --tls-san master-1 --tls-san master-2 --tls-san master-3 \
+            --disable traefik --disable servicelb --disable local-storage --disable metrics-server \
+            --kube-controller-manager-arg "node-monitor-grace-period=16s" \
+            --kube-controller-manager-arg "pod-eviction-timeout=20s" \
+            ${ETCD_S3_FLAGS} >/tmp/k3s.log 2>&1 &
     else
-        /usr/local/bin/rqlited -node-id "node-${NODE_NUM}" -http-addr "0.0.0.0:4001" -raft-addr "0.0.0.0:4002" /tmp/rqlite-data >/tmp/rqlited.log 2>&1 &
-    fi
-    sleep 3
+        for i in $(seq 1 45); do
+            if nc -z -w 2 master-1 6443 2>/dev/null; then
+                break
+            fi
+            sleep 2
+        done
 
-    /usr/local/bin/ttyd -p 7681 -b /ssh -W -t fontSize=14 -t theme='{"background": "#0b0f19"}' bash >/tmp/ttyd.log 2>&1 &
+        sudo k3s server --server "https://master-1:6443" \
+            ${COMMON_K3S_FLAGS} \
+            --tls-san master-1 --tls-san master-2 --tls-san master-3 \
+            --disable traefik --disable servicelb --disable local-storage --disable metrics-server \
+            --kube-controller-manager-arg "node-monitor-grace-period=16s" \
+            --kube-controller-manager-arg "pod-eviction-timeout=20s" \
+            ${ETCD_S3_FLAGS} >/tmp/k3s.log 2>&1 &
+    fi
+else
+    for i in $(seq 1 60); do
+        if nc -z -w 2 master-1 6443 2>/dev/null || nc -z -w 2 master-2 6443 2>/dev/null || nc -z -w 2 master-3 6443 2>/dev/null; then
+            break
+        fi
+        sleep 2
+    done
+
+    socat TCP-LISTEN:6443,fork,reuseaddr "TCP:master-1:6443" >/tmp/socat.log 2>&1 &
+
+    sudo k3s agent --server "https://127.0.0.1:6443" \
+        --node-name "free-vpc-${NODE_NUM}" \
+        --node-ip "${MY_IPV6}" \
+        --flannel-iface "ygg0" \
+        --token "${K3S_SECRET}" >/tmp/k3s.log 2>&1 &
 fi
 
-NOW=$(date +%s)
-EXPIRES=$((NOW + 21600))
-
-curl -s -X POST "http://127.0.0.1:4001/db/execute" \
-    -H "Content-Type: application/json" \
-    -d '[["INSERT OR REPLACE INTO runners (slot_id, node_name, mesh_ip, web_url, ssh_url, status, started_at, last_heartbeat, expires_at) VALUES (?, ?, ?, ?, ?, '\''online'\'', ?, ?, ?)", '$NODE_NUM', "'$NODE_NAME'", "'$MESH_IP'", "https://vm.unsafie.com", "ssh.unsafie.com:443", '$NOW', '$NOW', '$EXPIRES']]' >/dev/null 2>&1 || true
-
-bash "${SCRIPT_DIR}/cluster_orchestrator.sh" "$NODE_NUM" "${GITHUB_REPOSITORY:-wprhvso/free-vpc}" "${GH_PAT:-}" 20 >/tmp/orchestrator.log 2>&1 &
+if [ "$NODE_NUM" = "1" ]; then
+    bash "${SCRIPT_DIR}/cluster_orchestrator.sh" "$NODE_NUM" "${GITHUB_REPOSITORY:-wprhvso/free-vpc}" "${GH_PAT:-}" "$TOTAL_SLOTS" "${GITHUB_REF_NAME:-main}" >/tmp/orchestrator.log 2>&1 &
+fi
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-    printf "## Free VPC Node Online\n- Slot: \`#%s\`\n- Mesh IP: \`%s\`\n- Web Portal: https://vm.unsafie.com\n- Web SSH Terminal: https://vm.unsafie.com/ssh\n- CLI SSH via gRPC: \`ssh.unsafie.com:443\`\n" "$NODE_NUM" "${MESH_IP:-none}" >>"$GITHUB_STEP_SUMMARY"
+    ROLE="Worker"
+    if [ "$NODE_NUM" -le 3 ]; then
+        ROLE="Master (Control Plane)"
+    fi
+    printf "## Free VPC Kubernetes Node Online\n- Role: \`%s\`\n- Slot: \`#%s\`\n- Yggdrasil IPv6: \`%s\`\n- Peers: \`mesh1..3.unsafie.com\`\n" "$ROLE" "$NODE_NUM" "$MY_IPV6" >>"$GITHUB_STEP_SUMMARY"
 fi
 
 START_TIME=$SECONDS
-
 while [ $((SECONDS - START_TIME)) -lt 21120 ]; do
     if [ -f "/tmp/stop-node" ]; then
         break
     fi
     sleep 10
 done
-
-if [ -x /usr/local/bin/rqlited ]; then
-    curl -s -X POST "http://127.0.0.1:4001/db/execute" \
-        -H "Content-Type: application/json" \
-        -d "[[\"UPDATE runners SET status = 'draining' WHERE slot_id = ?\", $NODE_NUM]]" >/dev/null 2>&1 || true
-fi
