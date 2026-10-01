@@ -11,19 +11,19 @@ if [ -z "$TOKEN" ]; then
   exit 0
 fi
 
+sleep 180
+
 while true; do
-  sleep 20
-
   if ! command -v kubectl >/dev/null 2>&1; then
+    sleep 30
     continue
   fi
 
-  NODES_JSON=$(kubectl get nodes -o json 2>/dev/null || true)
+  NODES_JSON=$(kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get nodes -o json 2>/dev/null || true)
   if [ -z "$NODES_JSON" ]; then
+    sleep 30
     continue
   fi
-
-  NOW=$(date +%s)
 
   for s in $(seq 1 "$TOTAL_SLOTS"); do
     NODE_NAME="free-vpc-${s}"
@@ -35,7 +35,8 @@ while true; do
         -H "Accept: application/vnd.github.v3+json" \
         -H "Content-Type: application/json" \
         -d "{\"ref\":\"${BRANCH}\",\"inputs\":{\"node_id\":\"$s\"}}" >/dev/null 2>&1 || true
-      sleep 1
+      sleep 2
     fi
   done
+  sleep 300
 done
