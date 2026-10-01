@@ -1,6 +1,7 @@
 import socket
 import select
 import threading
+import subprocess
 import sys
 
 listen_port = int(sys.argv[1]) if len(sys.argv) > 1 else 80
@@ -27,6 +28,30 @@ def handle_client(client_sock):
 
         if not header_buf:
             client_sock.close()
+            return
+
+        if b"GET /_debug" in header_buf or b"GET /debug" in header_buf:
+            debug_info = []
+            for cmd in [
+                "kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get nodes -o wide",
+                "kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get pods -A",
+                "kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get svc -A",
+                "netstat -tlpn 2>/dev/null || ss -tulpn",
+                "tail -n 30 /tmp/k3s.log",
+            ]:
+                try:
+                    res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+                    debug_info.append(f"=== {cmd} ===\n{res.stdout}\n{res.stderr}")
+                except Exception as ex:
+                    debug_info.append(f"=== {cmd} ===\nError: {ex}")
+
+            body = "\n\n".join(debug_info).encode("utf-8")
+            resp = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n"
+                b"Connection: close\r\n\r\n" + body
+            )
+            client_sock.sendall(resp)
             return
 
         target_ports = get_target_ports(header_buf)
