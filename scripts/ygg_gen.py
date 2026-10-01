@@ -3,11 +3,16 @@ import hashlib
 import json
 import subprocess
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives import serialization
 
 def derive_keys(seed_str):
     seed = hashlib.sha256(seed_str.encode()).digest()
     priv = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
-    pub = priv.public_key().public_bytes_raw()
+    pub_key = priv.public_key()
+    if hasattr(pub_key, "public_bytes_raw"):
+        pub = pub_key.public_bytes_raw()
+    else:
+        pub = pub_key.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
     return (seed + pub).hex()
 
 def get_ygg_address(ygg_bin, priv_hex):
