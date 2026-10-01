@@ -23,27 +23,8 @@ variable "cloudflare_api_token" {
   default     = ""
 }
 
-variable "team_name" {
-  type        = string
-  description = "Cloudflare Zero Trust Team Name"
-  default     = ""
-}
-
 variable "github_repository" {
   type        = string
   description = "GitHub repository (owner/repo)"
   default     = "wprhvso/free-vpc"
-}
-
-variable "github_token" {
-  type        = string
-  description = "GitHub Personal Access Token"
-  sensitive   = true
-  default     = ""
-}
-
-variable "admin_email" {
-  type        = string
-  description = "Admin email for Zero Trust access"
-  default     = ""
 }

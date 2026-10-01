@@ -1,6 +1,0 @@
-name = "free-vpc-orchestrator"
-main = "index.js"
-compatibility_date = "2024-09-01"
-
-[triggers]
-crons = ["*/15 * * * *"]
