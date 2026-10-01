@@ -31,7 +31,7 @@ resource "cloudflare_record" "mesh_record" {
   zone_id = var.cloudflare_zone_id
   name    = "mesh${count.index + 1}"
   type    = "CNAME"
-  value   = "${cloudflare_zero_trust_tunnel_cloudflared.mesh_tunnel[count.index].id}.cfargotunnel.com"
+  content = "${cloudflare_zero_trust_tunnel_cloudflared.mesh_tunnel[count.index].id}.cfargotunnel.com"
   proxied = true
 }
 

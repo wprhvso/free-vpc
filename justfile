@@ -16,22 +16,7 @@ tf-apply:
 
 secrets-sync:
     @echo "Syncing generated secrets to GitHub Actions..."
-    @cd terraform && \
-      T1=$$(terraform output -raw cf_tunnel_token_1 2>/dev/null || true) && \
-      T2=$$(terraform output -raw cf_tunnel_token_2 2>/dev/null || true) && \
-      T3=$$(terraform output -raw cf_tunnel_token_3 2>/dev/null || true) && \
-      YGG=$$(terraform output -raw ygg_password 2>/dev/null || true) && \
-      K3S=$$(terraform output -raw k3s_token 2>/dev/null || true) && \
-      CRYPT=$$(terraform output -raw rclone_crypt_password 2>/dev/null || true) && \
-      S3KEY=$$(terraform output -raw s3_secret_key 2>/dev/null || true) && \
-      [ -n "$$T1" ] && echo -n "$$T1" | gh secret set CF_TUNNEL_TOKEN_1 --repo wprhvso/free-vpc || true && \
-      [ -n "$$T2" ] && echo -n "$$T2" | gh secret set CF_TUNNEL_TOKEN_2 --repo wprhvso/free-vpc || true && \
-      [ -n "$$T3" ] && echo -n "$$T3" | gh secret set CF_TUNNEL_TOKEN_3 --repo wprhvso/free-vpc || true && \
-      [ -n "$$YGG" ] && echo -n "$$YGG" | gh secret set YGG_PASSWORD --repo wprhvso/free-vpc || true && \
-      [ -n "$$K3S" ] && echo -n "$$K3S" | gh secret set K3S_TOKEN --repo wprhvso/free-vpc || true && \
-      [ -n "$$CRYPT" ] && echo -n "$$CRYPT" | gh secret set RCLONE_CRYPT_PASSWORD --repo wprhvso/free-vpc || true && \
-      [ -n "$$S3KEY" ] && echo -n "$$S3KEY" | gh secret set S3_SECRET_KEY --repo wprhvso/free-vpc || true
-    @echo "Secrets synchronized successfully."
+    @bash scripts/sync_secrets.sh
 
 spawn node_id="1":
     gh workflow run node.yml --repo wprhvso/free-vpc -f node_id={{node_id}}
