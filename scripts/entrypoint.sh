@@ -41,6 +41,16 @@ MY_IPV6=$(echo "$YGG_DATA" | jq -r .my_address)
 
 echo "$YGG_DATA" | jq -r ".hosts[]" | sudo tee -a /etc/hosts >/dev/null
 
+sudo systemctl stop yggdrasil 2>/dev/null || true
+sudo systemctl disable yggdrasil 2>/dev/null || true
+sudo pkill -9 yggdrasil 2>/dev/null || true
+sudo modprobe tun 2>/dev/null || true
+sudo mkdir -p /dev/net
+if [ ! -c /dev/net/tun ]; then
+    sudo mknod /dev/net/tun c 10 200
+    sudo chmod 666 /dev/net/tun
+fi
+
 sudo mkdir -p /etc/yggdrasil /var/run/yggdrasil /run/yggdrasil
 if [ "$NODE_NUM" -le 3 ]; then
     LISTEN_CONF="[\"ws://127.0.0.1:9001?password=${YGG_PASS}\"]"
@@ -63,7 +73,19 @@ cat <<YGGEOF | sudo tee /etc/yggdrasil/yggdrasil.conf >/dev/null
 YGGEOF
 
 sudo yggdrasil -useconffile /etc/yggdrasil/yggdrasil.conf >/tmp/yggdrasil.log 2>&1 &
-sleep 2
+
+for i in $(seq 1 30); do
+    if ip link show ygg0 >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+if ! ip link show ygg0 >/dev/null 2>&1; then
+    echo "ERROR: ygg0 not created! Yggdrasil crash log:" >&2
+    cat /tmp/yggdrasil.log >&2 || true
+    exit 1
+fi
 
 sudo mkdir -p /etc/ssh /etc/ssh/sshd_config.d
 if [ -n "${SSH_HOST_ED25519_KEY:-}" ]; then
