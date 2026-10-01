@@ -22,12 +22,7 @@ spawn node_id="1":
     gh workflow run node.yml --repo wprhvso/free-vpc -f node_id={{node_id}}
 
 spawn-all:
-    @echo "Spawning full 20-node Kubernetes cluster in parallel..."
-    @for i in $(seq 1 20); do \
-      gh workflow run node.yml --repo wprhvso/free-vpc -f node_id=$$i; \
-      sleep 0.2; \
-    done
-    @echo "All 20 nodes dispatched. Cluster will be ready in ~1-2 minutes."
+    @bash scripts/spawn_all.sh wprhvso/free-vpc 20
 
 nodes:
     gh run list --repo wprhvso/free-vpc --workflow node.yml --limit 20

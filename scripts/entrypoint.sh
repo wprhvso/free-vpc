@@ -66,7 +66,9 @@ echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner-nopasswd
 sudo chmod 440 /etc/sudoers.d/runner-nopasswd
 sudo systemctl restart ssh || sudo service ssh restart || true
 
-NODE_NUM="${NODE_ID:-1}"
+RAW_ID="${NODE_ID:-1}"
+NODE_NUM=$(echo "$RAW_ID" | tr -cd "0-9")
+NODE_NUM="${NODE_NUM:-1}"
 TOTAL_SLOTS="${TOTAL_SLOTS:-20}"
 CLUSTER_SALT="${CLUSTER_SALT:-unsafie-cluster-v1}"
 YGG_PASS="${YGG_PASSWORD:?YGG_PASSWORD is required}"

@@ -21,7 +21,8 @@ def main():
         print("Usage: ygg_gen.py <slot_id> <total_slots> [salt] [ygg_bin]")
         sys.exit(1)
     
-    slot_id = int(sys.argv[1])
+    raw_slot = "".join(c for c in sys.argv[1] if c.isdigit())
+    slot_id = int(raw_slot) if raw_slot else 1
     total_slots = int(sys.argv[2])
     salt = sys.argv[3] if len(sys.argv) > 3 else "unsafie-mesh-v1"
     ygg_bin = sys.argv[4] if len(sys.argv) > 4 else "yggdrasil"
