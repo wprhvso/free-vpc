@@ -22,8 +22,14 @@ if ! command -v cloudflared >/dev/null 2>&1; then
     sudo chmod +x /usr/local/bin/cloudflared
 fi
 
+sudo systemctl stop k3s 2>/dev/null || true
+sudo systemctl disable k3s 2>/dev/null || true
+sudo pkill -9 -f "k3s" 2>/dev/null || true
+
 if ! command -v k3s >/dev/null 2>&1; then
     curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true sh -
+    sudo systemctl stop k3s 2>/dev/null || true
+    sudo systemctl disable k3s 2>/dev/null || true
 fi
 
 RAW_ID="${NODE_ID:-1}"
@@ -80,12 +86,6 @@ for i in $(seq 1 30); do
     fi
     sleep 1
 done
-
-if ! ip link show ygg0 >/dev/null 2>&1; then
-    echo "ERROR: ygg0 not created! Yggdrasil crash log:" >&2
-    cat /tmp/yggdrasil.log >&2 || true
-    exit 1
-fi
 
 if [ "$NODE_NUM" -le 3 ]; then
     python3 "${SCRIPT_DIR}/mesh_proxy.py" 9001 9002 "$NODE_NUM" >/tmp/mesh_proxy.log 2>&1 &
@@ -177,31 +177,25 @@ RCEOF
 fi
 
 cleanup() {
-    if command -v kubectl >/dev/null 2>&1 && [ -f /etc/rancher/k3s/k3s.yaml ]; then
+    if command -v kubectl >/dev/null 2>&1; then
         kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml drain "free-vpc-${NODE_NUM}" --ignore-daemonsets --delete-emptydir-data --force --grace-period=15 2>/dev/null || true
     fi
 }
 trap cleanup EXIT INT TERM
 
-COMMON_K3S_FLAGS="--node-name free-vpc-${NODE_NUM} --node-ip ${MY_IPV6} --flannel-backend=host-gw --flannel-iface ygg0 --cluster-cidr fd00:42:1::/56 --service-cidr fd00:42:2::/112 --token ${K3S_SECRET}"
+COMMON_K3S_FLAGS="--node-name free-vpc-${NODE_NUM} --token ${K3S_SECRET}"
 
 if [ "$NODE_NUM" -le 3 ]; then
-    ETCD_S3_FLAGS=""
-    if [ -n "${HF_TOKEN:-}" ]; then
-        ETCD_S3_FLAGS="--etcd-s3 --etcd-s3-endpoint 127.0.0.1:9000 --etcd-s3-bucket etcd-backups --etcd-s3-access-key admin --etcd-s3-secret-key ${S3_PASS} --etcd-s3-insecure --etcd-snapshot-schedule-cron 0 */1 * * *"
-    fi
-
     if [ "$NODE_NUM" = "1" ]; then
         sudo k3s server --cluster-init \
             ${COMMON_K3S_FLAGS} \
-            --tls-san master-1 --tls-san master-2 --tls-san master-3 \
-            --disable traefik --disable servicelb --disable local-storage --disable metrics-server \
+            --tls-san master-1 --tls-san master-2 --tls-san master-3 --tls-san 127.0.0.1 \
+            --disable traefik --disable local-storage --disable metrics-server \
             --kube-controller-manager-arg "node-monitor-grace-period=16s" \
-            --kube-controller-manager-arg "pod-eviction-timeout=20s" \
-            ${ETCD_S3_FLAGS} >/tmp/k3s.log 2>&1 &
+            --kube-controller-manager-arg "pod-eviction-timeout=20s" >/tmp/k3s.log 2>&1 &
     else
         for i in $(seq 1 45); do
-            if nc -z -w 2 master-1 6443 2>/dev/null || nc -6 -z -w 2 master-1 6443 2>/dev/null; then
+            if nc -z -w 2 127.0.0.1 6443 2>/dev/null || nc -z -w 2 master-1 6443 2>/dev/null || nc -6 -z -w 2 master-1 6443 2>/dev/null; then
                 break
             fi
             sleep 2
@@ -209,15 +203,14 @@ if [ "$NODE_NUM" -le 3 ]; then
 
         sudo k3s server --server "https://master-1:6443" \
             ${COMMON_K3S_FLAGS} \
-            --tls-san master-1 --tls-san master-2 --tls-san master-3 \
-            --disable traefik --disable servicelb --disable local-storage --disable metrics-server \
+            --tls-san master-1 --tls-san master-2 --tls-san master-3 --tls-san 127.0.0.1 \
+            --disable traefik --disable local-storage --disable metrics-server \
             --kube-controller-manager-arg "node-monitor-grace-period=16s" \
-            --kube-controller-manager-arg "pod-eviction-timeout=20s" \
-            ${ETCD_S3_FLAGS} >/tmp/k3s.log 2>&1 &
+            --kube-controller-manager-arg "pod-eviction-timeout=20s" >/tmp/k3s.log 2>&1 &
     fi
 else
     for i in $(seq 1 60); do
-        if nc -z -w 2 master-1 6443 2>/dev/null || nc -6 -z -w 2 master-1 6443 2>/dev/null || nc -z -w 2 master-2 6443 2>/dev/null || nc -6 -z -w 2 master-2 6443 2>/dev/null; then
+        if nc -z -w 2 127.0.0.1 6443 2>/dev/null || nc -z -w 2 master-1 6443 2>/dev/null || nc -6 -z -w 2 master-1 6443 2>/dev/null; then
             break
         fi
         sleep 2
@@ -227,8 +220,6 @@ else
 
     sudo k3s agent --server "https://127.0.0.1:6443" \
         --node-name "free-vpc-${NODE_NUM}" \
-        --node-ip "${MY_IPV6}" \
-        --flannel-iface "ygg0" \
         --token "${K3S_SECRET}" >/tmp/k3s.log 2>&1 &
 fi
 
@@ -239,8 +230,6 @@ if [ "$NODE_NUM" = "1" ]; then
     for i in $(seq 1 60); do
         if [ -f /etc/rancher/k3s/k3s.yaml ]; then
             sudo chmod 644 /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
-            sudo sed -i "s|https://127.0.0.1:6443|https://master-1:6443|g" /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
-            sudo sed -i "s|https://\[::1\]:6443|https://master-1:6443|g" /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
             if kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get nodes 2>/dev/null | grep -q "Ready"; then
                 echo "K3s node is Ready!"
                 break
@@ -258,23 +247,17 @@ if [ "$NODE_NUM" = "1" ]; then
     fi
 
     sudo chmod 644 /etc/rancher/k3s/k3s.yaml
-    sudo sed -i "s|https://127.0.0.1:6443|https://master-1:6443|g" /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
-    sudo sed -i "s|https://\[::1\]:6443|https://master-1:6443|g" /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
     sudo mkdir -p /root/.kube /home/runner/.kube
     sudo cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
     sudo cp /etc/rancher/k3s/k3s.yaml /home/runner/.kube/config
     sudo chown -R runner:runner /home/runner/.kube
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-    (sudo socat TCP4-LISTEN:6443,fork,reuseaddr "TCP6:[${MY_IPV6}]:6443" >/dev/null 2>&1 || true) &
-    (sudo socat TCP6-LISTEN:6443,fork,reuseaddr "TCP6:[${MY_IPV6}]:6443" >/dev/null 2>&1 || true) &
 
-    echo "Installing Flux v2 CLI and Helm CLI..."
-    if ! command -v flux >/dev/null 2>&1; then
-        curl -s https://fluxcd.io/install.sh | sudo bash 2>/dev/null || true
-    fi
+    (sudo socat TCP6-LISTEN:6443,fork,reuseaddr "TCP4:127.0.0.1:6443" >/dev/null 2>&1 || true) &
 
+    echo "Installing Helm CLI and Gateway CRDs..."
     if ! command -v helm >/dev/null 2>&1; then
-        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | sudo bash 2>/dev/null || true
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | USE_SUDO=false HELM_INSTALL_DIR=/usr/local/bin bash 2>/dev/null || true
     fi
 
     if command -v helm >/dev/null 2>&1; then
@@ -336,6 +319,10 @@ if [ "$NODE_NUM" = "1" ]; then
     if ! command -v sops >/dev/null 2>&1; then
         sudo curl -fsSL https://github.com/getsops/sops/releases/download/v3.9.1/sops-v3.9.1.linux.amd64 -o /usr/local/bin/sops 2>/dev/null || true
         sudo chmod +x /usr/local/bin/sops 2>/dev/null || true
+    fi
+
+    if ! command -v flux >/dev/null 2>&1; then
+        curl -s https://fluxcd.io/install.sh | sudo bash 2>/dev/null || true
     fi
 
     if command -v flux >/dev/null 2>&1; then
