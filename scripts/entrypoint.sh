@@ -69,9 +69,9 @@ sudo systemctl restart ssh || sudo service ssh restart || true
 NODE_NUM="${NODE_ID:-1}"
 TOTAL_SLOTS="${TOTAL_SLOTS:-20}"
 CLUSTER_SALT="${CLUSTER_SALT:-unsafie-cluster-v1}"
-YGG_PASS="${YGG_PASSWORD:-ClusterSecretPass123}"
-K3S_SECRET="${K3S_TOKEN:-ClusterK3sSecret456}"
-S3_PASS="${S3_SECRET_KEY:-SecretS3Pass789}"
+YGG_PASS="${YGG_PASSWORD:?YGG_PASSWORD is required}"
+K3S_SECRET="${K3S_TOKEN:?K3S_TOKEN is required}"
+S3_PASS="${S3_SECRET_KEY:-}"
 
 YGG_DATA=$(python3 "${SCRIPT_DIR}/ygg_gen.py" "$NODE_NUM" "$TOTAL_SLOTS" "$CLUSTER_SALT" "/usr/bin/yggdrasil")
 PRIV_KEY=$(echo "$YGG_DATA" | jq -r .private_key)
@@ -132,7 +132,7 @@ type = crypt
 remote = hf-raw:${HF_BUCKET:-cluster-backups}
 filename_encryption = standard
 directory_name_encryption = true
-password = ${RCLONE_CRYPT_PASSWORD:-ClusterCryptKey123}
+password = ${RCLONE_CRYPT_PASSWORD:-}
 RCEOF
     rclone serve s3 hf-crypt: --addr 127.0.0.1:9000 --auth-key "admin,${S3_PASS}" --vfs-cache-mode minimal >/tmp/rclone.log 2>&1 &
     sleep 2

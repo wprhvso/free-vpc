@@ -132,7 +132,7 @@ function handleCors() {
 }
 
 async function getMasterCryptoKey(env) {
-  const secret = env.MASTER_KEY || "free-vpc-master-default-key-32b!";
+  const secret = env.MASTER_KEY || "";
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey(
     "raw",

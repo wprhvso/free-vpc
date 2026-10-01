@@ -1,7 +1,7 @@
 resource "cloudflare_workers_domain" "vm_domain" {
   account_id = var.cloudflare_account_id
-  zone_id    = "8fdf0e75be2ee4a86d28f9662b258e1b"
-  hostname   = "vm.unsafie.com"
+  zone_id    = var.cloudflare_zone_id
+  hostname   = "vm.${var.cluster_domain}"
   service    = cloudflare_worker_script.orchestrator.name
 }
 
@@ -27,7 +27,7 @@ resource "cloudflare_zero_trust_access_policy" "admin_ui" {
   decision   = "allow"
 
   include {
-    email = ["wprhvso@gmail.com"]
+    email = var.admin_email != "" ? [var.admin_email] : ["admin@${var.cluster_domain}"]
   }
 }
 
@@ -35,7 +35,7 @@ resource "cloudflare_zero_trust_access_application" "vm_app" {
   account_id                = var.cloudflare_account_id
   name                      = "Free VPC Unified Portal"
   type                      = "self_hosted"
-  domain                    = "vm.unsafie.com"
+  domain                    = "vm.${var.cluster_domain}"
   session_duration          = "24h"
   auto_redirect_to_identity = false
 

@@ -4,8 +4,7 @@ resource "cloudflare_zero_trust_access_policy" "device_enrollment" {
   decision   = "allow"
 
   include {
-    email        = ["wprhvso@gmail.com"]
-    email_domain = ["gmail.com"]
+    email = var.admin_email != "" ? [var.admin_email] : ["admin@${var.cluster_domain}"]
   }
 }
 
@@ -15,7 +14,6 @@ resource "cloudflare_zero_trust_access_application" "warp_enrollment" {
   type                 = "warp"
   domain               = "${var.team_name}.cloudflareaccess.com/warp"
   app_launcher_visible = false
-  allowed_idps         = ["636485b2-2a70-40e8-8e3e-758b36fe104b"]
 
   policies = [
     cloudflare_zero_trust_access_policy.device_enrollment.id
