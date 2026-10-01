@@ -41,7 +41,7 @@ MY_IPV6=$(echo "$YGG_DATA" | jq -r .my_address)
 
 echo "$YGG_DATA" | jq -r ".hosts[]" | sudo tee -a /etc/hosts >/dev/null
 
-sudo mkdir -p /etc/yggdrasil
+sudo mkdir -p /etc/yggdrasil /var/run/yggdrasil /run/yggdrasil
 if [ "$NODE_NUM" -le 3 ]; then
     LISTEN_CONF="[\"ws://127.0.0.1:9001?password=${YGG_PASS}\"]"
 else
@@ -121,40 +121,7 @@ if [ "$NODE_NUM" -le 3 ]; then
     TOKEN_VAR="CF_TUNNEL_TOKEN_${NODE_NUM}"
     CURRENT_TUNNEL_TOKEN="${!TOKEN_VAR:-${CF_TUNNEL_TOKEN:-}}"
     if [ -n "$CURRENT_TUNNEL_TOKEN" ]; then
-        TOKEN_JSON=$(echo "$CURRENT_TUNNEL_TOKEN" | base64 -d 2>/dev/null || true)
-        CF_ACC=$(echo "$TOKEN_JSON" | jq -r '.a // empty' 2>/dev/null || true)
-        CF_TUN_ID=$(echo "$TOKEN_JSON" | jq -r '.t // empty' 2>/dev/null || true)
-        CF_SECRET=$(echo "$TOKEN_JSON" | jq -r '.s // empty' 2>/dev/null || true)
-
-        if [ -n "$CF_ACC" ] && [ -n "$CF_TUN_ID" ] && [ -n "$CF_SECRET" ]; then
-            sudo mkdir -p /etc/cloudflared
-            cat <<CREDEOF | sudo tee /etc/cloudflared/credentials.json >/dev/null
-{
-  "AccountTag": "${CF_ACC}",
-  "TunnelID": "${CF_TUN_ID}",
-  "TunnelSecret": "${CF_SECRET}"
-}
-CREDEOF
-            cat <<CFEOF | sudo tee /etc/cloudflared/config.yml >/dev/null
-tunnel: ${CF_TUN_ID}
-credentials-file: /etc/cloudflared/credentials.json
-ingress:
-  - hostname: mesh${NODE_NUM}.unsafie.com
-    service: http://127.0.0.1:9001
-  - hostname: gitops.unsafie.com
-    service: http://127.0.0.1:80
-  - hostname: headlamp.unsafie.com
-    service: http://127.0.0.1:80
-  - hostname: ui.unsafie.com
-    service: http://127.0.0.1:80
-  - hostname: "*.unsafie.com"
-    service: http://127.0.0.1:80
-  - service: http_status:404
-CFEOF
-            sudo /usr/local/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run >/tmp/cf_tunnel.log 2>&1 &
-        else
-            sudo /usr/local/bin/cloudflared tunnel run --token "$CURRENT_TUNNEL_TOKEN" >/tmp/cf_tunnel.log 2>&1 &
-        fi
+        sudo /usr/local/bin/cloudflared tunnel run --token "$CURRENT_TUNNEL_TOKEN" >/tmp/cf_tunnel.log 2>&1 &
         sleep 2
     fi
 fi
