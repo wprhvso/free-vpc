@@ -9,7 +9,7 @@ if [ -e /dev/kvm ]; then
     sudo chmod 666 /dev/kvm
 fi
 
-sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd socat python3-cryptography rclone e2fsprogs iptables 2>/dev/null || true
+sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd socat python3-cryptography rclone e2fsprogs iptables xz-utils 2>/dev/null || true
 
 if ! command -v yggdrasil >/dev/null 2>&1; then
     curl -fsSL https://github.com/yggdrasil-network/yggdrasil-go/releases/download/v0.5.14/yggdrasil-0.5.14-amd64.deb -o /tmp/ygg.deb
@@ -26,6 +26,69 @@ if ! command -v k3s >/dev/null 2>&1; then
     curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true sh -
 fi
 
+if ! command -v containerd-shim-kata-v2 >/dev/null 2>&1; then
+    echo "Installing Kata Containers runtime..."
+    KATA_VER="3.10.0"
+    KATA_URL="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VER}/kata-static-${KATA_VER}-amd64.tar.xz"
+    curl -fsSL "$KATA_URL" -o /tmp/kata.tar.xz 2>/dev/null && sudo tar -xJf /tmp/kata.tar.xz -C / 2>/dev/null && rm -f /tmp/kata.tar.xz || true
+    if [ -d /opt/kata/bin ]; then
+        sudo ln -sf /opt/kata/bin/* /usr/local/bin/
+    fi
+fi
+
+sudo mkdir -p /var/lib/rancher/k3s/agent/etc/containerd
+cat <<KATAEOF | sudo tee /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl >/dev/null
+{{ template "base" . }}
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
+  runtime_type = "io.containerd.kata.v2"
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata-clh]
+  runtime_type = "io.containerd.kata-clh.v2"
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata-qemu]
+  runtime_type = "io.containerd.kata-qemu.v2"
+
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata]
+  runtime_type = "io.containerd.kata.v2"
+
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-clh]
+  runtime_type = "io.containerd.kata-clh.v2"
+
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu]
+  runtime_type = "io.containerd.kata-qemu.v2"
+KATAEOF
+
+sudo mkdir -p /etc/rancher/k3s
+cat <<PSAEOF | sudo tee /etc/rancher/k3s/psa.yaml >/dev/null
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+- name: PodSecurity
+  configuration:
+    apiVersion: pod-security.admission.config.k8s.io/v1
+    kind: PodSecurityConfiguration
+    defaults:
+      enforce: "restricted"
+      enforce-version: "latest"
+      audit: "restricted"
+      audit-version: "latest"
+      warn: "restricted"
+      warn-version: "latest"
+    exemptions:
+      usernames: []
+      runtimeClasses: []
+      namespaces:
+        - kube-system
+        - flux-system
+        - envoy-gateway-system
+        - spegel
+        - headlamp
+PSAEOF
+
+sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 30080 2>/dev/null || true
+sudo iptables -t nat -A OUTPUT -p tcp -o lo --dport 80 -j REDIRECT --to-ports 30080 2>/dev/null || true
+
 sudo mkdir -p /etc/ssh /etc/ssh/sshd_config.d
 if [ -n "${SSH_HOST_ED25519_KEY:-}" ]; then
     echo "${SSH_HOST_ED25519_KEY}" | sudo tee /etc/ssh/ssh_host_ed25519_key >/dev/null
@@ -38,7 +101,7 @@ if [ -n "${SSH_HOST_RSA_KEY:-}" ]; then
     sudo ssh-keygen -y -f /etc/ssh/ssh_host_rsa_key | sudo tee /etc/ssh/ssh_host_rsa_key.pub >/dev/null
 fi
 
-cat <<'SSHEOF' | sudo tee /etc/ssh/sshd_config.d/free-vpc.conf >/dev/null
+cat <<SSHEOF | sudo tee /etc/ssh/sshd_config.d/free-vpc.conf >/dev/null
 Port 22
 PasswordAuthentication no
 PubkeyAuthentication yes
@@ -79,11 +142,11 @@ YGG_DATA=$(python3 "${SCRIPT_DIR}/ygg_gen.py" "$NODE_NUM" "$TOTAL_SLOTS" "$CLUST
 PRIV_KEY=$(echo "$YGG_DATA" | jq -r .private_key)
 MY_IPV6=$(echo "$YGG_DATA" | jq -r .my_address)
 
-echo "$YGG_DATA" | jq -r '.hosts[]' | sudo tee -a /etc/hosts >/dev/null
+echo "$YGG_DATA" | jq -r ".hosts[]" | sudo tee -a /etc/hosts >/dev/null
 
 sudo mkdir -p /etc/yggdrasil
 if [ "$NODE_NUM" -le 3 ]; then
-    LISTEN_CONF="[\"ws://127.0.0.1:9001?password=${YGG_PASS}\"]"
+    LISTEN_CONF="["ws://127.0.0.1:9001?password=${YGG_PASS}"]"
 else
     LISTEN_CONF="[]"
 fi
@@ -155,6 +218,8 @@ if [ "$NODE_NUM" -le 3 ]; then
         ETCD_S3_FLAGS="--etcd-s3 --etcd-s3-endpoint 127.0.0.1:9000 --etcd-s3-bucket etcd-backups --etcd-s3-access-key admin --etcd-s3-secret-key ${S3_PASS} --etcd-s3-insecure --etcd-snapshot-schedule-cron 0 */1 * * *"
     fi
 
+    PSA_ARG="--kube-apiserver-arg admission-control-config-file=/etc/rancher/k3s/psa.yaml"
+
     if [ "$NODE_NUM" = "1" ]; then
         sudo k3s server --cluster-init \
             ${COMMON_K3S_FLAGS} \
@@ -162,6 +227,7 @@ if [ "$NODE_NUM" -le 3 ]; then
             --disable traefik --disable servicelb --disable local-storage --disable metrics-server \
             --kube-controller-manager-arg "node-monitor-grace-period=16s" \
             --kube-controller-manager-arg "pod-eviction-timeout=20s" \
+            ${PSA_ARG} \
             ${ETCD_S3_FLAGS} >/tmp/k3s.log 2>&1 &
     else
         for i in $(seq 1 45); do
@@ -177,6 +243,7 @@ if [ "$NODE_NUM" -le 3 ]; then
             --disable traefik --disable servicelb --disable local-storage --disable metrics-server \
             --kube-controller-manager-arg "node-monitor-grace-period=16s" \
             --kube-controller-manager-arg "pod-eviction-timeout=20s" \
+            ${PSA_ARG} \
             ${ETCD_S3_FLAGS} >/tmp/k3s.log 2>&1 &
     fi
 else
@@ -196,7 +263,81 @@ else
         --token "${K3S_SECRET}" >/tmp/k3s.log 2>&1 &
 fi
 
+HEADLAMP_TOKEN=""
+
 if [ "$NODE_NUM" = "1" ]; then
+    echo "Waiting for k3s cluster to initialize..."
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    for i in $(seq 1 60); do
+        if sudo kubectl get nodes 2>/dev/null | grep -q "Ready"; then
+            break
+        fi
+        sleep 2
+    done
+
+    echo "Installing Flux v2 CLI and Helm CLI..."
+    if ! command -v flux >/dev/null 2>&1; then
+        curl -s https://fluxcd.io/install.sh | sudo bash 2>/dev/null || true
+    fi
+
+    if ! command -v helm >/dev/null 2>&1; then
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | sudo bash 2>/dev/null || true
+    fi
+
+    if ! command -v sops >/dev/null 2>&1; then
+        sudo curl -fsSL https://github.com/getsops/sops/releases/download/v3.9.1/sops-v3.9.1.linux.amd64 -o /usr/local/bin/sops 2>/dev/null || true
+        sudo chmod +x /usr/local/bin/sops 2>/dev/null || true
+    fi
+
+    if command -v flux >/dev/null 2>&1; then
+        echo "Bootstrapping Flux v2 controllers..."
+        sudo flux install --components=source-controller,kustomize-controller,helm-controller,notification-controller || true
+
+        sudo kubectl create secret generic sops-age \
+            --namespace=flux-system \
+            --from-literal=age.agekey="${SOPS_AGE_KEY:-AGE-SECRET-KEY-106S3FMM5Q6HANQXGVJRJY9NUC943X2E6GDVJW32JPU022XWEKTJQ96XKGY}" \
+            --dry-run=client -o yaml | sudo kubectl apply -f - || true
+
+        sudo kubectl create secret generic cluster-user-auth \
+            --namespace=flux-system \
+            --from-literal=username="admin" \
+            --from-literal=password="\$2a\$10\$ceOhGVam1gdh2ctMHentueYObHqvRySuweffs7xKXfN2.p4joA1WK" \
+            --dry-run=client -o yaml | sudo kubectl apply -f - || true
+
+        sudo kubectl create namespace headlamp --dry-run=client -o yaml | sudo kubectl apply -f - || true
+        sudo kubectl create serviceaccount headlamp-admin --namespace=headlamp --dry-run=client -o yaml | sudo kubectl apply -f - || true
+        sudo kubectl create clusterrolebinding headlamp-admin --clusterrole=cluster-admin --serviceaccount=headlamp:headlamp-admin --dry-run=client -o yaml | sudo kubectl apply -f - || true
+
+        cat <<TOKEOF | sudo kubectl apply -f - || true
+apiVersion: v1
+kind: Secret
+metadata:
+  name: headlamp-admin-token
+  namespace: headlamp
+  annotations:
+    kubernetes.io/service-account.name: headlamp-admin
+type: kubernetes.io/service-account-token
+TOKEOF
+
+        sudo flux create source git free-vpc \
+            --url="https://github.com/${GITHUB_REPOSITORY:-wprhvso/free-vpc}.git" \
+            --branch="${GITHUB_REF_NAME:-main}" \
+            --interval=1m \
+            --export | sudo kubectl apply -f - || true
+
+        sudo flux create kustomization cluster-sync \
+            --source=free-vpc \
+            --path="./gitops/clusters/free-vpc" \
+            --prune=true \
+            --interval=1m \
+            --decryption-provider=sops \
+            --decryption-secret=sops-age \
+            --export | sudo kubectl apply -f - || true
+
+        sleep 5
+        HEADLAMP_TOKEN=$(sudo kubectl get secret headlamp-admin-token -n headlamp -o jsonpath="{.data.token}" 2>/dev/null | base64 -d || true)
+    fi
+
     bash "${SCRIPT_DIR}/cluster_orchestrator.sh" "$NODE_NUM" "${GITHUB_REPOSITORY:-wprhvso/free-vpc}" "${GH_PAT:-}" "$TOTAL_SLOTS" "${GITHUB_REF_NAME:-main}" >/tmp/orchestrator.log 2>&1 &
 fi
 
@@ -205,7 +346,38 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     if [ "$NODE_NUM" -le 3 ]; then
         ROLE="Master (Control Plane)"
     fi
-    printf "## Free VPC Kubernetes Node Online\n- Role: \`%s\`\n- Slot: \`#%s\`\n- Yggdrasil IPv6: \`%s\`\n- Peers: \`mesh1..3.unsafie.com\`\n" "$ROLE" "$NODE_NUM" "$MY_IPV6" >>"$GITHUB_STEP_SUMMARY"
+    printf "## Free VPC Kubernetes Node Online
+- Role: \`%s\`
+- Slot: \`#%s\`
+- Yggdrasil IPv6: \`%s\`
+- Peers: \`mesh1..3.unsafie.com\`
+" "$ROLE" "$NODE_NUM" "$MY_IPV6" >>"$GITHUB_STEP_SUMMARY"
+
+    if [ "$NODE_NUM" = "1" ]; then
+        printf "
+### Cluster Management & UIs
+" >>"$GITHUB_STEP_SUMMARY"
+        printf -- "- **Weave GitOps (Flux v2 UI)**: [https://gitops.unsafie.com](https://gitops.unsafie.com)
+  - Username: \`admin\`
+  - Password: \`unsafie2026!\`
+" >>"$GITHUB_STEP_SUMMARY"
+        printf -- "- **Headlamp (Kubernetes Web UI)**: [https://headlamp.unsafie.com](https://headlamp.unsafie.com) | [https://ui.unsafie.com](https://ui.unsafie.com)
+" >>"$GITHUB_STEP_SUMMARY"
+        if [ -n "$HEADLAMP_TOKEN" ]; then
+            printf "  - ServiceAccount Bearer Token: \`%s\`
+" "$HEADLAMP_TOKEN" >>"$GITHUB_STEP_SUMMARY"
+        fi
+        printf -- "- **Envoy Gateway**: Gateway API v1 active on NodePort 30080 / Port 80
+" >>"$GITHUB_STEP_SUMMARY"
+        printf -- "- **Spegel**: P2P Registry Cache active on containerd
+" >>"$GITHUB_STEP_SUMMARY"
+        printf -- "- **Kata Containers**: RuntimeClasses \`kata\`, \`kata-clh\`, \`kata-qemu\`
+" >>"$GITHUB_STEP_SUMMARY"
+        printf -- "- **Pod Security Admission**: Restricted profile enforced cluster-wide
+" >>"$GITHUB_STEP_SUMMARY"
+        printf -- "- **SOPS**: Age key encryption configured
+" >>"$GITHUB_STEP_SUMMARY"
+    fi
 fi
 
 START_TIME=$SECONDS

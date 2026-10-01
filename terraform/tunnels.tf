@@ -21,6 +21,22 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "mesh_config" {
       service  = "http://127.0.0.1:9001"
     }
     ingress_rule {
+      hostname = "gitops.${var.cluster_domain}"
+      service  = "http://127.0.0.1:80"
+    }
+    ingress_rule {
+      hostname = "headlamp.${var.cluster_domain}"
+      service  = "http://127.0.0.1:80"
+    }
+    ingress_rule {
+      hostname = "ui.${var.cluster_domain}"
+      service  = "http://127.0.0.1:80"
+    }
+    ingress_rule {
+      hostname = "*.${var.cluster_domain}"
+      service  = "http://127.0.0.1:80"
+    }
+    ingress_rule {
       service = "http_status:404"
     }
   }
@@ -32,6 +48,23 @@ resource "cloudflare_record" "mesh_record" {
   name    = "mesh${count.index + 1}"
   type    = "CNAME"
   content = "${cloudflare_zero_trust_tunnel_cloudflared.mesh_tunnel[count.index].id}.cfargotunnel.com"
+  proxied = true
+}
+
+resource "cloudflare_record" "ui_records" {
+  for_each = toset(["gitops", "headlamp", "ui"])
+  zone_id  = var.cloudflare_zone_id
+  name     = each.key
+  type     = "CNAME"
+  content  = "${cloudflare_zero_trust_tunnel_cloudflared.mesh_tunnel[0].id}.cfargotunnel.com"
+  proxied  = true
+}
+
+resource "cloudflare_record" "wildcard_record" {
+  zone_id = var.cloudflare_zone_id
+  name    = "*"
+  type    = "CNAME"
+  content = "${cloudflare_zero_trust_tunnel_cloudflared.mesh_tunnel[0].id}.cfargotunnel.com"
   proxied = true
 }
 

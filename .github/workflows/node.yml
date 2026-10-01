@@ -32,6 +32,7 @@ jobs:
           HF_BUCKET: ${{ secrets.HF_BUCKET }}
           RCLONE_CRYPT_PASSWORD: ${{ secrets.RCLONE_CRYPT_PASSWORD }}
           S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
           SSH_HOST_ED25519_KEY: ${{ secrets.SSH_HOST_ED25519_KEY }}
           SSH_HOST_RSA_KEY: ${{ secrets.SSH_HOST_RSA_KEY }}
           SSH_AUTHORIZED_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}

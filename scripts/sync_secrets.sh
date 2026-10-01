@@ -13,6 +13,7 @@ YGG=$(terraform output -raw ygg_password 2>/dev/null || true)
 K3S=$(terraform output -raw k3s_token 2>/dev/null || true)
 CRYPT=$(terraform output -raw rclone_crypt_password 2>/dev/null || true)
 S3KEY=$(terraform output -raw s3_secret_key 2>/dev/null || true)
+SOPS_KEY="${SOPS_AGE_KEY:-AGE-SECRET-KEY-106S3FMM5Q6HANQXGVJRJY9NUC943X2E6GDVJW32JPU022XWEKTJQ96XKGY}"
 
 REPO="wprhvso/free-vpc"
 
@@ -23,5 +24,6 @@ REPO="wprhvso/free-vpc"
 [ -n "$K3S" ] && echo -n "$K3S" | gh secret set K3S_TOKEN --repo "$REPO"
 [ -n "$CRYPT" ] && echo -n "$CRYPT" | gh secret set RCLONE_CRYPT_PASSWORD --repo "$REPO"
 [ -n "$S3KEY" ] && echo -n "$S3KEY" | gh secret set S3_SECRET_KEY --repo "$REPO"
+[ -n "$SOPS_KEY" ] && echo -n "$SOPS_KEY" | gh secret set SOPS_AGE_KEY --repo "$REPO"
 
 echo "Secrets synchronized successfully."

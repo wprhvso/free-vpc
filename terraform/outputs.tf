@@ -37,3 +37,15 @@ output "s3_secret_key" {
   value     = random_password.s3_secret_key.result
   sensitive = true
 }
+
+output "gitops_url" {
+  value = "https://gitops.${var.cluster_domain}"
+}
+
+output "headlamp_url" {
+  value = "https://headlamp.${var.cluster_domain}"
+}
+
+output "ui_url" {
+  value = "https://ui.${var.cluster_domain}"
+}
