@@ -12,7 +12,7 @@ on:
 
 jobs:
   run-node:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
       - name: Checkout
