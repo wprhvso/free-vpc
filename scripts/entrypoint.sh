@@ -63,49 +63,7 @@ cat <<YGGEOF | sudo tee /etc/yggdrasil/yggdrasil.conf >/dev/null
 YGGEOF
 
 sudo yggdrasil -useconffile /etc/yggdrasil/yggdrasil.conf >/tmp/yggdrasil.log 2>&1 &
-sleep 1
-
-if [ "$NODE_NUM" -le 3 ]; then
-    TOKEN_VAR="CF_TUNNEL_TOKEN_${NODE_NUM}"
-    CURRENT_TUNNEL_TOKEN="${!TOKEN_VAR:-${CF_TUNNEL_TOKEN:-}}"
-    if [ -n "$CURRENT_TUNNEL_TOKEN" ]; then
-        TOKEN_JSON=$(echo "$CURRENT_TUNNEL_TOKEN" | base64 -d 2>/dev/null || true)
-        CF_ACC=$(echo "$TOKEN_JSON" | jq -r '.a // empty' 2>/dev/null || true)
-        CF_TUN_ID=$(echo "$TOKEN_JSON" | jq -r '.t // empty' 2>/dev/null || true)
-        CF_SECRET=$(echo "$TOKEN_JSON" | jq -r '.s // empty' 2>/dev/null || true)
-
-        if [ -n "$CF_ACC" ] && [ -n "$CF_TUN_ID" ] && [ -n "$CF_SECRET" ]; then
-            sudo mkdir -p /etc/cloudflared
-            cat <<CREDEOF | sudo tee /etc/cloudflared/credentials.json >/dev/null
-{
-  "AccountTag": "${CF_ACC}",
-  "TunnelID": "${CF_TUN_ID}",
-  "TunnelSecret": "${CF_SECRET}"
-}
-CREDEOF
-            cat <<CFEOF | sudo tee /etc/cloudflared/config.yml >/dev/null
-tunnel: ${CF_TUN_ID}
-credentials-file: /etc/cloudflared/credentials.json
-ingress:
-  - hostname: mesh${NODE_NUM}.unsafie.com
-    service: http://127.0.0.1:9001
-  - hostname: gitops.unsafie.com
-    service: http://127.0.0.1:80
-  - hostname: headlamp.unsafie.com
-    service: http://127.0.0.1:80
-  - hostname: ui.unsafie.com
-    service: http://127.0.0.1:80
-  - hostname: "*.unsafie.com"
-    service: http://127.0.0.1:80
-  - service: http_status:404
-CFEOF
-            /usr/local/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run >/tmp/cf_tunnel.log 2>&1 &
-        else
-            /usr/local/bin/cloudflared tunnel run --token "$CURRENT_TUNNEL_TOKEN" >/tmp/cf_tunnel.log 2>&1 &
-        fi
-        sleep 2
-    fi
-fi
+sleep 2
 
 sudo mkdir -p /etc/ssh /etc/ssh/sshd_config.d
 if [ -n "${SSH_HOST_ED25519_KEY:-}" ]; then
@@ -209,6 +167,48 @@ sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 3008
 sudo iptables -t nat -A OUTPUT -p tcp -o lo --dport 80 -j REDIRECT --to-ports 30080 2>/dev/null || true
 sudo socat TCP-LISTEN:80,fork,reuseaddr TCP:127.0.0.1:30080 >/dev/null 2>&1 &
 
+if [ "$NODE_NUM" -le 3 ]; then
+    TOKEN_VAR="CF_TUNNEL_TOKEN_${NODE_NUM}"
+    CURRENT_TUNNEL_TOKEN="${!TOKEN_VAR:-${CF_TUNNEL_TOKEN:-}}"
+    if [ -n "$CURRENT_TUNNEL_TOKEN" ]; then
+        TOKEN_JSON=$(echo "$CURRENT_TUNNEL_TOKEN" | base64 -d 2>/dev/null || true)
+        CF_ACC=$(echo "$TOKEN_JSON" | jq -r '.a // empty' 2>/dev/null || true)
+        CF_TUN_ID=$(echo "$TOKEN_JSON" | jq -r '.t // empty' 2>/dev/null || true)
+        CF_SECRET=$(echo "$TOKEN_JSON" | jq -r '.s // empty' 2>/dev/null || true)
+
+        if [ -n "$CF_ACC" ] && [ -n "$CF_TUN_ID" ] && [ -n "$CF_SECRET" ]; then
+            sudo mkdir -p /etc/cloudflared
+            cat <<CREDEOF | sudo tee /etc/cloudflared/credentials.json >/dev/null
+{
+  "AccountTag": "${CF_ACC}",
+  "TunnelID": "${CF_TUN_ID}",
+  "TunnelSecret": "${CF_SECRET}"
+}
+CREDEOF
+            cat <<CFEOF | sudo tee /etc/cloudflared/config.yml >/dev/null
+tunnel: ${CF_TUN_ID}
+credentials-file: /etc/cloudflared/credentials.json
+ingress:
+  - hostname: mesh${NODE_NUM}.unsafie.com
+    service: http://127.0.0.1:9001
+  - hostname: gitops.unsafie.com
+    service: http://127.0.0.1:80
+  - hostname: headlamp.unsafie.com
+    service: http://127.0.0.1:80
+  - hostname: ui.unsafie.com
+    service: http://127.0.0.1:80
+  - hostname: "*.unsafie.com"
+    service: http://127.0.0.1:80
+  - service: http_status:404
+CFEOF
+            /usr/local/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run >/tmp/cf_tunnel.log 2>&1 &
+        else
+            /usr/local/bin/cloudflared tunnel run --token "$CURRENT_TUNNEL_TOKEN" >/tmp/cf_tunnel.log 2>&1 &
+        fi
+        sleep 2
+    fi
+fi
+
 if [ -n "${HF_TOKEN:-}" ]; then
     mkdir -p ~/.config/rclone
     cat <<RCEOF > ~/.config/rclone/rclone.conf
@@ -236,8 +236,8 @@ RCEOF
 fi
 
 cleanup() {
-    if command -v kubectl >/dev/null 2>&1; then
-        kubectl drain "free-vpc-${NODE_NUM}" --ignore-daemonsets --delete-emptydir-data --force --grace-period=15 2>/dev/null || true
+    if command -v kubectl >/dev/null 2>&1 && [ -f /etc/rancher/k3s/k3s.yaml ]; then
+        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml drain "free-vpc-${NODE_NUM}" --ignore-daemonsets --delete-emptydir-data --force --grace-period=15 2>/dev/null || true
     fi
 }
 trap cleanup EXIT INT TERM
@@ -299,13 +299,19 @@ HEADLAMP_TOKEN=""
 
 if [ "$NODE_NUM" = "1" ]; then
     echo "Waiting for k3s cluster to initialize..."
-    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
     for i in $(seq 1 60); do
-        if sudo kubectl get nodes 2>/dev/null | grep -q "Ready"; then
+        if [ -f /etc/rancher/k3s/k3s.yaml ] && sudo k3s kubectl get nodes 2>/dev/null | grep -q "Ready"; then
             break
         fi
         sleep 2
     done
+
+    sudo chmod 644 /etc/rancher/k3s/k3s.yaml
+    sudo mkdir -p /root/.kube /home/runner/.kube
+    sudo cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
+    sudo cp /etc/rancher/k3s/k3s.yaml /home/runner/.kube/config
+    sudo chown -R runner:runner /home/runner/.kube
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
     echo "Installing Flux v2 CLI and Helm CLI..."
     if ! command -v flux >/dev/null 2>&1; then
@@ -323,24 +329,24 @@ if [ "$NODE_NUM" = "1" ]; then
 
     if command -v flux >/dev/null 2>&1; then
         echo "Bootstrapping Flux v2 controllers..."
-        sudo flux install --components=source-controller,kustomize-controller,helm-controller,notification-controller || true
+        flux --kubeconfig /etc/rancher/k3s/k3s.yaml install --components=source-controller,kustomize-controller,helm-controller,notification-controller || true
 
-        sudo kubectl create secret generic sops-age \
+        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create secret generic sops-age \
             --namespace=flux-system \
             --from-literal=age.agekey="${SOPS_AGE_KEY:-AGE-SECRET-KEY-106S3FMM5Q6HANQXGVJRJY9NUC943X2E6GDVJW32JPU022XWEKTJQ96XKGY}" \
-            --dry-run=client -o yaml | sudo kubectl apply -f - || true
+            --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
 
-        sudo kubectl create secret generic cluster-user-auth \
+        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create secret generic cluster-user-auth \
             --namespace=flux-system \
             --from-literal=username="admin" \
             --from-literal=password='$2a$10$ceOhGVam1gdh2ctMHentueYObHqvRySuweffs7xKXfN2.p4joA1WK' \
-            --dry-run=client -o yaml | sudo kubectl apply -f - || true
+            --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
 
-        sudo kubectl create namespace headlamp --dry-run=client -o yaml | sudo kubectl apply -f - || true
-        sudo kubectl create serviceaccount headlamp-admin --namespace=headlamp --dry-run=client -o yaml | sudo kubectl apply -f - || true
-        sudo kubectl create clusterrolebinding headlamp-admin --clusterrole=cluster-admin --serviceaccount=headlamp:headlamp-admin --dry-run=client -o yaml | sudo kubectl apply -f - || true
+        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create namespace headlamp --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
+        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create serviceaccount headlamp-admin --namespace=headlamp --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
+        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create clusterrolebinding headlamp-admin --clusterrole=cluster-admin --serviceaccount=headlamp:headlamp-admin --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
 
-        cat <<TOKEOF | sudo kubectl apply -f - || true
+        cat <<TOKEOF | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
 apiVersion: v1
 kind: Secret
 metadata:
@@ -351,23 +357,23 @@ metadata:
 type: kubernetes.io/service-account-token
 TOKEOF
 
-        sudo flux create source git free-vpc \
+        flux --kubeconfig /etc/rancher/k3s/k3s.yaml create source git free-vpc \
             --url="https://github.com/${GITHUB_REPOSITORY:-wprhvso/free-vpc}.git" \
             --branch="${GITHUB_REF_NAME:-main}" \
             --interval=1m \
-            --export | sudo kubectl apply -f - || true
+            --export | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
 
-        sudo flux create kustomization cluster-sync \
+        flux --kubeconfig /etc/rancher/k3s/k3s.yaml create kustomization cluster-sync \
             --source=free-vpc \
             --path="./gitops/clusters/free-vpc" \
             --prune=true \
             --interval=1m \
             --decryption-provider=sops \
             --decryption-secret=sops-age \
-            --export | sudo kubectl apply -f - || true
+            --export | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
 
         sleep 5
-        HEADLAMP_TOKEN=$(sudo kubectl get secret headlamp-admin-token -n headlamp -o jsonpath="{.data.token}" 2>/dev/null | base64 -d || true)
+        HEADLAMP_TOKEN=$(kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get secret headlamp-admin-token -n headlamp -o jsonpath="{.data.token}" 2>/dev/null | base64 -d || true)
     fi
 
     bash "${SCRIPT_DIR}/cluster_orchestrator.sh" "$NODE_NUM" "${GITHUB_REPOSITORY:-wprhvso/free-vpc}" "${GH_PAT:-}" "$TOTAL_SLOTS" "${GITHUB_REF_NAME:-main}" >/tmp/orchestrator.log 2>&1 &
