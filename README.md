@@ -6,6 +6,7 @@ Free VPC turns ephemeral GitHub Actions runners into a high-availability **20-no
 
 ## Cloud-Native Platform Stack
 
+- **Ansible + Mitogen:** Fast execution strategy plugin accelerating node provisioning and role execution.
 - **Envoy Gateway:** Kubernetes Gateway API v1 implementation serving all ingress traffic.
 - **Flux v2 & Helm:** Continuous GitOps reconciliation managing all cluster infrastructure via Helm releases and OCI repositories.
 - **Spegel:** Stateless cluster-local P2P OCI registry cache accelerating container image distribution across nodes.

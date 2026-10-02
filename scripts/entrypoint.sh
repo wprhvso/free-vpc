@@ -12,11 +12,21 @@ if ! command -v ansible-playbook >/dev/null 2>&1; then
     sudo apt-get update -qq && sudo apt-get install -y -qq ansible-core 2>/dev/null || true
 fi
 
+if ! python3 -c "import ansible_mitogen" >/dev/null 2>&1; then
+    sudo pip install --break-system-packages mitogen 2>/dev/null || sudo pip install mitogen 2>/dev/null || pip install mitogen 2>/dev/null || true
+fi
+
+MITOGEN_STRATEGY=$(python3 -c "import os, ansible_mitogen; print(os.path.join(os.path.dirname(ansible_mitogen.__file__), 'plugins', 'strategy'))" 2>/dev/null || true)
+if [ -n "$MITOGEN_STRATEGY" ] && [ -d "$MITOGEN_STRATEGY" ]; then
+    export ANSIBLE_STRATEGY_PLUGINS="$MITOGEN_STRATEGY"
+    export ANSIBLE_STRATEGY="mitogen_linear"
+fi
+
 ANSIBLE_BIN=$(command -v ansible-playbook || echo "/usr/bin/ansible-playbook")
 
 cd "$REPO_DIR"
 
-sudo "$ANSIBLE_BIN" -i "localhost," -c local playbooks/node.yml \
+sudo -E "$ANSIBLE_BIN" -i "localhost," -c local playbooks/node.yml \
   -e "node_id=${NODE_NUM}" \
   -e "total_slots=${TOTAL_SLOTS:-20}" \
   -e "cluster_salt=${CLUSTER_SALT:-unsafie-cluster-v1}" \
@@ -43,7 +53,7 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     if [ "$NODE_NUM" -le 3 ]; then
         ROLE="Master (Control Plane)"
     fi
-    printf "## Free VPC Kubernetes Node Online\n- Role: \`%s\`\n- Slot: \`#%s\`\n- Node Provisioner: Ansible\n" "$ROLE" "$NODE_NUM" >>"$GITHUB_STEP_SUMMARY"
+    printf "## Free VPC Kubernetes Node Online\n- Role: \`%s\`\n- Slot: \`#%s\`\n- Provisioner: Ansible (Mitogen accelerated)\n" "$ROLE" "$NODE_NUM" >>"$GITHUB_STEP_SUMMARY"
     if [ "$NODE_NUM" = "1" ]; then
         printf "\n### Cluster Management & UIs\n" >>"$GITHUB_STEP_SUMMARY"
         printf -- "- **Weave GitOps**: [https://gitops.unsafie.com](https://gitops.unsafie.com)\n" >>"$GITHUB_STEP_SUMMARY"

@@ -1,6 +1,7 @@
 - name: bootstrap free-vpc node
   hosts: localhost
   connection: local
+  strategy: mitogen_linear
   gather_facts: true
   vars:
     slot_id: "{{ node_id | int }}"
