@@ -1,0 +1,59 @@
+- name: check if kata runtime binary exists
+  stat:
+    path: /usr/local/bin/containerd-shim-kata-v2
+  register: kata_bin_stat
+
+- name: download kata static archive
+  get_url:
+    url: "https://github.com/kata-containers/kata-containers/releases/download/3.10.0/kata-static-3.10.0-amd64.tar.xz"
+    dest: /tmp/kata.tar.xz
+    mode: "0644"
+  when: not kata_bin_stat.stat.exists
+
+- name: extract kata runtime archive to root
+  unarchive:
+    src: /tmp/kata.tar.xz
+    dest: /
+    remote_src: yes
+  when: not kata_bin_stat.stat.exists
+
+- name: symlink kata binaries
+  shell: |
+    if [ -d /opt/kata/bin ]; then
+      ln -sf /opt/kata/bin/* /usr/local/bin/
+      ln -sf /opt/kata/bin/* /usr/bin/
+    fi
+    rm -f /tmp/kata.tar.xz
+  args:
+    executable: /bin/bash
+  when: not kata_bin_stat.stat.exists
+
+- name: ensure containerd config templates directory exists
+  file:
+    path: /var/lib/rancher/k3s/agent/etc/containerd
+    state: directory
+    mode: "0755"
+
+- name: deploy containerd template v2
+  template:
+    src: config.toml.tmpl.j2
+    dest: /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
+    mode: "0644"
+
+- name: deploy containerd template v3
+  template:
+    src: config.toml.tmpl.j2
+    dest: /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl
+    mode: "0644"
+
+- name: ensure k3s config directory exists
+  file:
+    path: /etc/rancher/k3s
+    state: directory
+    mode: "0755"
+
+- name: deploy pod security admission configuration
+  template:
+    src: psa.yaml.j2
+    dest: /etc/rancher/k3s/psa.yaml
+    mode: "0644"

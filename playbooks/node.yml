@@ -1,0 +1,16 @@
+- name: bootstrap free-vpc node
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    slot_id: "{{ node_id | int }}"
+    is_master: "{{ (node_id | int) <= 3 }}"
+    is_seed: "{{ (node_id | int) == 1 }}"
+    repo_dir: "{{ playbook_dir }}/.."
+  roles:
+    - common
+    - yggdrasil
+    - kata
+    - ingress
+    - k3s
+    - gitops

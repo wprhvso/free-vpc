@@ -1,0 +1,88 @@
+- name: check if yggdrasil binary exists
+  stat:
+    path: /usr/bin/yggdrasil
+  register: ygg_bin_stat
+
+- name: download yggdrasil deb package
+  get_url:
+    url: "https://github.com/yggdrasil-network/yggdrasil-go/releases/download/v0.5.14/yggdrasil-0.5.14-amd64.deb"
+    dest: /tmp/ygg.deb
+    mode: "0644"
+  when: not ygg_bin_stat.stat.exists
+
+- name: install yggdrasil package
+  apt:
+    deb: /tmp/ygg.deb
+  when: not ygg_bin_stat.stat.exists
+
+- name: remove temporary deb package
+  file:
+    path: /tmp/ygg.deb
+    state: absent
+  when: not ygg_bin_stat.stat.exists
+
+- name: stop and disable default yggdrasil service
+  systemd:
+    name: yggdrasil
+    state: stopped
+    enabled: no
+  failed_when: false
+
+- name: kill existing yggdrasil processes
+  command: pkill -9 -f yggdrasil
+  failed_when: false
+
+- name: generate deterministic yggdrasil keys and addressing
+  command: python3 "{{ repo_dir }}/scripts/ygg_gen.py" "{{ slot_id }}" "{{ total_slots }}" "{{ cluster_salt }}" "/usr/bin/yggdrasil"
+  register: ygg_gen_output
+  changed_when: false
+
+- name: parse yggdrasil data
+  set_fact:
+    ygg_data: "{{ ygg_gen_output.stdout | from_json }}"
+
+- name: set yggdrasil facts
+  set_fact:
+    ygg_priv_key: "{{ ygg_data.private_key }}"
+    my_ipv6: "{{ ygg_data.my_address }}"
+    ygg_hosts: "{{ ygg_data.hosts }}"
+
+- name: update etc hosts with yggdrasil node mapping
+  blockinfile:
+    path: /etc/hosts
+    block: "{{ ygg_hosts | join('\n') }}"
+    marker: "# {mark} ANSIBLE MANAGED YGGDRASIL HOSTS"
+
+- name: ensure yggdrasil runtime directories exist
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - /etc/yggdrasil
+    - /var/run/yggdrasil
+    - /run/yggdrasil
+
+- name: deploy yggdrasil configuration file
+  template:
+    src: yggdrasil.conf.j2
+    dest: /etc/yggdrasil/yggdrasil.conf
+    mode: "0640"
+
+- name: launch yggdrasil daemon in background
+  shell: nohup /usr/bin/yggdrasil -useconffile /etc/yggdrasil/yggdrasil.conf >/tmp/yggdrasil.log 2>&1 &
+  args:
+    executable: /bin/bash
+
+- name: wait for ygg0 network interface
+  command: ip link show ygg0
+  register: ygg0_check
+  until: ygg0_check.rc == 0
+  retries: 30
+  delay: 1
+
+- name: start transparent mesh proxy on master nodes
+  shell: nohup python3 "{{ repo_dir }}/scripts/mesh_proxy.py" 9001 9002 "{{ slot_id }}" >/tmp/mesh_proxy.log 2>&1 &
+  args:
+    executable: /bin/bash
+  when: is_master

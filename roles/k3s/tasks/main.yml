@@ -1,0 +1,31 @@
+- name: check if k3s binary exists
+  stat:
+    path: /usr/local/bin/k3s
+  register: k3s_bin_stat
+
+- name: install k3s binary
+  shell: curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true sh -
+  when: not k3s_bin_stat.stat.exists
+
+- name: stop and disable systemd k3s unit
+  systemd:
+    name: k3s
+    state: stopped
+    enabled: no
+  failed_when: false
+
+- name: kill lingering k3s processes
+  command: pkill -9 -f k3s
+  failed_when: false
+
+- name: include seed master configuration
+  import_tasks: master.yml
+  when: is_seed
+
+- name: include secondary master configuration
+  import_tasks: secondary.yml
+  when: is_master and not is_seed
+
+- name: include worker agent configuration
+  import_tasks: worker.yml
+  when: not is_master

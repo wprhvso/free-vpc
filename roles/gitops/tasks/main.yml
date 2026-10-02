@@ -1,0 +1,150 @@
+- name: check if seed master
+  meta: end_host
+  when: not is_seed
+
+- name: install helm cli
+  shell: |
+    if ! command -v helm >/dev/null 2>&1; then
+      curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | USE_SUDO=false HELM_INSTALL_DIR=/usr/local/bin bash
+    fi
+  args:
+    executable: /bin/bash
+
+- name: unpack and apply gateway api crds
+  shell: |
+    helm pull oci://docker.io/envoyproxy/gateway-helm --version 1.9.2 --untar --untardir /tmp/eg-chart 2>/dev/null || true
+    if [ -d /tmp/eg-chart/gateway-helm/charts/crds/crds ]; then
+      kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f /tmp/eg-chart/gateway-helm/charts/crds/crds/gatewayapi-crds.yaml 2>/dev/null || true
+      kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f /tmp/eg-chart/gateway-helm/charts/crds/crds/generated/ 2>/dev/null || true
+    fi
+  args:
+    executable: /bin/bash
+
+- name: deploy envoy gateway release
+  shell: |
+    helm upgrade --install envoy-gateway oci://docker.io/envoyproxy/gateway-helm --version 1.9.2 \
+      --namespace envoy-gateway-system --create-namespace \
+      --kubeconfig /etc/rancher/k3s/k3s.yaml
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f "{{ repo_dir }}/gitops/infrastructure/envoy-gateway/gateway.yaml"
+  args:
+    executable: /bin/bash
+
+- name: deploy weave gitops release
+  shell: |
+    helm upgrade --install weave-gitops oci://ghcr.io/weaveworks/charts/weave-gitops --version 4.0.36 \
+      --namespace flux-system --create-namespace \
+      --set adminUser.create=true \
+      --set adminUser.createSecret=true \
+      --set adminUser.username="admin" \
+      --set adminUser.passwordHash="\$2a\$12\$JEdioLbAPM0rC7YsaKzKxOgiqUN/NxAeriaJyHA7VVpQPLOWyGQ9q" \
+      --set rbac.create=true \
+      --kubeconfig /etc/rancher/k3s/k3s.yaml
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f "{{ repo_dir }}/gitops/infrastructure/weave-gitops/httproute.yaml"
+  args:
+    executable: /bin/bash
+
+- name: deploy headlamp release
+  shell: |
+    helm repo add headlamp https://kubernetes-sigs.github.io/headlamp/ 2>/dev/null || true
+    helm repo update 2>/dev/null || true
+    helm upgrade --install headlamp headlamp/headlamp --version 0.45.0 \
+      --namespace headlamp --create-namespace \
+      --kubeconfig /etc/rancher/k3s/k3s.yaml
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f "{{ repo_dir }}/gitops/infrastructure/headlamp/rbac.yaml"
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f "{{ repo_dir }}/gitops/infrastructure/headlamp/httproute.yaml"
+  args:
+    executable: /bin/bash
+
+- name: start ui background port forwarders
+  shell: |
+    nohup bash -c "while true; do kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml port-forward svc/weave-gitops -n flux-system 9003:9001; sleep 2; done" >/dev/null 2>&1 &
+    nohup bash -c "while true; do kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml port-forward svc/headlamp -n headlamp 4467:80; sleep 2; done" >/dev/null 2>&1 &
+    nohup bash -c "while true; do EG_SVC=\$(kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get svc -n envoy-gateway-system -l gateway.envoyproxy.io/owning-gateway-name=eg -o jsonpath="{{.items[0].metadata.name}}"); [ -n "\$EG_SVC" ] && kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml port-forward "svc/\$EG_SVC" -n envoy-gateway-system 30080:80; sleep 2; done" >/dev/null 2>&1 &
+  args:
+    executable: /bin/bash
+
+- name: install sops cli
+  get_url:
+    url: "https://github.com/getsops/sops/releases/download/v3.9.1/sops-v3.9.1.linux.amd64"
+    dest: /usr/local/bin/sops
+    mode: "0755"
+
+- name: install flux cli
+  shell: |
+    if ! command -v flux >/dev/null 2>&1; then
+      curl -s https://fluxcd.io/install.sh | bash
+    fi
+  args:
+    executable: /bin/bash
+
+- name: bootstrap flux v2 controllers
+  shell: flux --kubeconfig /etc/rancher/k3s/k3s.yaml install --components=source-controller,kustomize-controller,helm-controller,notification-controller
+  args:
+    executable: /bin/bash
+
+- name: create sops age secret
+  shell: |
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create secret generic sops-age \
+      --namespace=flux-system \
+      --from-literal=age.agekey="{{ sops_age_key }}" \
+      --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+  args:
+    executable: /bin/bash
+
+- name: create weave gitops auth secret
+  shell: |
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create secret generic cluster-user-auth \
+      --namespace=flux-system \
+      --from-literal=username="admin" \
+      --from-literal=password="\$2a\$12\$JEdioLbAPM0rC7YsaKzKxOgiqUN/NxAeriaJyHA7VVpQPLOWyGQ9q" \
+      --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+  args:
+    executable: /bin/bash
+
+- name: create headlamp service account and token secret
+  shell: |
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create namespace headlamp --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create serviceaccount headlamp-admin --namespace=headlamp --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create clusterrolebinding headlamp-admin --clusterrole=cluster-admin --serviceaccount=headlamp:headlamp-admin --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+    cat << TOKEOF | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: headlamp-admin-token
+      namespace: headlamp
+      annotations:
+        kubernetes.io/service-account.name: headlamp-admin
+    type: kubernetes.io/service-account-token
+    TOKEOF
+  args:
+    executable: /bin/bash
+
+- name: enforce psa restricted on default namespace
+  shell: kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml label namespace default pod-security.kubernetes.io/enforce=restricted --overwrite
+  args:
+    executable: /bin/bash
+
+- name: configure flux git source and kustomization
+  shell: |
+    flux --kubeconfig /etc/rancher/k3s/k3s.yaml create source git free-vpc \
+      --url="https://github.com/{{ github_repository }}.git" \
+      --branch="{{ github_ref_name }}" \
+      --interval=1m \
+      --export | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+
+    flux --kubeconfig /etc/rancher/k3s/k3s.yaml create kustomization cluster-sync \
+      --source=free-vpc \
+      --path="./gitops/clusters/free-vpc" \
+      --prune=true \
+      --interval=1m \
+      --decryption-provider=sops \
+      --decryption-secret=sops-age \
+      --export | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+  args:
+    executable: /bin/bash
+
+- name: launch cluster orchestrator in background
+  shell: nohup bash "{{ repo_dir }}/scripts/cluster_orchestrator.sh" "{{ slot_id }}" "{{ github_repository }}" "{{ gh_pat }}" "{{ total_slots }}" "{{ github_ref_name }}" >/tmp/orchestrator.log 2>&1 &
+  args:
+    executable: /bin/bash
+  when: gh_pat is defined and gh_pat != ""

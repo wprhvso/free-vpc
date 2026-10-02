@@ -1,0 +1,60 @@
+- name: start k3s seed server
+  shell: |
+    nohup /usr/local/bin/k3s server --cluster-init \
+      --node-name "free-vpc-{{ slot_id }}" \
+      --token "{{ k3s_token }}" \
+      --tls-san master-1 --tls-san master-2 --tls-san master-3 --tls-san 127.0.0.1 \
+      --disable traefik --disable local-storage --disable metrics-server \
+      --kube-controller-manager-arg "node-monitor-grace-period=16s" \
+      --kube-controller-manager-arg "pod-eviction-timeout=20s" >/tmp/k3s.log 2>&1 &
+  args:
+    executable: /bin/bash
+
+- name: wait for k3s kubeconfig to exist
+  wait_for:
+    path: /etc/rancher/k3s/k3s.yaml
+    state: present
+    timeout: 60
+
+- name: set kubeconfig permissions
+  file:
+    path: /etc/rancher/k3s/k3s.yaml
+    mode: "0644"
+
+- name: ensure kube config directories exist
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - /root/.kube
+    - /home/runner/.kube
+
+- name: copy kubeconfig for root and runner
+  copy:
+    src: /etc/rancher/k3s/k3s.yaml
+    dest: "{{ item }}"
+    mode: "0600"
+    remote_src: yes
+  loop:
+    - /root/.kube/config
+    - /home/runner/.kube/config
+
+- name: set runner kubeconfig ownership
+  file:
+    path: /home/runner/.kube/config
+    owner: runner
+    group: runner
+
+- name: start ipv6 to ipv4 loopback socat for k3s
+  shell: nohup socat TCP6-LISTEN:6443,fork,reuseaddr TCP4:127.0.0.1:6443 >/dev/null 2>&1 &
+  args:
+    executable: /bin/bash
+  failed_when: false
+
+- name: wait for k3s node to report ready
+  shell: /usr/local/bin/k3s kubectl get nodes 2>/dev/null | grep -q "Ready"
+  register: k3s_ready
+  until: k3s_ready.rc == 0
+  retries: 30
+  delay: 2

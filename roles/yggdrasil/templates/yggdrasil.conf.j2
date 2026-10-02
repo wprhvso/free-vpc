@@ -1,0 +1,11 @@
+{
+  "PrivateKey": "{{ ygg_priv_key }}",
+  "Peers": [
+    "wss://mesh1.unsafie.com:443?password={{ ygg_password }}",
+    "wss://mesh2.unsafie.com:443?password={{ ygg_password }}",
+    "wss://mesh3.unsafie.com:443?password={{ ygg_password }}"
+  ],
+  "Listen": {% if is_master %}["ws://127.0.0.1:9002?password={{ ygg_password }}"]{% else %}[]{% endif %},
+  "IfName": "ygg0",
+  "IfMTU": 1280
+}

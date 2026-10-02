@@ -1,0 +1,19 @@
+- name: wait for any master api server
+  shell: nc -z -w 2 127.0.0.1 6443 2>/dev/null || nc -z -w 2 master-1 6443 2>/dev/null || nc -6 -z -w 2 master-1 6443 2>/dev/null || nc -z -w 2 master-2 6443 2>/dev/null || nc -6 -z -w 2 master-2 6443 2>/dev/null
+  register: any_master_check
+  until: any_master_check.rc == 0
+  retries: 60
+  delay: 2
+
+- name: start socat proxy to master-1
+  shell: nohup socat TCP-LISTEN:6443,fork,reuseaddr "TCP:master-1:6443" >/tmp/socat.log 2>&1 &
+  args:
+    executable: /bin/bash
+
+- name: start k3s agent
+  shell: |
+    nohup /usr/local/bin/k3s agent --server "https://127.0.0.1:6443" \
+      --node-name "free-vpc-{{ slot_id }}" \
+      --token "{{ k3s_token }}" --snapshotter=native >/tmp/k3s.log 2>&1 &
+  args:
+    executable: /bin/bash

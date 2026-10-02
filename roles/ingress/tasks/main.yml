@@ -1,0 +1,69 @@
+- name: launch gateway proxy in background
+  shell: nohup python3 "{{ repo_dir }}/scripts/gateway_proxy.py" 80 30080 >/tmp/gateway_proxy.log 2>&1 &
+  args:
+    executable: /bin/bash
+
+- name: check if cloudflared exists
+  stat:
+    path: /usr/local/bin/cloudflared
+  register: cf_bin_stat
+
+- name: download cloudflared binary
+  get_url:
+    url: "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+    dest: /usr/local/bin/cloudflared
+    mode: "0755"
+  when: not cf_bin_stat.stat.exists
+
+- name: determine tunnel token for master node
+  set_fact:
+    current_tunnel_token: >-
+      {{
+        (slot_id == 1) | ternary(cf_tunnel_token_1,
+        (slot_id == 2) | ternary(cf_tunnel_token_2,
+        (slot_id == 3) | ternary(cf_tunnel_token_3, '')))
+      }}
+  when: is_master
+
+- name: launch cloudflared tunnel daemon
+  shell: nohup /usr/local/bin/cloudflared tunnel run --token "{{ current_tunnel_token }}" >/tmp/cf_tunnel.log 2>&1 &
+  args:
+    executable: /bin/bash
+  when: is_master and (current_tunnel_token | default('') != '')
+
+- name: configure rclone s3 backup gateway
+  block:
+    - name: ensure rclone config directory exists
+      file:
+        path: /home/runner/.config/rclone
+        state: directory
+        mode: "0755"
+    - name: write rclone configuration
+      copy:
+        dest: /home/runner/.config/rclone/rclone.conf
+        content: |
+          [hf-raw]
+          type = s3
+          provider = Other
+          endpoint = https://s3.hf.co/{{ hf_namespace }}
+          access_key_id = {{ hf_token }}
+          secret_access_key = {{ hf_token }}
+          region = us-east-1
+          force_path_style = true
+          list_version = 2
+          upload_cutoff = 2G
+          chunk_size = 2G
+
+          [hf-crypt]
+          type = crypt
+          remote = hf-raw:{{ hf_bucket }}
+          filename_encryption = standard
+          directory_name_encryption = true
+          password = {{ rclone_crypt_password }}
+        mode: "0600"
+    - name: launch rclone serve s3 in background
+      shell: |
+        nohup rclone serve s3 hf-crypt: --addr 127.0.0.1:9000 --auth-key "admin,{{ s3_secret_key }}" --vfs-cache-mode minimal >/tmp/rclone.log 2>&1 &
+      args:
+        executable: /bin/bash
+  when: hf_token is defined and hf_token != ""

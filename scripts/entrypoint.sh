@@ -2,402 +2,53 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost 2>/dev/null || true
-
-if [ -e /dev/kvm ]; then
-    sudo chmod 666 /dev/kvm
-fi
-
-sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server curl jq netcat-openbsd socat python3-cryptography rclone e2fsprogs iptables xz-utils 2>/dev/null || true
-
-if ! command -v yggdrasil >/dev/null 2>&1; then
-    curl -fsSL https://github.com/yggdrasil-network/yggdrasil-go/releases/download/v0.5.14/yggdrasil-0.5.14-amd64.deb -o /tmp/ygg.deb
-    sudo dpkg -i /tmp/ygg.deb 2>/dev/null || true
-    rm -f /tmp/ygg.deb
-fi
-
-if ! command -v cloudflared >/dev/null 2>&1; then
-    sudo curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
-    sudo chmod +x /usr/local/bin/cloudflared
-fi
-
-sudo systemctl stop k3s 2>/dev/null || true
-sudo systemctl disable k3s 2>/dev/null || true
-sudo pkill -9 -f "k3s" 2>/dev/null || true
-
-if ! command -v k3s >/dev/null 2>&1; then
-    curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true sh -
-    sudo systemctl stop k3s 2>/dev/null || true
-    sudo systemctl disable k3s 2>/dev/null || true
-fi
+REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 RAW_ID="${NODE_ID:-1}"
 NODE_NUM=$(echo "$RAW_ID" | tr -cd "0-9")
 NODE_NUM="${NODE_NUM:-1}"
-TOTAL_SLOTS="${TOTAL_SLOTS:-20}"
-CLUSTER_SALT="${CLUSTER_SALT:-unsafie-cluster-v1}"
-YGG_PASS="${YGG_PASSWORD:?YGG_PASSWORD is required}"
-K3S_SECRET="${K3S_TOKEN:?K3S_TOKEN is required}"
-S3_PASS="${S3_SECRET_KEY:-}"
 
-YGG_DATA=$(python3 "${SCRIPT_DIR}/ygg_gen.py" "$NODE_NUM" "$TOTAL_SLOTS" "$CLUSTER_SALT" "/usr/bin/yggdrasil")
-PRIV_KEY=$(echo "$YGG_DATA" | jq -r .private_key)
-MY_IPV6=$(echo "$YGG_DATA" | jq -r .my_address)
-
-echo "$YGG_DATA" | jq -r ".hosts[]" | sudo tee -a /etc/hosts >/dev/null
-
-sudo systemctl stop yggdrasil 2>/dev/null || true
-sudo systemctl disable yggdrasil 2>/dev/null || true
-sudo pkill -9 yggdrasil 2>/dev/null || true
-sudo modprobe tun 2>/dev/null || true
-sudo mkdir -p /dev/net
-if [ ! -c /dev/net/tun ]; then
-    sudo mknod /dev/net/tun c 10 200
-    sudo chmod 666 /dev/net/tun
+if ! command -v ansible-playbook >/dev/null 2>&1; then
+    sudo apt-get update -qq && sudo apt-get install -y -qq ansible-core 2>/dev/null || true
 fi
 
-sudo mkdir -p /etc/yggdrasil /var/run/yggdrasil /run/yggdrasil
-if [ "$NODE_NUM" -le 3 ]; then
-    LISTEN_CONF="[\"ws://127.0.0.1:9002?password=${YGG_PASS}\"]"
-else
-    LISTEN_CONF="[]"
-fi
+ANSIBLE_BIN=$(command -v ansible-playbook || echo "/usr/bin/ansible-playbook")
 
-cat <<YGGEOF | sudo tee /etc/yggdrasil/yggdrasil.conf >/dev/null
-{
-  "PrivateKey": "${PRIV_KEY}",
-  "Peers": [
-    "wss://mesh1.unsafie.com:443?password=${YGG_PASS}",
-    "wss://mesh2.unsafie.com:443?password=${YGG_PASS}",
-    "wss://mesh3.unsafie.com:443?password=${YGG_PASS}"
-  ],
-  "Listen": ${LISTEN_CONF},
-  "IfName": "ygg0",
-  "IfMTU": 1280
-}
-YGGEOF
+cd "$REPO_DIR"
 
-sudo yggdrasil -useconffile /etc/yggdrasil/yggdrasil.conf >/tmp/yggdrasil.log 2>&1 &
-
-for i in $(seq 1 30); do
-    if ip link show ygg0 >/dev/null 2>&1; then
-        break
-    fi
-    sleep 1
-done
-
-if [ "$NODE_NUM" -le 3 ]; then
-    python3 "${SCRIPT_DIR}/mesh_proxy.py" 9001 9002 "$NODE_NUM" >/tmp/mesh_proxy.log 2>&1 &
-fi
-
-sudo mkdir -p /etc/ssh /etc/ssh/sshd_config.d
-if [ -n "${SSH_HOST_ED25519_KEY:-}" ]; then
-    echo "${SSH_HOST_ED25519_KEY}" | sudo tee /etc/ssh/ssh_host_ed25519_key >/dev/null
-    sudo chmod 600 /etc/ssh/ssh_host_ed25519_key
-    sudo ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key | sudo tee /etc/ssh/ssh_host_ed25519_key.pub >/dev/null
-fi
-if [ -n "${SSH_HOST_RSA_KEY:-}" ]; then
-    echo "${SSH_HOST_RSA_KEY}" | sudo tee /etc/ssh/ssh_host_rsa_key >/dev/null
-    sudo chmod 600 /etc/ssh/ssh_host_rsa_key
-    sudo ssh-keygen -y -f /etc/ssh/ssh_host_rsa_key | sudo tee /etc/ssh/ssh_host_rsa_key.pub >/dev/null
-fi
-
-cat <<SSHEOF | sudo tee /etc/ssh/sshd_config.d/free-vpc.conf >/dev/null
-Port 22
-PasswordAuthentication no
-PubkeyAuthentication yes
-PermitRootLogin prohibit-password
-HostKey /etc/ssh/ssh_host_ed25519_key
-HostKey /etc/ssh/ssh_host_rsa_key
-AuthorizedKeysFile .ssh/authorized_keys
-SSHEOF
-
-sudo mkdir -p /home/runner/.ssh /root/.ssh
-sudo chmod 700 /home/runner/.ssh /root/.ssh
-AUTH_FILE="/home/runner/.ssh/authorized_keys"
-sudo touch "$AUTH_FILE"
-if [ -f "authorized_keys" ]; then
-    cat authorized_keys | sudo tee -a "$AUTH_FILE" >/dev/null
-fi
-if [ -n "${SSH_AUTHORIZED_KEYS:-}" ]; then
-    echo "${SSH_AUTHORIZED_KEYS}" | sudo tee -a "$AUTH_FILE" >/dev/null
-fi
-curl -sSL "https://github.com/wprhvso.keys" | sudo tee -a "$AUTH_FILE" >/dev/null
-sudo cp "$AUTH_FILE" /root/.ssh/authorized_keys
-sudo chmod 600 "$AUTH_FILE" /root/.ssh/authorized_keys
-sudo chown -R runner:runner /home/runner/.ssh
-echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner-nopasswd
-sudo chmod 440 /etc/sudoers.d/runner-nopasswd
-sudo systemctl restart ssh || sudo service ssh restart || true
-
-if ! command -v containerd-shim-kata-v2 >/dev/null 2>&1; then
-    (
-        KATA_VER="3.10.0"
-        KATA_URL="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VER}/kata-static-${KATA_VER}-amd64.tar.xz"
-        curl -fsSL "$KATA_URL" -o /tmp/kata.tar.xz 2>/dev/null && sudo tar -xJf /tmp/kata.tar.xz -C / 2>/dev/null && rm -f /tmp/kata.tar.xz && sudo ln -sf /opt/kata/bin/* /usr/local/bin/ && sudo ln -sf /opt/kata/bin/* /usr/bin/ || true
-    ) &
-fi
-
-sudo python3 "${SCRIPT_DIR}/gateway_proxy.py" 80 30080 >/tmp/gateway_proxy.log 2>&1 &
-
-if [ "$NODE_NUM" -le 3 ]; then
-    TOKEN_VAR="CF_TUNNEL_TOKEN_${NODE_NUM}"
-    CURRENT_TUNNEL_TOKEN="${!TOKEN_VAR:-${CF_TUNNEL_TOKEN:-}}"
-    if [ -n "$CURRENT_TUNNEL_TOKEN" ]; then
-        sudo /usr/local/bin/cloudflared tunnel run --token "$CURRENT_TUNNEL_TOKEN" >/tmp/cf_tunnel.log 2>&1 &
-        sleep 2
-    fi
-fi
-
-if [ -n "${HF_TOKEN:-}" ]; then
-    mkdir -p ~/.config/rclone
-    cat <<RCEOF > ~/.config/rclone/rclone.conf
-[hf-raw]
-type = s3
-provider = Other
-endpoint = https://s3.hf.co/${HF_NAMESPACE:-wprhvso}
-access_key_id = ${HF_ACCESS_KEY:-$HF_TOKEN}
-secret_access_key = ${HF_SECRET_KEY:-$HF_TOKEN}
-region = us-east-1
-force_path_style = true
-list_version = 2
-upload_cutoff = 2G
-chunk_size = 2G
-
-[hf-crypt]
-type = crypt
-remote = hf-raw:${HF_BUCKET:-cluster-backups}
-filename_encryption = standard
-directory_name_encryption = true
-password = ${RCLONE_CRYPT_PASSWORD:-}
-RCEOF
-    rclone serve s3 hf-crypt: --addr 127.0.0.1:9000 --auth-key "admin,${S3_PASS}" --vfs-cache-mode minimal >/tmp/rclone.log 2>&1 &
-    sleep 2
-fi
-
-cleanup() {
-    if command -v kubectl >/dev/null 2>&1; then
-        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml drain "free-vpc-${NODE_NUM}" --ignore-daemonsets --delete-emptydir-data --force --grace-period=15 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT INT TERM
-
-COMMON_K3S_FLAGS="--node-name free-vpc-${NODE_NUM} --token ${K3S_SECRET} --snapshotter=native"
-
-if [ "$NODE_NUM" -le 3 ]; then
-    if [ "$NODE_NUM" = "1" ]; then
-        sudo k3s server --cluster-init \
-            ${COMMON_K3S_FLAGS} \
-            --tls-san master-1 --tls-san master-2 --tls-san master-3 --tls-san 127.0.0.1 \
-            --disable traefik --disable local-storage --disable metrics-server \
-            --kube-controller-manager-arg "node-monitor-grace-period=16s" \
-            --kube-controller-manager-arg "pod-eviction-timeout=20s" >/tmp/k3s.log 2>&1 &
-    else
-        for i in $(seq 1 45); do
-            if nc -z -w 2 127.0.0.1 6443 2>/dev/null || nc -z -w 2 master-1 6443 2>/dev/null || nc -6 -z -w 2 master-1 6443 2>/dev/null; then
-                break
-            fi
-            sleep 2
-        done
-
-        sudo k3s server --server "https://master-1:6443" \
-            ${COMMON_K3S_FLAGS} \
-            --tls-san master-1 --tls-san master-2 --tls-san master-3 --tls-san 127.0.0.1 \
-            --disable traefik --disable local-storage --disable metrics-server \
-            --kube-controller-manager-arg "node-monitor-grace-period=16s" \
-            --kube-controller-manager-arg "pod-eviction-timeout=20s" >/tmp/k3s.log 2>&1 &
-    fi
-else
-    for i in $(seq 1 60); do
-        if nc -z -w 2 127.0.0.1 6443 2>/dev/null || nc -z -w 2 master-1 6443 2>/dev/null || nc -6 -z -w 2 master-1 6443 2>/dev/null; then
-            break
-        fi
-        sleep 2
-    done
-
-    (socat TCP-LISTEN:6443,fork,reuseaddr "TCP6:master-1:6443" >/tmp/socat.log 2>&1 || socat TCP-LISTEN:6443,fork,reuseaddr "TCP:master-1:6443" >/tmp/socat.log 2>&1) &
-
-    sudo k3s agent --server "https://127.0.0.1:6443" \
-        --node-name "free-vpc-${NODE_NUM}" \
-        --token "${K3S_SECRET}" --snapshotter=native >/tmp/k3s.log 2>&1 &
-fi
-
-HEADLAMP_TOKEN=""
-
-if [ "$NODE_NUM" = "1" ]; then
-    echo "Waiting for k3s cluster to initialize..."
-    for i in $(seq 1 60); do
-        if [ -f /etc/rancher/k3s/k3s.yaml ]; then
-            sudo chmod 644 /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
-            if kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get nodes 2>/dev/null | grep -q "Ready"; then
-                echo "K3s node is Ready!"
-                break
-            fi
-        fi
-        sleep 2
-    done
-
-    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get nodes -o wide || true
-
-    if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
-        echo "ERROR: k3s.yaml not created! Crash log:" >&2
-        cat /tmp/k3s.log >&2 || true
-        exit 1
-    fi
-
-    sudo chmod 644 /etc/rancher/k3s/k3s.yaml
-    sudo mkdir -p /root/.kube /home/runner/.kube
-    sudo cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
-    sudo cp /etc/rancher/k3s/k3s.yaml /home/runner/.kube/config
-    sudo chown -R runner:runner /home/runner/.kube
-    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-
-    (sudo socat TCP6-LISTEN:6443,fork,reuseaddr "TCP4:127.0.0.1:6443" >/dev/null 2>&1 || true) &
-
-    echo "Installing Helm CLI and Gateway CRDs..."
-    if ! command -v helm >/dev/null 2>&1; then
-        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | USE_SUDO=false HELM_INSTALL_DIR=/usr/local/bin bash 2>/dev/null || true
-    fi
-
-    if command -v helm >/dev/null 2>&1; then
-        helm pull oci://docker.io/envoyproxy/gateway-helm --version 1.9.2 --untar --untardir /tmp/eg-chart 2>/dev/null || true
-        if [ -d /tmp/eg-chart/gateway-helm/charts/crds/crds ]; then
-            kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f /tmp/eg-chart/gateway-helm/charts/crds/crds/gatewayapi-crds.yaml 2>/dev/null || true
-            kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f /tmp/eg-chart/gateway-helm/charts/crds/crds/generated/ 2>/dev/null || true
-        fi
-
-        helm upgrade --install envoy-gateway oci://docker.io/envoyproxy/gateway-helm --version 1.9.2 \
-            --namespace envoy-gateway-system --create-namespace \
-            --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
-
-        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f "${SCRIPT_DIR}/../gitops/infrastructure/envoy-gateway/gateway.yaml" 2>/dev/null || true
-
-        helm upgrade --install weave-gitops oci://ghcr.io/weaveworks/charts/weave-gitops --version 4.0.36 \
-            --namespace flux-system --create-namespace \
-            --set adminUser.create=true \
-            --set adminUser.createSecret=true \
-            --set adminUser.username="admin" \
-            --set adminUser.passwordHash="\$2a\$10\$ceOhGVam1gdh2ctMHentueYObHqvRySuweffs7xKXfN2.p4joA1WK" \
-            --set rbac.create=true \
-            --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
-
-        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f "${SCRIPT_DIR}/../gitops/infrastructure/weave-gitops/httproute.yaml" 2>/dev/null || true
-
-        helm repo add headlamp https://kubernetes-sigs.github.io/headlamp/ 2>/dev/null || true
-        helm repo update 2>/dev/null || true
-        helm upgrade --install headlamp headlamp/headlamp --version 0.45.0 \
-            --namespace headlamp --create-namespace \
-            --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
-
-        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f "${SCRIPT_DIR}/../gitops/infrastructure/headlamp/rbac.yaml" 2>/dev/null || true
-        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f "${SCRIPT_DIR}/../gitops/infrastructure/headlamp/httproute.yaml" 2>/dev/null || true
-
-        (
-            while true; do
-                kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml port-forward svc/weave-gitops -n flux-system 9003:9001 >/dev/null 2>&1 || true
-                sleep 2
-            done
-        ) &
-        (
-            while true; do
-                kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml port-forward svc/headlamp -n headlamp 4467:80 >/dev/null 2>&1 || true
-                sleep 2
-            done
-        ) &
-        (
-            while true; do
-                EG_SVC=$(kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get svc -n envoy-gateway-system -l gateway.envoyproxy.io/owning-gateway-name=eg -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || true)
-                if [ -n "$EG_SVC" ]; then
-                    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml port-forward "svc/${EG_SVC}" -n envoy-gateway-system 30080:80 >/dev/null 2>&1 || true
-                fi
-                sleep 2
-            done
-        ) &
-    fi
-
-    if ! command -v sops >/dev/null 2>&1; then
-        sudo curl -fsSL https://github.com/getsops/sops/releases/download/v3.9.1/sops-v3.9.1.linux.amd64 -o /usr/local/bin/sops 2>/dev/null || true
-        sudo chmod +x /usr/local/bin/sops 2>/dev/null || true
-    fi
-
-    if ! command -v flux >/dev/null 2>&1; then
-        curl -s https://fluxcd.io/install.sh | sudo bash 2>/dev/null || true
-    fi
-
-    if command -v flux >/dev/null 2>&1; then
-        echo "Bootstrapping Flux v2 controllers..."
-        flux --kubeconfig /etc/rancher/k3s/k3s.yaml install --components=source-controller,kustomize-controller,helm-controller,notification-controller || true
-
-        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create secret generic sops-age \
-            --namespace=flux-system \
-            --from-literal=age.agekey="${SOPS_AGE_KEY:-AGE-SECRET-KEY-106S3FMM5Q6HANQXGVJRJY9NUC943X2E6GDVJW32JPU022XWEKTJQ96XKGY}" \
-            --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
-
-        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create secret generic cluster-user-auth \
-            --namespace=flux-system \
-            --from-literal=username="admin" \
-            --from-literal=password='$2a$12$JEdioLbAPM0rC7YsaKzKxOgiqUN/NxAeriaJyHA7VVpQPLOWyGQ9q' \
-            --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
-
-        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create namespace headlamp --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
-        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create serviceaccount headlamp-admin --namespace=headlamp --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
-        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create clusterrolebinding headlamp-admin --clusterrole=cluster-admin --serviceaccount=headlamp:headlamp-admin --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
-
-        cat <<TOKEOF | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
-apiVersion: v1
-kind: Secret
-metadata:
-  name: headlamp-admin-token
-  namespace: headlamp
-  annotations:
-    kubernetes.io/service-account.name: headlamp-admin
-type: kubernetes.io/service-account-token
-TOKEOF
-
-        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml label namespace default pod-security.kubernetes.io/enforce=restricted --overwrite 2>/dev/null || true
-
-        flux --kubeconfig /etc/rancher/k3s/k3s.yaml create source git free-vpc \
-            --url="https://github.com/${GITHUB_REPOSITORY:-wprhvso/free-vpc}.git" \
-            --branch="${GITHUB_REF_NAME:-main}" \
-            --interval=1m \
-            --export | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
-
-        flux --kubeconfig /etc/rancher/k3s/k3s.yaml create kustomization cluster-sync \
-            --source=free-vpc \
-            --path="./gitops/clusters/free-vpc" \
-            --prune=true \
-            --interval=1m \
-            --decryption-provider=sops \
-            --decryption-secret=sops-age \
-            --export | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
-
-        sleep 5
-        HEADLAMP_TOKEN=$(kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get secret headlamp-admin-token -n headlamp -o jsonpath="{.data.token}" 2>/dev/null | base64 -d || true)
-    fi
-
-    bash "${SCRIPT_DIR}/cluster_orchestrator.sh" "$NODE_NUM" "${GITHUB_REPOSITORY:-wprhvso/free-vpc}" "${GH_PAT:-}" "$TOTAL_SLOTS" "${GITHUB_REF_NAME:-main}" >/tmp/orchestrator.log 2>&1 &
-fi
+sudo "$ANSIBLE_BIN" -i "localhost," -c local playbooks/node.yml \
+  -e "node_id=${NODE_NUM}" \
+  -e "total_slots=${TOTAL_SLOTS:-20}" \
+  -e "cluster_salt=${CLUSTER_SALT:-unsafie-cluster-v1}" \
+  -e "ygg_password=${YGG_PASSWORD}" \
+  -e "k3s_token=${K3S_TOKEN}" \
+  -e "s3_secret_key=${S3_SECRET_KEY:-}" \
+  -e "hf_token=${HF_TOKEN:-}" \
+  -e "hf_namespace=${HF_NAMESPACE:-wprhvso}" \
+  -e "hf_bucket=${HF_BUCKET:-cluster-backups}" \
+  -e "rclone_crypt_password=${RCLONE_CRYPT_PASSWORD:-}" \
+  -e "sops_age_key=${SOPS_AGE_KEY:-AGE-SECRET-KEY-106S3FMM5Q6HANQXGVJRJY9NUC943X2E6GDVJW32JPU022XWEKTJQ96XKGY}" \
+  -e "gh_pat=${GH_PAT:-}" \
+  -e "github_repository=${GITHUB_REPOSITORY:-wprhvso/free-vpc}" \
+  -e "github_ref_name=${GITHUB_REF_NAME:-main}" \
+  -e "ssh_host_ed25519_key=${SSH_HOST_ED25519_KEY:-}" \
+  -e "ssh_host_rsa_key=${SSH_HOST_RSA_KEY:-}" \
+  -e "ssh_authorized_keys=${SSH_AUTHORIZED_KEYS:-}" \
+  -e "cf_tunnel_token_1=${CF_TUNNEL_TOKEN_1:-}" \
+  -e "cf_tunnel_token_2=${CF_TUNNEL_TOKEN_2:-}" \
+  -e "cf_tunnel_token_3=${CF_TUNNEL_TOKEN_3:-}"
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     ROLE="Worker"
     if [ "$NODE_NUM" -le 3 ]; then
         ROLE="Master (Control Plane)"
     fi
-    printf "## Free VPC Kubernetes Node Online\n- Role: \`%s\`\n- Slot: \`#%s\`\n- Yggdrasil IPv6: \`%s\`\n- Peers: \`mesh1..3.unsafie.com\`\n" "$ROLE" "$NODE_NUM" "$MY_IPV6" >>"$GITHUB_STEP_SUMMARY"
-
+    printf "## Free VPC Kubernetes Node Online\n- Role: \`%s\`\n- Slot: \`#%s\`\n- Node Provisioner: Ansible\n" "$ROLE" "$NODE_NUM" >>"$GITHUB_STEP_SUMMARY"
     if [ "$NODE_NUM" = "1" ]; then
         printf "\n### Cluster Management & UIs\n" >>"$GITHUB_STEP_SUMMARY"
-        printf -- "- **Weave GitOps (Flux v2 UI)**: [https://gitops.unsafie.com](https://gitops.unsafie.com)\n  - Username: \`admin\`\n  - Password: \`unsafie2026!\`\n" >>"$GITHUB_STEP_SUMMARY"
-        printf -- "- **Headlamp (Kubernetes Web UI)**: [https://headlamp.unsafie.com](https://headlamp.unsafie.com) | [https://ui.unsafie.com](https://ui.unsafie.com)\n" >>"$GITHUB_STEP_SUMMARY"
-        if [ -n "$HEADLAMP_TOKEN" ]; then
-            printf "  - ServiceAccount Bearer Token: \`%s\`\n" "$HEADLAMP_TOKEN" >>"$GITHUB_STEP_SUMMARY"
-        fi
-        printf -- "- **Envoy Gateway**: Gateway API v1 active on NodePort 30080 / Port 80\n" >>"$GITHUB_STEP_SUMMARY"
-        printf -- "- **Spegel**: P2P Registry Cache active on containerd\n" >>"$GITHUB_STEP_SUMMARY"
-        printf -- "- **Kata Containers**: RuntimeClasses \`kata\`, \`kata-clh\`, \`kata-qemu\`\n" >>"$GITHUB_STEP_SUMMARY"
-        printf -- "- **Pod Security Admission**: Restricted profile enforced cluster-wide\n" >>"$GITHUB_STEP_SUMMARY"
-        printf -- "- **SOPS**: Age key encryption configured\n" >>"$GITHUB_STEP_SUMMARY"
+        printf -- "- **Weave GitOps**: [https://gitops.unsafie.com](https://gitops.unsafie.com)\n" >>"$GITHUB_STEP_SUMMARY"
+        printf -- "- **Headlamp**: [https://headlamp.unsafie.com](https://headlamp.unsafie.com) | [https://ui.unsafie.com](https://ui.unsafie.com)\n" >>"$GITHUB_STEP_SUMMARY"
+        printf -- "- **Mesh Endpoints**: [https://mesh1.unsafie.com](https://mesh1.unsafie.com)\n" >>"$GITHUB_STEP_SUMMARY"
     fi
 fi
 

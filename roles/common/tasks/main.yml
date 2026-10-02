@@ -1,0 +1,142 @@
+- name: remove unused runner directories
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /usr/share/dotnet
+    - /usr/local/lib/android
+    - /opt/ghc
+    - /usr/local/share/boost
+  failed_when: false
+
+- name: set kvm permissions
+  file:
+    path: /dev/kvm
+    mode: "0666"
+  when: ansible_facts['devices']['kvm'] is defined or ('/dev/kvm' is exists)
+  failed_when: false
+
+- name: load tun module
+  modprobe:
+    name: tun
+    state: present
+  failed_when: false
+
+- name: ensure dev net directory exists
+  file:
+    path: /dev/net
+    state: directory
+    mode: "0755"
+
+- name: check if tun device node exists
+  stat:
+    path: /dev/net/tun
+  register: tun_stat
+
+- name: create tun device node
+  command: mknod /dev/net/tun c 10 200
+  when: not tun_stat.stat.exists
+  failed_when: false
+
+- name: set tun device node permissions
+  file:
+    path: /dev/net/tun
+    mode: "0666"
+  failed_when: false
+
+- name: install system prerequisites
+  apt:
+    name:
+      - openssh-server
+      - curl
+      - jq
+      - netcat-openbsd
+      - socat
+      - python3-cryptography
+      - rclone
+      - e2fsprogs
+      - iptables
+      - xz-utils
+    state: present
+    update_cache: yes
+  retries: 3
+  delay: 2
+
+- name: ensure ssh directories exist
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop:
+    - /etc/ssh
+    - /etc/ssh/sshd_config.d
+    - /home/runner/.ssh
+    - /root/.ssh
+
+- name: configure ssh host ed25519 key
+  copy:
+    dest: /etc/ssh/ssh_host_ed25519_key
+    content: "{{ ssh_host_ed25519_key }}\n"
+    mode: "0600"
+  when: ssh_host_ed25519_key is defined and ssh_host_ed25519_key != ""
+
+- name: configure ssh host rsa key
+  copy:
+    dest: /etc/ssh/ssh_host_rsa_key
+    content: "{{ ssh_host_rsa_key }}\n"
+    mode: "0600"
+  when: ssh_host_rsa_key is defined and ssh_host_rsa_key != ""
+
+- name: configure sshd drop-in
+  copy:
+    dest: /etc/ssh/sshd_config.d/free-vpc.conf
+    content: |
+      Port 22
+      PasswordAuthentication no
+      PubkeyAuthentication yes
+      PermitRootLogin prohibit-password
+      HostKey /etc/ssh/ssh_host_ed25519_key
+      HostKey /etc/ssh/ssh_host_rsa_key
+      AuthorizedKeysFile .ssh/authorized_keys
+    mode: "0644"
+
+- name: configure runner sudoers
+  copy:
+    dest: /etc/sudoers.d/runner-nopasswd
+    content: "runner ALL=(ALL) NOPASSWD:ALL\n"
+    mode: "0440"
+
+- name: fetch authorized keys from github
+  get_url:
+    url: "https://github.com/wprhvso.keys"
+    dest: /tmp/github_keys
+    mode: "0644"
+  failed_when: false
+
+- name: assemble authorized keys
+  shell: |
+    AUTH_FILE="/home/runner/.ssh/authorized_keys"
+    touch "$AUTH_FILE"
+    if [ -f "{{ repo_dir }}/authorized_keys" ]; then
+      cat "{{ repo_dir }}/authorized_keys" >> "$AUTH_FILE"
+    fi
+    if [ -n "{{ ssh_authorized_keys | default('') }}" ]; then
+      echo "{{ ssh_authorized_keys | default('') }}" >> "$AUTH_FILE"
+    fi
+    if [ -f /tmp/github_keys ]; then
+      cat /tmp/github_keys >> "$AUTH_FILE"
+    fi
+    sort -u "$AUTH_FILE" | grep -v '^$' > /tmp/merged_keys
+    cp /tmp/merged_keys "$AUTH_FILE"
+    cp /tmp/merged_keys /root/.ssh/authorized_keys
+    chmod 600 "$AUTH_FILE" /root/.ssh/authorized_keys
+    chown -R runner:runner /home/runner/.ssh
+    rm -f /tmp/github_keys /tmp/merged_keys
+  args:
+    executable: /bin/bash
+
+- name: restart ssh service
+  service:
+    name: ssh
+    state: restarted
+  failed_when: false
