@@ -337,7 +337,7 @@ if [ "$NODE_NUM" = "1" ]; then
         kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create secret generic cluster-user-auth \
             --namespace=flux-system \
             --from-literal=username="admin" \
-            --from-literal=password='$2a$10$ceOhGVam1gdh2ctMHentueYObHqvRySuweffs7xKXfN2.p4joA1WK' \
+            --from-literal=password='$2a$12$JEdioLbAPM0rC7YsaKzKxOgiqUN/NxAeriaJyHA7VVpQPLOWyGQ9q' \
             --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true
 
         kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create namespace headlamp --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - || true

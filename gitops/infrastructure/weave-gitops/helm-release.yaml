@@ -18,7 +18,7 @@ spec:
       create: true
       createSecret: true
       username: "admin"
-      passwordHash: "$2a$10$ceOhGVam1gdh2ctMHentueYObHqvRySuweffs7xKXfN2.p4joA1WK"
+      passwordHash: "$2a$12$JEdioLbAPM0rC7YsaKzKxOgiqUN/NxAeriaJyHA7VVpQPLOWyGQ9q"
     rbac:
       create: true
       impersonationResourceNames: ["admin"]
