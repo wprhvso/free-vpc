@@ -24,7 +24,8 @@ fi
 
 ANSIBLE_BIN=$(command -v ansible-playbook || echo "/usr/bin/ansible-playbook")
 
-cd "$REPO_DIR"
+export ANSIBLE_CONFIG="${REPO_DIR}/ansible/ansible.cfg"
+cd "$REPO_DIR/ansible"
 
 sudo -E "$ANSIBLE_BIN" -i "localhost," -c local playbooks/node.yml \
   -e "node_id=${NODE_NUM}" \
