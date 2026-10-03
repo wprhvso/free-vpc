@@ -143,8 +143,110 @@
   args:
     executable: /bin/bash
 
-- name: launch cluster orchestrator in background
-  shell: nohup bash "{{ repo_dir }}/scripts/cluster_orchestrator.sh" "{{ slot_id }}" "{{ github_repository }}" "{{ gh_pat }}" "{{ total_slots }}" "{{ github_ref_name }}" >/tmp/orchestrator.log 2>&1 &
+- name: stop host cluster orchestrator
+  shell: pkill -9 -f cluster_orchestrator.sh || true
+  args:
+    executable: /bin/bash
+  failed_when: false
+
+- name: create cluster orchestrator secret
+  shell: |
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create secret generic cluster-orchestrator-secret \
+      --namespace=kube-system \
+      --from-literal=GH_PAT="{{ gh_pat }}" \
+      --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+  args:
+    executable: /bin/bash
+  when: gh_pat is defined and gh_pat != ""
+
+- name: create cluster orchestrator configmap
+  shell: |
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create configmap cluster-orchestrator-script \
+      --namespace=kube-system \
+      --from-file=cluster_orchestrator.sh="{{ repo_dir }}/scripts/cluster_orchestrator.sh" \
+      --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+  args:
+    executable: /bin/bash
+  when: gh_pat is defined and gh_pat != ""
+
+- name: deploy cluster orchestrator deployment
+  shell: |
+    cat << "ORCH_EOF" | sed -e "s|__REPO__|{{ github_repository }}|g" -e "s|__REF__|{{ github_ref_name }}|g" -e "s|__SLOTS__|{{ total_slots }}|g" | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: cluster-orchestrator
+      namespace: kube-system
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: cluster-orchestrator
+    rules:
+      - apiGroups: [""]
+        resources: ["nodes"]
+        verbs: ["get", "list", "watch"]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: cluster-orchestrator
+    subjects:
+      - kind: ServiceAccount
+        name: cluster-orchestrator
+        namespace: kube-system
+    roleRef:
+      kind: ClusterRole
+      name: cluster-orchestrator
+      apiGroup: rbac.authorization.k8s.io
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: cluster-orchestrator
+      namespace: kube-system
+      labels:
+        app: cluster-orchestrator
+    spec:
+      replicas: 1
+      strategy:
+        type: Recreate
+      selector:
+        matchLabels:
+          app: cluster-orchestrator
+      template:
+        metadata:
+          labels:
+            app: cluster-orchestrator
+        spec:
+          serviceAccountName: cluster-orchestrator
+          tolerations:
+            - operator: Exists
+          containers:
+            - name: orchestrator
+              image: alpine/k8s:1.31.2
+              command: ["/bin/bash", "/scripts/cluster_orchestrator.sh"]
+              env:
+                - name: GITHUB_REPOSITORY
+                  value: "__REPO__"
+                - name: GITHUB_REF_NAME
+                  value: "__REF__"
+                - name: TOTAL_SLOTS
+                  value: "__SLOTS__"
+                - name: GH_PAT
+                  valueFrom:
+                    secretKeyRef:
+                      name: cluster-orchestrator-secret
+                      key: GH_PAT
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+          volumes:
+            - name: script
+              configMap:
+                name: cluster-orchestrator-script
+                defaultMode: 0755
+    ORCH_EOF
   args:
     executable: /bin/bash
   when: gh_pat is defined and gh_pat != ""

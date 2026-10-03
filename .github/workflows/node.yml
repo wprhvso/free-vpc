@@ -10,6 +10,10 @@ on:
   repository_dispatch:
     types: [spawn-node]
 
+concurrency:
+  group: free-vpc-slot-${{ github.event.inputs.node_id || github.event.client_payload.node_id || '1' }}
+  cancel-in-progress: false
+
 jobs:
   run-node:
     runs-on: ubuntu-latest
