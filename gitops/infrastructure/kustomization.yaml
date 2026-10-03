@@ -8,3 +8,4 @@ resources:
   - weave-gitops
   - headlamp
   - runner-autoscaler
+  - cloudflared

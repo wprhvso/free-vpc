@@ -55,14 +55,6 @@
   args:
     executable: /bin/bash
 
-- name: start ui background port forwarders
-  shell: |
-    nohup bash -c "while true; do kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml port-forward svc/weave-gitops -n flux-system 9003:9001; sleep 2; done" >/dev/null 2>&1 &
-    nohup bash -c "while true; do kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml port-forward svc/headlamp -n headlamp 4467:80; sleep 2; done" >/dev/null 2>&1 &
-    nohup bash -c "while true; do EG_SVC=\$(kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get svc -n envoy-gateway-system -l gateway.envoyproxy.io/owning-gateway-name=eg -o jsonpath="{{.items[0].metadata.name}}"); [ -n "\$EG_SVC" ] && kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml port-forward "svc/\$EG_SVC" -n envoy-gateway-system 30080:80; sleep 2; done" >/dev/null 2>&1 &
-  args:
-    executable: /bin/bash
-
 - name: install sops cli
   get_url:
     url: "https://github.com/getsops/sops/releases/download/v3.9.1/sops-v3.9.1.linux.amd64"
@@ -142,6 +134,17 @@
       --export | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
   args:
     executable: /bin/bash
+
+- name: create cloudflare tunnel secret
+  shell: |
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create namespace flux-system --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create secret generic cloudflare-tunnel-token \
+      --namespace=flux-system \
+      --from-literal=token="{{ cf_tunnel_token_1 }}" \
+      --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+  args:
+    executable: /bin/bash
+  when: is_seed and cf_tunnel_token_1 is defined and cf_tunnel_token_1 != ""
 
 - name: create runner autoscaler secret
   shell: |
