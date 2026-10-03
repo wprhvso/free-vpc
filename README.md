@@ -23,12 +23,10 @@ All dashboards are securely routed through Cloudflare Named Tunnels with authent
 - **Weave GitOps:** https://gitops.unsafie.com
   - Access: Password authenticated
   - Username: admin
-  - Password: Wv9#kL2$xQ8!tZ5*GitOps2026
 
 - **Headlamp:** https://headlamp.unsafie.com and https://ui.unsafie.com
   - Access: HTTP Basic Authentication protected gateway + Kubernetes ServiceAccount Bearer token
   - Basic Auth Username: admin
-  - Basic Auth Password: Hl8*pQ3$mK9!wZ2#Headlamp2026
 
 - **Yggdrasil Mesh Endpoints:**
   - https://mesh1.unsafie.com
