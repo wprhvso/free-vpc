@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runner-autoscaler
+  namespace: kube-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: runner-autoscaler
+  template:
+    metadata:
+      labels:
+        app: runner-autoscaler
+    spec:
+      serviceAccountName: runner-autoscaler
+      containers:
+        - name: autoscaler
+          image: python:3.12-alpine
+          command: ["python3", "-u", "/app/autoscaler.py"]
+          volumeMounts:
+            - name: script
+              mountPath: /app
+          env:
+            - name: GITHUB_PAT
+              valueFrom:
+                secretKeyRef:
+                  name: runner-autoscaler-secret
+                  key: github-pat
+                  optional: true
+            - name: GITHUB_REPOSITORY
+              value: "wprhvso/free-vpc"
+            - name: GITHUB_REF
+              value: "main"
+            - name: TOTAL_SLOTS
+              value: "20"
+            - name: COOLDOWN_SECONDS
+              value: "600"
+            - name: CHECK_INTERVAL
+              value: "60"
+            - name: MAX_DISPATCH_PER_LOOP
+              value: "2"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+      volumes:
+        - name: script
+          configMap:
+            name: runner-autoscaler-script

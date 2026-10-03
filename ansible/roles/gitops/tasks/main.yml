@@ -36,7 +36,7 @@
       --set adminUser.create=true \
       --set adminUser.createSecret=true \
       --set adminUser.username="admin" \
-      --set adminUser.passwordHash="\$2a\$12\$JEdioLbAPM0rC7YsaKzKxOgiqUN/NxAeriaJyHA7VVpQPLOWyGQ9q" \
+      --set adminUser.passwordHash="\$2a\$12\$UucldIja3MqEJYGG..du4up8X1sG9hqsmOkR/A4PhqHZstWICZKC2" \
       --set rbac.create=true \
       --kubeconfig /etc/rancher/k3s/k3s.yaml
     kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f "{{ repo_dir }}/gitops/infrastructure/weave-gitops/httproute.yaml"
@@ -96,7 +96,7 @@
     kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create secret generic cluster-user-auth \
       --namespace=flux-system \
       --from-literal=username="admin" \
-      --from-literal=password="\$2a\$12\$JEdioLbAPM0rC7YsaKzKxOgiqUN/NxAeriaJyHA7VVpQPLOWyGQ9q" \
+      --from-literal=password="\$2a\$12\$UucldIja3MqEJYGG..du4up8X1sG9hqsmOkR/A4PhqHZstWICZKC2" \
       --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
   args:
     executable: /bin/bash
@@ -143,8 +143,10 @@
   args:
     executable: /bin/bash
 
-- name: launch cluster orchestrator in background
-  shell: nohup bash "{{ repo_dir }}/scripts/cluster_orchestrator.sh" "{{ slot_id }}" "{{ github_repository }}" "{{ gh_pat }}" "{{ total_slots }}" "{{ github_ref_name }}" >/tmp/orchestrator.log 2>&1 &
+- name: create runner autoscaler secret
+  shell: |
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create namespace kube-system --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml create secret generic runner-autoscaler-secret       --namespace=kube-system       --from-literal=github-pat="{{ gh_pat }}"       --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
   args:
     executable: /bin/bash
   when: gh_pat is defined and gh_pat != ""

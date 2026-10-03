@@ -1,0 +1,156 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: runner-autoscaler-script
+  namespace: kube-system
+data:
+  autoscaler.py: |
+    import os
+    import time
+    import json
+    import ssl
+    import urllib.request
+    import urllib.error
+    
+    TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    CA_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    K8S_HOST = "https://kubernetes.default.svc"
+    
+    GITHUB_PAT = os.environ.get("GITHUB_PAT", "").strip()
+    GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY", "wprhvso/free-vpc").strip()
+    GITHUB_REF = os.environ.get("GITHUB_REF", "main").strip()
+    TOTAL_SLOTS = int(os.environ.get("TOTAL_SLOTS", "20"))
+    COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "600"))
+    CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
+    MAX_DISPATCH_PER_LOOP = int(os.environ.get("MAX_DISPATCH_PER_LOOP", "2"))
+    
+    def get_k8s_ssl_context():
+        ctx = ssl.create_default_context()
+        if os.path.exists(CA_FILE):
+            ctx.load_verify_locations(cafile=CA_FILE)
+        return ctx
+    
+    def get_k8s_token():
+        if os.path.exists(TOKEN_FILE):
+            with open(TOKEN_FILE, "r") as f:
+                return f.read().strip()
+        return ""
+    
+    def get_ready_slots():
+        token = get_k8s_token()
+        if not token:
+            return set()
+        req = urllib.request.Request(
+            f"{K8S_HOST}/api/v1/nodes",
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        ctx = get_k8s_ssl_context()
+        try:
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                ready_slots = set()
+                for item in data.get("items", []):
+                    name = item.get("metadata", {}).get("name", "")
+                    is_ready = False
+                    for cond in item.get("status", {}).get("conditions", []):
+                        if cond.get("type") == "Ready" and cond.get("status") == "True":
+                            is_ready = True
+                            break
+                    if is_ready and name.startswith("free-vpc-"):
+                        slot_part = name.replace("free-vpc-", "")
+                        if slot_part.isdigit():
+                            ready_slots.add(int(slot_part))
+                return ready_slots
+        except Exception as e:
+            print(f"[K8s] Error getting nodes: {e}", flush=True)
+            return set()
+    
+    def get_active_github_runs():
+        if not GITHUB_PAT:
+            return 0
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/runs?status=in_progress&per_page=30"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"token {GITHUB_PAT}",
+                "Accept": "application/vnd.github.v3+json",
+                "User-Agent": "free-vpc-autoscaler"
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                return data.get("total_count", 0)
+        except Exception as e:
+            print(f"[GitHub] Error checking runs: {e}", flush=True)
+            return 0
+    
+    def dispatch_node(slot):
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/node.yml/dispatches"
+        data = json.dumps({"ref": GITHUB_REF, "inputs": {"node_id": str(slot)}}).encode()
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Authorization": f"token {GITHUB_PAT}",
+                "Accept": "application/vnd.github.v3+json",
+                "User-Agent": "free-vpc-autoscaler",
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status == 204
+        except Exception as e:
+            print(f"[GitHub] Error dispatching slot {slot}: {e}", flush=True)
+            return False
+    
+    def main():
+        print("Starting free-vpc runner-autoscaler controller...", flush=True)
+        cooldowns = {}
+        time.sleep(30)
+    
+        while True:
+            try:
+                ready_slots = get_ready_slots()
+                missing_slots = [s for s in range(1, TOTAL_SLOTS + 1) if s not in ready_slots]
+                print(f"[Status] Healthy nodes: {len(ready_slots)}/{TOTAL_SLOTS}. Missing: {missing_slots}", flush=True)
+    
+                if not missing_slots:
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+    
+                active_runs = get_active_github_runs()
+                if active_runs >= TOTAL_SLOTS:
+                    print(f"[Throttle] Already {active_runs} active runs on GitHub. Skipping dispatch.", flush=True)
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+    
+                dispatched_this_round = 0
+                now = time.time()
+    
+                for s in missing_slots:
+                    last_time = cooldowns.get(s, 0)
+                    if now - last_time < COOLDOWN_SECONDS:
+                        continue
+    
+                    if dispatched_this_round >= MAX_DISPATCH_PER_LOOP:
+                        break
+    
+                    print(f"[Autoscale] Dispatching runner for missing slot #{s}...", flush=True)
+                    if dispatch_node(s):
+                        print(f"[Autoscale] Successfully dispatched slot #{s}", flush=True)
+                        cooldowns[s] = time.time()
+                        dispatched_this_round += 1
+                        time.sleep(2)
+                    else:
+                        cooldowns[s] = time.time() + 60
+    
+            except Exception as e:
+                print(f"[Error] Main loop error: {e}", flush=True)
+    
+            time.sleep(CHECK_INTERVAL)
+    
+    if __name__ == '__main__':
+        main()
